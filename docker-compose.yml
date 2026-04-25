@@ -1,5 +1,8 @@
 version: "3.8"
 
+# Variables below are interpolated from a `.env` file in this directory.
+# See `.env.example` for the full list. Required: DB_PASS, ENCRYPT_KEY, MONITOR_PASS.
+
 services:
   zatca-daemon:
     build: .
@@ -8,35 +11,36 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
-      - "4222:4222"   # NATS — your backend publishes here
-      - "8222:8222"   # NATS monitoring — http://localhost:8222
+      - "${NATS_PORT:-4222}:4222"   # NATS — your backend publishes here
+      - "${NATS_MONITOR_PORT:-8222}:8222"   # NATS monitoring — http://localhost:8222
     volumes:
       - zatca-xml:/data/zatca-xml       # signed XML storage
       - nats-data:/data/nats            # JetStream persistence
     environment:
       # --- DB connection (required) ---
-      DB_USER: zatca_daemon
-      DB_PASS: ""                        # <-- set your password
-      DB_HOST: host.docker.internal      # <-- host.docker.internal = host machine
-      DB_PORT: "3306"
-      MASTER_DB: zatca_master
+      DB_USER: ${DB_USER:-zatca_daemon}
+      DB_PASS: ${DB_PASS:?DB_PASS must be set in .env}
+      DB_HOST: ${DB_HOST:-host.docker.internal}
+      DB_PORT: ${DB_PORT:-3306}
+      MASTER_DB: ${MASTER_DB:-zatca_master}
 
       # --- Optional: separate admin user for onboarding ---
-      # ADMIN_DB_USER: zatca_admin
-      # ADMIN_DB_PASS: ""
+      ADMIN_DB_USER: ${ADMIN_DB_USER:-}
+      ADMIN_DB_PASS: ${ADMIN_DB_PASS:-}
 
       # --- Encryption key for sensitive ZATCA credentials (required) ---
       # Generate with: openssl rand -base64 32
-      ENCRYPT_KEY: ""                    # <-- set your 32-byte key (base64 or 64 hex chars)
+      ENCRYPT_KEY: ${ENCRYPT_KEY:?ENCRYPT_KEY must be set in .env}
 
       # --- NATS monitoring password (required if port 8222 is exposed) ---
-      MONITOR_PASS: ""                   # <-- set a strong password for http://host:8222
+      MONITOR_PASS: ${MONITOR_PASS:?MONITOR_PASS must be set in .env}
 
-      # --- SMTP for error alerts (uses host SMTP) ---
-      SMTP_HOST: host.docker.internal
-      SMTP_PORT: "25"
-    # No command override needed — daemon reads env vars above
-    # Override only what differs from defaults:
+      # --- SMTP for error alerts (uses host SMTP by default) ---
+      SMTP_HOST: ${SMTP_HOST:-host.docker.internal}
+      SMTP_PORT: ${SMTP_PORT:-25}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-zatca-daemon@localhost}
     command: ["--nats-data=/data/nats"]
 
 volumes:
