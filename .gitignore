@@ -1,0 +1,13 @@
+.env
+output/
+*.exe
+*.pem
+*.csr
+*.key
+zatca-einvoicing-sdk-*/
+*.pdf
+*.log
+bin/
+todo/
+.vscode/
+.idea/

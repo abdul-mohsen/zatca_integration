@@ -1,0 +1,48 @@
+version: "3.8"
+
+# Minimal self-contained test: MySQL + daemon + auto-test
+# Usage: docker compose -f docker-compose.test.yml up --build
+
+services:
+  mysql-test:
+    image: mysql:8.0
+    container_name: zatca-test-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+    volumes:
+      - ./scripts/test_setup.sql:/docker-entrypoint-initdb.d/01_setup.sql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-prootpass"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  zatca-daemon-test:
+    build: .
+    container_name: zatca-test-daemon
+    depends_on:
+      mysql-test:
+        condition: service_healthy
+    environment:
+      DB_USER: zatca_daemon
+      DB_PASS: test_pass_123
+      DB_HOST: mysql-test
+      DB_PORT: "3306"
+      MASTER_DB: zatca_master
+      ENCRYPT_KEY: Z75tP56ou8HfdHr1PbBe7FpJV8U6YMzCGzGwb2ZthSU=
+      MONITOR_PASS: testmon
+    command: ["--nats-data=/data/nats", "--nats-monitor=0"]
+    ports:
+      - "14222:4222"
+
+  test-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    container_name: zatca-test-runner
+    depends_on:
+      - zatca-daemon-test
+    environment:
+      NATS_URL: nats://zatca-daemon-test:4222
+      DB_NAME: zatca_test_db
