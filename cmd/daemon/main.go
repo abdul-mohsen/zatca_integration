@@ -159,6 +159,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("open master db: %v", err)
 	}
+	// Recycle connections to avoid stale-idle broken-pipe warnings
+	// (Docker bridge / NAT drops long-idle TCP).
+	masterDBConn.SetConnMaxLifetime(3 * time.Minute)
+	masterDBConn.SetConnMaxIdleTime(1 * time.Minute)
+	masterDBConn.SetMaxOpenConns(5)
+	masterDBConn.SetMaxIdleConns(2)
 	defer masterDBConn.Close()
 
 	tenants, err := tenant.LoadAll(masterDBConn)

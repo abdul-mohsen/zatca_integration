@@ -3,6 +3,7 @@ package tenant
 import (
 	"database/sql"
 	"fmt"
+	"time"
 
 	"github.com/go-sql-driver/mysql"
 )
@@ -50,6 +51,14 @@ func OpenDB(t Tenant, baseDSN string) (*sql.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open tenant db %s: %w", t.DBName, err)
 	}
+	// Recycle connections before MySQL/NAT/Docker drops them as idle.
+	// Default MySQL wait_timeout is 28800s, but Docker bridge networks and
+	// stateful firewalls often drop idle TCP after a few minutes, producing
+	// "broken pipe" / "unexpected read from socket" warnings on the next use.
+	db.SetConnMaxLifetime(3 * time.Minute)
+	db.SetConnMaxIdleTime(1 * time.Minute)
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(5)
 	if err := db.Ping(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("ping tenant db %s: %w", t.DBName, err)
