@@ -1,0 +1,18 @@
+# Force LF line endings everywhere — project is Linux-only (Docker, bash SDK).
+* text=auto eol=lf
+
+# Binaries: never normalize.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.tar binary
+*.exe binary
+*.dll binary
+*.so binary
+*.jar binary
+*.p12 binary
