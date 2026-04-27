@@ -111,9 +111,16 @@ func OnboardBranch(db *sql.DB, baseCfg *config.Config, branchID int64, otp strin
 		return fmt.Errorf("encrypt production secret: %w", err)
 	}
 
+	// NOTE: `zatca_otp` is intentionally NOT written here. The OTP arrives
+	// via NATS (single-use) and persisting it would only retain plaintext
+	// PII. Some deployments' `branch_zatca_config` tables also lack the
+	// column entirely (Error 1054: Unknown column 'zatca_otp'), so writing
+	// it would break onboarding on those tenants. The post-insert
+	// "clear OTP" UPDATE below is best-effort for legacy schemas that DO
+	// have the column.
 	credQ := `INSERT INTO branch_zatca_config
-		(branch_id, csr_org_identifier, csr_org_unit, csr_org_name, csr_country, csr_location, business_category, seller_vat, seller_crn, street, building, district, postal_code, zatca_otp, zatca_csr, zatca_private_key, zatca_compliance_certificate, zatca_compliance_secret, zatca_compliance_request_id, zatca_production_username, zatca_production_password, zatca_production_request_id, zatca_registered_at)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
+		(branch_id, csr_org_identifier, csr_org_unit, csr_org_name, csr_country, csr_location, business_category, seller_vat, seller_crn, street, building, district, postal_code, zatca_csr, zatca_private_key, zatca_compliance_certificate, zatca_compliance_secret, zatca_compliance_request_id, zatca_production_username, zatca_production_password, zatca_production_request_id, zatca_registered_at)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
 	ON DUPLICATE KEY UPDATE
 		csr_org_identifier = VALUES(csr_org_identifier),
 		csr_org_unit = VALUES(csr_org_unit),
@@ -127,7 +134,6 @@ func OnboardBranch(db *sql.DB, baseCfg *config.Config, branchID int64, otp strin
 		building = VALUES(building),
 		district = VALUES(district),
 		postal_code = VALUES(postal_code),
-		zatca_otp = VALUES(zatca_otp),
 		zatca_csr = VALUES(zatca_csr),
 		zatca_private_key = VALUES(zatca_private_key),
 		zatca_compliance_certificate = VALUES(zatca_compliance_certificate),
@@ -152,7 +158,6 @@ func OnboardBranch(db *sql.DB, baseCfg *config.Config, branchID int64, otp strin
 		branch.Building,
 		branch.District,
 		branch.PostalCode,
-		otp,
 		csrPEM,
 		encPriv,
 		result.ComplianceCert,
