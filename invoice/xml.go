@@ -220,15 +220,13 @@ func (inv *Invoice) writeSupplier(b *strings.Builder) {
 }
 
 func (inv *Invoice) writeCustomer(b *strings.Builder) {
-	// For simplified (B2C) invoices, the AccountingCustomerParty is
-	// optional. ZATCA's KSA business rules reject an empty/partial
-	// customer party, so omit the entire block when we have no buyer
-	// identification at all (typical for B2C compliance / receipts).
-	if inv.IsSimplified() && inv.Customer.VAT == "" && inv.Customer.RegistrationName == "" &&
-		inv.Customer.Street == "" && inv.Customer.City == "" {
-		return
-	}
-
+	// AccountingCustomerParty is required by the UBL 2.1 Invoice schema
+	// (cardinality 1..1 in cac:Invoice). Omitting it produces:
+	//   cvc-complex-type.2.4.a: Invalid content was found starting with
+	//   element 'cac:PaymentMeans'. One of '{...AccountingCustomerParty}'
+	//   is expected.
+	// The ZATCA SDK's shipped Samples/Simplified/Invoice/Simplified_Invoice.xml
+	// also includes a full ACP block, so we emit it unconditionally.
 	b.WriteString("    <cac:AccountingCustomerParty>\n")
 	b.WriteString("        <cac:Party>\n")
 
