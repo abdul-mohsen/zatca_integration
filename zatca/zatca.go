@@ -112,8 +112,33 @@ func (s *Service) OnboardWithCSR(csrPEM, privateKeyPEM string) (*OnboardResult, 
 	s.Config.ComplianceUsername = compResp.BinarySecurityToken
 	s.Config.CompliancePassword = compResp.Secret
 
-	// Update SDK with the compliance certificate for signing
-	certPEM := "-----BEGIN CERTIFICATE-----\n" + compResp.BinarySecurityToken + "\n-----END CERTIFICATE-----"
+	// Update SDK with the compliance certificate for signing.
+	//
+	// ZATCA's /compliance and /production/csids endpoints return
+	// `binarySecurityToken` as Base64(<cert.pem body>), where the inner body is
+	// itself the raw Base64(DER) X.509 certificate (the same shape as the SDK's
+	// shipped Data/Certificates/cert.pem). I.e. the token on the wire is
+	// double-encoded. The Java SDK's InvoiceSigningService reads cert.pem and
+	// calls Base64.getDecoder().decode(...) once, then
+	// CertificateFactory.generateCertificate(...) on the result — so cert.pem
+	// must contain Base64(DER), NOT Base64(Base64(DER)).
+	//
+	// Reproduced in Docker (zatca-test image, fatoora -sign):
+	//   - writing the raw token (still doubly-encoded) → fails with
+	//     "[ERROR] InvoiceSigningService - failed to sign invoice
+	//      [please provide a valid certificate]"
+	//   - writing base64-decoded(token) → signs successfully.
+	//
+	// Reference: ZATCA Discourse, "Decoding Binary Security Token":
+	//   "Before signing any B2C invoice ensure to decode the BinarySecurityToken
+	//    using Base64 and put the decoded BinarySecurityToken to the cert.pem".
+	decodedCert, err := base64.StdEncoding.DecodeString(compResp.BinarySecurityToken)
+	if err != nil {
+		return nil, fmt.Errorf("step 2: base64-decode binarySecurityToken (len=%d): %w", len(compResp.BinarySecurityToken), err)
+	}
+	certPEM := string(decodedCert)
+	log.Printf("Onboard step 2/4: cert decoded (token_len=%d → cert_len=%d, first16=%q)",
+		len(compResp.BinarySecurityToken), len(certPEM), safePrefix(certPEM, 16))
 	s.SDK.SetCredentials(privateKeyPEM, certPEM)
 
 	// Step 3: Submit 6 compliance invoices
@@ -523,6 +548,15 @@ func maskOTP(s string) string {
 		return s
 	}
 	return s[:2] + "****" + s[len(s)-2:]
+}
+
+// safePrefix returns the first n bytes of s, or s itself if shorter.
+// Used for safe diagnostic logging of cert/key bodies.
+func safePrefix(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
 }
 
 func min(a, b int) int {
