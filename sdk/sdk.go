@@ -31,20 +31,28 @@ func (s *SDK) SetCredentials(privateKeyPEM, certPEM string) {
 	s.certPEM = certPEM
 }
 
-// stripPEMArmor removes PEM BEGIN/END header lines and surrounding whitespace,
-// leaving only the base64 body. The ZATCA Java SDK requires the EC private key
-// (Data/Certificates/ec-secp256k1-priv-key.pem) and certificate
-// (Data/Certificates/cert.pem) to be the raw base64 body without headers/footers,
-// otherwise fatoora -sign / -qr fails with:
+// stripPEMArmor removes PEM BEGIN/END header lines and ALL whitespace
+// (including the newlines between base64 lines), returning a single contiguous
+// base64 string. The ZATCA Java SDK's InvoiceSigningService loads the key/cert
+// files via java.util.Base64.getDecoder().decode(...), which is the strict
+// RFC 4648 decoder and rejects embedded newlines or spaces. It also rejects
+// "-----BEGIN/END-----" markers explicitly. The shipped sample
+// Data/Certificates/ec-secp256k1-priv-key.pem is a single unbroken base64 line
+// for the same reason.
 //
-//	"please provide private key without -----BEGIN EC PRIVATE KEY----- and -----END EC PRIVATE KEY-----"
+// Failure modes seen on the wire when this is wrong:
+//   - "[please provide private key without -----BEGIN EC PRIVATE KEY----- and
+//     -----END EC PRIVATE KEY-----]" — markers still present.
+//   - "[please provide a valid private key]" — markers stripped but body still
+//     contains whitespace/newlines, so Base64.getDecoder() returns null.
 //
 // See SDK Readme and https://zatca1.discourse.group (search "BEGIN EC PRIVATE KEY").
 func stripPEMArmor(s string) string {
 	if s == "" {
 		return s
 	}
-	var out []string
+	// Pass 1: drop BEGIN/END lines while we still have line structure.
+	var body strings.Builder
 	for _, line := range strings.Split(s, "\n") {
 		t := strings.TrimSpace(line)
 		if t == "" {
@@ -53,9 +61,24 @@ func stripPEMArmor(s string) string {
 		if strings.HasPrefix(t, "-----BEGIN ") || strings.HasPrefix(t, "-----END ") {
 			continue
 		}
-		out = append(out, t)
+		body.WriteString(t)
+		// no separator: produce a single contiguous base64 string.
 	}
-	return strings.Join(out, "\n")
+	// Pass 2: drop any remaining whitespace just in case (e.g. CR inside a
+	// trimmed line on Windows-origin input).
+	out := body.String()
+	if !strings.ContainsAny(out, " \t\r\n") {
+		return out
+	}
+	var clean strings.Builder
+	clean.Grow(len(out))
+	for _, r := range out {
+		if r == ' ' || r == '\t' || r == '\r' || r == '\n' {
+			continue
+		}
+		clean.WriteRune(r)
+	}
+	return clean.String()
 }
 
 // credentialScript returns a bash snippet that writes the private key and certificate
