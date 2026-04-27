@@ -2,6 +2,7 @@ package storeconfig
 
 import (
 	"database/sql"
+	"encoding/base64"
 	"fmt"
 	"net/http"
 	"time"
@@ -149,14 +150,28 @@ func (bz *BranchZATCA) NewService(base *config.Config) *zatca.Service {
 	return svc
 }
 
-// CertificatePEM returns the certificate in PEM format.
-// ZATCA returns certificates as base64(DER). The SDK expects PEM format,
-// so we wrap it with PEM headers.
+// CertificatePEM returns the certificate body suitable for the SDK's cert.pem.
+//
+// ZATCA's /production/csids endpoint returns `binarySecurityToken` =
+// Base64(<cert.pem body>), where the inner body is itself raw Base64(DER)
+// (same shape as the SDK's shipped Data/Certificates/cert.pem). The Java SDK's
+// InvoiceSigningService reads cert.pem and Base64-decodes it ONCE, then calls
+// CertificateFactory.generateCertificate(...). So cert.pem must contain the
+// inner Base64(DER), NOT the raw doubly-encoded token. Writing the raw token
+// fails with "[ERROR] InvoiceSigningService - failed to sign invoice
+// [please provide a valid certificate]" (reproduced in Docker).
+//
+// Therefore: base64-decode the stored token once and return the decoded body.
+// If the decode fails (legacy data already stored decoded), fall back to the
+// stored value unchanged.
 func (bz *BranchZATCA) CertificatePEM() string {
 	if bz.Certificate == "" {
 		return ""
 	}
-	return "-----BEGIN CERTIFICATE-----\n" + bz.Certificate + "\n-----END CERTIFICATE-----"
+	if decoded, err := base64.StdEncoding.DecodeString(bz.Certificate); err == nil && len(decoded) > 0 {
+		return string(decoded)
+	}
+	return bz.Certificate
 }
 
 // ZATCAStatus represents the connection state of a branch with ZATCA.

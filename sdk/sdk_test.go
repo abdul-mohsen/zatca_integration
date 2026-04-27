@@ -54,3 +54,48 @@ func TestEnvFlag(t *testing.T) {
 		}
 	}
 }
+
+func TestStripPEMArmor(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"empty", "", ""},
+		{"already stripped", "MIID3jCCA4Sg", "MIID3jCCA4Sg"},
+		{
+			"cert with markers and newlines",
+			"-----BEGIN CERTIFICATE-----\nMIID3jCC\nA4SgAwIB\n-----END CERTIFICATE-----",
+			"MIID3jCCA4SgAwIB",
+		},
+		{
+			"key with markers and CRLF",
+			"-----BEGIN EC PRIVATE KEY-----\r\nMHcCAQE\r\nGByqGSM49\r\n-----END EC PRIVATE KEY-----\r\n",
+			"MHcCAQEGByqGSM49",
+		},
+		{
+			"trailing newline only",
+			"MIID3jCCA4Sg\n",
+			"MIID3jCCA4Sg",
+		},
+		{
+			"internal spaces",
+			"MIID 3jCC\tA4Sg",
+			"MIID3jCCA4Sg",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := stripPEMArmor(tt.in)
+			if got != tt.want {
+				t.Errorf("stripPEMArmor(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+			// Strict-base64 invariant: output must contain no whitespace or markers.
+			for _, r := range got {
+				if r == ' ' || r == '\t' || r == '\r' || r == '\n' {
+					t.Errorf("output contains whitespace: %q", got)
+				}
+			}
+		})
+	}
+}

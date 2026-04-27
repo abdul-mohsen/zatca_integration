@@ -230,7 +230,10 @@ fatoora -generateHash -invoice /tmp/invoice.xml %s
 // SignInvoice signs an invoice XML using the SDK.
 func (s *SDK) SignInvoice(xmlContent string) (signedXML string, hash string, err error) {
 	envFlag := s.envFlag()
-	log.Printf("SDK.SignInvoice: envFlag=%q hasKey=%t hasCert=%t xmlLen=%d", envFlag, s.privateKey != "", s.certPEM != "", len(xmlContent))
+	keyBody := stripPEMArmor(s.privateKey)
+	certBody := stripPEMArmor(s.certPEM)
+	log.Printf("SDK.SignInvoice: envFlag=%q xmlLen=%d key_body_len=%d cert_body_len=%d cert_first16=%q",
+		envFlag, len(xmlContent), len(keyBody), len(certBody), certBody[:min(16, len(certBody))])
 
 	script := fmt.Sprintf(`%s
 cat > /tmp/invoice.xml << 'XMLEOF'
