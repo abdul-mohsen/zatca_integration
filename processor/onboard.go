@@ -53,33 +53,41 @@ func OnboardBranch(db *sql.DB, baseCfg *config.Config, branchID int64, otp strin
 	log.Printf("Onboard branch %d: company=%s branch=%s vat=%s env=%s",
 		branchID, branch.CompanyName, branch.BranchName, branch.VATReg, cfg.Env)
 
-	// Step 1: CSR + private key. Reuse what's already stored if present
-	// so retries (after an Invalid-OTP failure, for example) don't burn a
-	// new EGS identity and don't lose the original key.
-	var csrPEM, privateKey string
-	if branch.ExistingCSR != "" && branch.ExistingPrivateKey != "" {
-		log.Printf("Branch %d: reusing existing CSR + private key from DB", branchID)
-		csrPEM = branch.ExistingCSR
-		privateKey = branch.ExistingPrivateKey
-		svc.SDK.SetCredentials(privateKey, "")
-	} else {
-		csrResult, err := svc.SDK.GenerateCSR(cfg.CSR)
-		if err != nil {
-			return fmt.Errorf("step 1 (generate CSR): %w", err)
-		}
-		csrPEM = csrResult.CSR
-		privateKey = csrResult.PrivateKey
-		// Persist CSR + key immediately so a failure in the compliance
-		// step doesn't lose them and a retry can reuse the same identity.
-		encKey2, err := encKey.Encrypt(privateKey)
-		if err != nil {
-			return fmt.Errorf("step 1 (encrypt private key): %w", err)
-		}
-		if err := saveOnboardCSR(db, branchID, cfg, csrPEM, encKey2, tp.TIN, tp.ComputerNumber); err != nil {
-			return fmt.Errorf("step 1 (persist CSR): %w", err)
-		}
-		svc.SDK.SetCredentials(privateKey, "")
+	// Step 1: CSR + private key.
+	//
+	// A CSR is single-shot at ZATCA: once it has been exchanged for a
+	// Compliance CSID, submitting the same CSR again returns HTTP 409
+	// ("Compliance transaction was submitted/generated before"), regardless
+	// of which OTP is attached. So the only safe time to reuse a stored
+	// CSR is when onboarding actually completed (i.e. we already saved a
+	// compliance certificate). If there's a stored CSR but no compliance
+	// certificate, the previous attempt either succeeded without our
+	// catching the result, or burned the CSR on ZATCA's side. In both
+	// cases the right move on a fresh OTP is to generate a new CSR.
+	if branch.ComplianceCert != "" {
+		return fmt.Errorf("branch %d: onboarding already completed (compliance certificate is present); revoke and clear branch_zatca_config to re-onboard", branchID)
 	}
+
+	var csrPEM, privateKey string
+	if branch.ExistingCSR != "" {
+		log.Printf("Branch %d: discarding stale CSR (no compliance cert saved); generating fresh CSR with new OTP", branchID)
+	}
+	csrResult, err := svc.SDK.GenerateCSR(cfg.CSR)
+	if err != nil {
+		return fmt.Errorf("step 1 (generate CSR): %w", err)
+	}
+	csrPEM = csrResult.CSR
+	privateKey = csrResult.PrivateKey
+	// Persist CSR + key immediately so a failure later can be debugged
+	// without re-running CSR generation.
+	encKey2, err := encKey.Encrypt(privateKey)
+	if err != nil {
+		return fmt.Errorf("step 1 (encrypt private key): %w", err)
+	}
+	if err := saveOnboardCSR(db, branchID, cfg, csrPEM, encKey2, tp.TIN, tp.ComputerNumber); err != nil {
+		return fmt.Errorf("step 1 (persist CSR): %w", err)
+	}
+	svc.SDK.SetCredentials(privateKey, "")
 
 	// Run the rest of onboarding (compliance CSID → 6 invoices → production CSID)
 	// using the already-generated key.
@@ -190,6 +198,11 @@ type onboardBranchData struct {
 	// generated them). Empty when this is a fresh onboard.
 	ExistingCSR        string
 	ExistingPrivateKey string
+
+	// ComplianceCert is non-empty once onboarding has fully succeeded.
+	// Used to refuse a redundant onboard attempt instead of burning a
+	// new CSR or hitting ZATCA's 409 dedup.
+	ComplianceCert string
 }
 
 func (b *onboardBranchData) taxpayer() *config.Taxpayer {
@@ -244,7 +257,8 @@ func loadOnboardBranch(db *sql.DB, branchID int64, encKey *secutil.Key) (*onboar
 		COALESCE(bz.zatca_csr, '') AS bz_csr,
 		COALESCE(bz.zatca_private_key, '') AS bz_priv,
 		COALESCE(bz.csr_tin, '') AS bz_tin,
-		COALESCE(bz.csr_computer_number, '') AS bz_uuid
+		COALESCE(bz.csr_computer_number, '') AS bz_uuid,
+		COALESCE(bz.zatca_compliance_certificate, '') AS bz_comp_cert
 	FROM branches b
 	JOIN company c ON c.id = b.company_id
 	LEFT JOIN store s ON s.id = (
@@ -258,14 +272,14 @@ func loadOnboardBranch(db *sql.DB, branchID int64, encKey *secutil.Key) (*onboar
 		sStreet, sBuilding, sDistrict, sCity, sPostal, sCountry, companyBiz string
 		bzOrgID, bzOrgUnit, bzOrgName, bzCountry, bzLocation, bzBiz         string
 		bzVAT, bzCRN, bzStreet, bzBuilding, bzDistrict, bzPostal            string
-		bzCSR, bzPriv, bzTIN, bzUUID                                        string
+		bzCSR, bzPriv, bzTIN, bzUUID, bzCompCert                            string
 	)
 	err := db.QueryRow(q, branchID).Scan(
 		&companyName, &companyNameAR, &companyVAT, &companyCRN, &branchName,
 		&sStreet, &sBuilding, &sDistrict, &sCity, &sPostal, &sCountry, &companyBiz,
 		&bzOrgID, &bzOrgUnit, &bzOrgName, &bzCountry, &bzLocation, &bzBiz,
 		&bzVAT, &bzCRN, &bzStreet, &bzBuilding, &bzDistrict, &bzPostal,
-		&bzCSR, &bzPriv, &bzTIN, &bzUUID,
+		&bzCSR, &bzPriv, &bzTIN, &bzUUID, &bzCompCert,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -298,6 +312,7 @@ func loadOnboardBranch(db *sql.DB, branchID int64, encKey *secutil.Key) (*onboar
 		CSRTIN:            bzTIN,
 		CSRComputerNumber: bzUUID,
 		ExistingCSR:       bzCSR,
+		ComplianceCert:    bzCompCert,
 	}
 
 	if bzPriv != "" {
