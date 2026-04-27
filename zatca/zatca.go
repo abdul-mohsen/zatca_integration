@@ -248,21 +248,20 @@ func (s *Service) buildComplianceInvoice(typeCode invoice.TypeCode, subType invo
 		},
 	}
 
-	// Standard (B2B) invoices require a Customer party with VAT.
-	// Simplified (B2C) compliance invoices MUST NOT include a customer
-	// with VAT/address (KSA-22): leave Customer empty so the XML omits
-	// the AccountingCustomerParty block.
-	if subType == invoice.SubTypeStandard {
-		inv.Customer = invoice.Party{
-			RegistrationName: "Fatoora Samples LTD",
-			VAT:              "399999999800003",
-			Street:           "Prince Sultan",
-			Building:         "2322",
-			District:         "Al-Murabba",
-			City:             "Riyadh",
-			PostalCode:       "23333",
-			Country:          "SA",
-		}
+	// AccountingCustomerParty is required by the UBL 2.1 Invoice schema
+	// for BOTH standard and simplified invoices. The ZATCA SDK's shipped
+	// Samples/Simplified/Invoice/Simplified_Invoice.xml includes a full
+	// ACP with VAT, address and legal entity, so we use the same
+	// `Fatoora Samples LTD` test customer for every compliance invoice.
+	inv.Customer = invoice.Party{
+		RegistrationName: "Fatoora Samples LTD",
+		VAT:              "399999999800003",
+		Street:           "Prince Sultan",
+		Building:         "2322",
+		District:         "Al-Murabba",
+		City:             "Riyadh",
+		PostalCode:       "23333",
+		Country:          "SA",
 	}
 
 	// Credit/debit notes need a billing reference and KSA-10 reason note.
