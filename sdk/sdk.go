@@ -82,18 +82,34 @@ func stripPEMArmor(s string) string {
 }
 
 // credentialScript returns a bash snippet that writes the private key and certificate
-// to the paths expected by the ZATCA SDK. Both files must contain only the base64
-// body (no PEM BEGIN/END markers) per the SDK requirement.
+// to the paths expected by the ZATCA SDK.
+//
+// Both files must contain ONLY the base64 body — no PEM BEGIN/END markers AND no
+// trailing newline. The Java SDK reads the file as a UTF-8 string and feeds it
+// directly to java.util.Base64.getDecoder().decode(...), which is the strict
+// RFC 4648 decoder and rejects any character outside the base64 alphabet,
+// including a single trailing '\n'. Verified empirically inside the docker
+// runtime: a file ending in `\n` produces
+//
+//	[ERROR] InvoiceSigningService - failed to sign invoice [please provide a valid private key]
+//
+// while the same body with no trailing newline signs successfully.
+//
+// We use `printf '%s'` (not heredoc, not echo) to write the file because:
+//   - heredoc always appends a trailing newline.
+//   - `echo` (without -n) appends a trailing newline; `echo -n` is non-portable.
+//   - the stripped body is pure base64 ([A-Za-z0-9+/=]) which is safe inside
+//     single quotes — no shell escaping needed.
 func (s *SDK) credentialScript() string {
 	if s.privateKey == "" && s.certPEM == "" {
 		return ""
 	}
 	var sb strings.Builder
 	if s.privateKey != "" {
-		sb.WriteString(fmt.Sprintf("cat > /SDK/zatca-einvoicing-sdk-238-R4.0.0/Data/Certificates/ec-secp256k1-priv-key.pem << 'KEYEOF'\n%s\nKEYEOF\n", stripPEMArmor(s.privateKey)))
+		sb.WriteString(fmt.Sprintf("printf '%%s' '%s' > /SDK/zatca-einvoicing-sdk-238-R4.0.0/Data/Certificates/ec-secp256k1-priv-key.pem\n", stripPEMArmor(s.privateKey)))
 	}
 	if s.certPEM != "" {
-		sb.WriteString(fmt.Sprintf("cat > /SDK/zatca-einvoicing-sdk-238-R4.0.0/Data/Certificates/cert.pem << 'CERTEOF'\n%s\nCERTEOF\n", stripPEMArmor(s.certPEM)))
+		sb.WriteString(fmt.Sprintf("printf '%%s' '%s' > /SDK/zatca-einvoicing-sdk-238-R4.0.0/Data/Certificates/cert.pem\n", stripPEMArmor(s.certPEM)))
 	}
 	return sb.String()
 }
