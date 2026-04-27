@@ -99,3 +99,46 @@ func TestStripPEMArmor(t *testing.T) {
 		})
 	}
 }
+
+func TestGenerateQR_ExtractsEmbeddedQR(t *testing.T) {
+	const qr = "AQ1Tb2xkRWRnZSBMTEMCDzMxMzEyMzA1MTQwMDAwMwMTMjAyNi0wNC0yN1QxMTowNzo1NA=="
+	const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<Invoice>
+    <cac:AdditionalDocumentReference>
+        <cbc:ID>PIH</cbc:ID>
+        <cac:Attachment>
+            <cbc:EmbeddedDocumentBinaryObject mimeCode="text/plain">prevhash==</cbc:EmbeddedDocumentBinaryObject>
+        </cac:Attachment>
+    </cac:AdditionalDocumentReference>
+    <cac:AdditionalDocumentReference>
+        <cbc:ID>QR</cbc:ID>
+        <cac:Attachment>
+            <cbc:EmbeddedDocumentBinaryObject mimeCode="text/plain">` + qr + `</cbc:EmbeddedDocumentBinaryObject>
+        </cac:Attachment>
+    </cac:AdditionalDocumentReference>
+</Invoice>`
+	s := &SDK{}
+	got, err := s.GenerateQR(xml)
+	if err != nil {
+		t.Fatalf("GenerateQR error: %v", err)
+	}
+	if got != qr {
+		t.Errorf("GenerateQR = %q, want %q", got, qr)
+	}
+}
+
+func TestGenerateQR_MissingQRReturnsError(t *testing.T) {
+	const xml = `<?xml version="1.0"?><Invoice><cac:AdditionalDocumentReference><cbc:ID>PIH</cbc:ID><cac:Attachment><cbc:EmbeddedDocumentBinaryObject>x</cbc:EmbeddedDocumentBinaryObject></cac:Attachment></cac:AdditionalDocumentReference></Invoice>`
+	s := &SDK{}
+	if _, err := s.GenerateQR(xml); err == nil {
+		t.Error("expected error when QR element absent, got nil")
+	}
+}
+
+func TestGenerateQR_EmptyQRReturnsError(t *testing.T) {
+	const xml = `<cac:AdditionalDocumentReference><cbc:ID>QR</cbc:ID><cac:Attachment><cbc:EmbeddedDocumentBinaryObject mimeCode="text/plain"></cbc:EmbeddedDocumentBinaryObject></cac:Attachment></cac:AdditionalDocumentReference>`
+	s := &SDK{}
+	if _, err := s.GenerateQR(xml); err == nil {
+		t.Error("expected error when QR EmbeddedDocumentBinaryObject body empty, got nil")
+	}
+}
