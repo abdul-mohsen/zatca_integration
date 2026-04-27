@@ -31,18 +31,46 @@ func (s *SDK) SetCredentials(privateKeyPEM, certPEM string) {
 	s.certPEM = certPEM
 }
 
+// stripPEMArmor removes PEM BEGIN/END header lines and surrounding whitespace,
+// leaving only the base64 body. The ZATCA Java SDK requires the EC private key
+// (Data/Certificates/ec-secp256k1-priv-key.pem) and certificate
+// (Data/Certificates/cert.pem) to be the raw base64 body without headers/footers,
+// otherwise fatoora -sign / -qr fails with:
+//
+//	"please provide private key without -----BEGIN EC PRIVATE KEY----- and -----END EC PRIVATE KEY-----"
+//
+// See SDK Readme and https://zatca1.discourse.group (search "BEGIN EC PRIVATE KEY").
+func stripPEMArmor(s string) string {
+	if s == "" {
+		return s
+	}
+	var out []string
+	for _, line := range strings.Split(s, "\n") {
+		t := strings.TrimSpace(line)
+		if t == "" {
+			continue
+		}
+		if strings.HasPrefix(t, "-----BEGIN ") || strings.HasPrefix(t, "-----END ") {
+			continue
+		}
+		out = append(out, t)
+	}
+	return strings.Join(out, "\n")
+}
+
 // credentialScript returns a bash snippet that writes the private key and certificate
-// to the paths expected by the ZATCA SDK.
+// to the paths expected by the ZATCA SDK. Both files must contain only the base64
+// body (no PEM BEGIN/END markers) per the SDK requirement.
 func (s *SDK) credentialScript() string {
 	if s.privateKey == "" && s.certPEM == "" {
 		return ""
 	}
 	var sb strings.Builder
 	if s.privateKey != "" {
-		sb.WriteString(fmt.Sprintf("cat > /SDK/zatca-einvoicing-sdk-238-R4.0.0/Data/Certificates/ec-secp256k1-priv-key.pem << 'KEYEOF'\n%s\nKEYEOF\n", s.privateKey))
+		sb.WriteString(fmt.Sprintf("cat > /SDK/zatca-einvoicing-sdk-238-R4.0.0/Data/Certificates/ec-secp256k1-priv-key.pem << 'KEYEOF'\n%s\nKEYEOF\n", stripPEMArmor(s.privateKey)))
 	}
 	if s.certPEM != "" {
-		sb.WriteString(fmt.Sprintf("cat > /SDK/zatca-einvoicing-sdk-238-R4.0.0/Data/Certificates/cert.pem << 'CERTEOF'\n%s\nCERTEOF\n", s.certPEM))
+		sb.WriteString(fmt.Sprintf("cat > /SDK/zatca-einvoicing-sdk-238-R4.0.0/Data/Certificates/cert.pem << 'CERTEOF'\n%s\nCERTEOF\n", stripPEMArmor(s.certPEM)))
 	}
 	return sb.String()
 }
