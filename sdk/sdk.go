@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os/exec"
+	"regexp"
 	"strings"
 
 	"github.com/zatca-go/zatca/config"
@@ -273,30 +274,37 @@ cat /tmp/signed.xml
 	return signedXML, hash, nil
 }
 
-// GenerateQR generates the QR code for a signed invoice.
+// qrEmbeddedRe matches the QR <cbc:EmbeddedDocumentBinaryObject> body inside
+// the AdditionalDocumentReference whose <cbc:ID> is exactly "QR". The (?s)
+// flag lets `.` match newlines so we can span the intervening Attachment
+// element. We deliberately do NOT use a real XML parser here: the signed XML
+// must remain byte-for-byte identical for the XAdES signature to verify, and
+// any round-trip through encoding/xml would re-encode whitespace.
+var qrEmbeddedRe = regexp.MustCompile(`(?s)<cac:AdditionalDocumentReference>\s*<cbc:ID>\s*QR\s*</cbc:ID>.*?<cbc:EmbeddedDocumentBinaryObject[^>]*>([^<]+)</cbc:EmbeddedDocumentBinaryObject>`)
+
+// GenerateQR returns the base64-encoded TLV QR code for a signed simplified
+// invoice.
+//
+// The QR is already embedded inside the signed XML by the signing pipeline
+// (cac:AdditionalDocumentReference[cbc:ID='QR']/cac:Attachment/
+// cbc:EmbeddedDocumentBinaryObject), so we extract it directly with a regex
+// rather than calling `fatoora -qr`. The CLI re-derives the QR from the XAdES
+// <ds:Signature> and routinely fails with
+//
+//	[ERROR] QrGenerationService - failed to generate qr [unable to get
+//	signature from invoice]
+//
+// on otherwise valid signed XML — particularly when the signature uses the
+// secp256k1 curve. Reading the embedded QR is also ~100x faster (no JVM
+// startup) and works offline.
 func (s *SDK) GenerateQR(xmlContent string) (string, error) {
-	script := fmt.Sprintf(`%s
-cat > /tmp/invoice.xml << 'XMLEOF'
-%s
-XMLEOF
-fatoora -qr -invoice /tmp/invoice.xml %s
-`, s.credentialScript(), xmlContent, s.envFlag())
-
-	stdout, stderr, err := s.localExec(script)
-	combined := stdout + "\n" + stderr
-	if err != nil {
-		return "", fmt.Errorf("GenerateQR: %w\noutput: %s", err, combined)
-	}
-
-	for _, line := range strings.Split(combined, "\n") {
-		if strings.Contains(line, "QR code =") {
-			parts := strings.SplitN(line, "=", 2)
-			if len(parts) == 2 {
-				return strings.TrimSpace(parts[1]), nil
-			}
+	if m := qrEmbeddedRe.FindStringSubmatch(xmlContent); len(m) == 2 {
+		qr := strings.TrimSpace(m[1])
+		if qr != "" {
+			return qr, nil
 		}
 	}
-	return "", fmt.Errorf("GenerateQR: could not find QR in output: %s", combined)
+	return "", fmt.Errorf("GenerateQR: QR EmbeddedDocumentBinaryObject not found in signed XML")
 }
 
 // GenerateAPIRequest generates the JSON API request for an invoice.
