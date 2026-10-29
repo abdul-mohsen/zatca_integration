@@ -19,7 +19,10 @@ services:
       start_period: 30s
 
   zatca-daemon-test:
-    build: .
+    build:
+      context: .
+      additional_contexts:
+        zatca-sdk: ${ZATCA_SDK_PATH:?ZATCA_SDK_PATH must point to the private ZATCA SDK root}
     container_name: zatca-test-daemon
     depends_on:
       mysql-test:
