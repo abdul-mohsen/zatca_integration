@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Invoice xmlns="urn:oasis:names:specification:ubl:schema:xsd:Invoice-2"
+         xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2"
+         xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2">
+  <cbc:ID>UNSIGNED-1</cbc:ID>
+  <cbc:UUID>550e8400-e29b-41d4-a716-446655440001</cbc:UUID>
+  <cbc:IssueDate>2026-09-27</cbc:IssueDate>
+  <cbc:Note>same supplier identity, duplicate intake evidence</cbc:Note>
+  <cbc:DocumentCurrencyCode>SAR</cbc:DocumentCurrencyCode>
+  <cac:LegalMonetaryTotal><cbc:PayableAmount currencyID="SAR">1.00</cbc:PayableAmount></cac:LegalMonetaryTotal>
+  <cac:InvoiceLine>
+    <cbc:ID>1</cbc:ID>
+    <cbc:InvoicedQuantity unitCode="PCE">1</cbc:InvoicedQuantity>
+    <cbc:LineExtensionAmount currencyID="SAR">1.00</cbc:LineExtensionAmount>
+    <cac:Item><cbc:Name>Unsigned item</cbc:Name></cac:Item>
+    <cac:Price><cbc:PriceAmount currencyID="SAR">1.00</cbc:PriceAmount></cac:Price>
+  </cac:InvoiceLine>
+</Invoice>

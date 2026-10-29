@@ -520,7 +520,39 @@ The path is also stored in the bill row as `invoice_xml_path`.
 
 ---
 
-## 9. ZATCA Environments
+## 9. Supplier signed-UBL import boundary
+
+The `invoice` package exposes a side-effect-free import service for supplier
+UBL 2.1 XML. It keeps an in-memory defensive copy of the exact source bytes
+and caller provenance, then returns the versioned canonical `UBLImport`
+mapping:
+
+```go
+service := invoice.NewImportService(invoice.ImportOptions{
+    TrustedCertificates: trustedRoots, // optional provider-configured roots
+})
+
+result, err := service.Import(invoice.ImportRequest{
+    Bytes:            xmlBytes,
+    MIMEType:         "application/xml",
+    OriginalName:     "supplier-invoice.xml",
+    ContentReference: "upload:123",
+    Provenance:       "supplier_upload",
+})
+```
+
+`ImportFailure` provides stable classes for malformed, unsafe, oversized,
+required-field, signature, trust, schema, and unsupported-content outcomes.
+Canonical fields and unsupported raw XML remain available on failures discovered
+after safe parsing. The service does not persist documents, post bills, or
+change stock/accounting. Without configured trust roots, a structurally signed
+or unsigned document remains explicitly review-gated and is never reported as
+cryptographically verified. Authentic ZATCA provider roots and signed fixtures
+must be supplied by the deployment/integration environment.
+
+---
+
+## 10. ZATCA Environments
 
 | Environment | Base URL | Usage |
 |-------------|----------|-------|
@@ -532,7 +564,7 @@ Set per-tenant via `tenant.zatca_env` column in the master DB.
 
 ---
 
-## 10. ZATCA Timing Rules
+## 11. ZATCA Timing Rules
 
 | Invoice Type | API | Deadline |
 |---|---|---|
@@ -541,7 +573,7 @@ Set per-tenant via `tenant.zatca_env` column in the master DB.
 
 ---
 
-## 11. Certificate Renewal
+## 12. Certificate Renewal
 
 ZATCA certificates expire after ~1 year. To renew, get a fresh OTP from the Fatoora portal and re-onboard:
 
@@ -559,7 +591,7 @@ The `INSERT ... ON DUPLICATE KEY UPDATE` in the onboarding flow handles both ini
 
 ---
 
-## 12. Monitoring
+## 13. Monitoring
 
 | What | How | Frequency |
 |---|---|---|
