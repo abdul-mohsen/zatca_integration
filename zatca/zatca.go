@@ -61,6 +61,9 @@ type OnboardResult struct {
 // 3. Submit 6 compliance invoices (standard + simplified × invoice/credit/debit)
 // 4. Request Production CSID from ZATCA
 func (s *Service) Onboard() (*OnboardResult, error) {
+	if err := s.validateOnboardingConfig(); err != nil {
+		return nil, err
+	}
 	log.Printf("Onboard: env=%s baseURL=%s otp=%s", s.Config.Env, s.Config.BaseURL(), maskOTP(s.Config.OTP))
 
 	// Step 1: Generate CSR
@@ -91,6 +94,9 @@ func (s *Service) Onboard() (*OnboardResult, error) {
 // The CSR + private key are NOT included in the returned OnboardResult
 // so the caller is expected to know them already.
 func (s *Service) OnboardWithCSR(csrPEM, privateKeyPEM string) (*OnboardResult, error) {
+	if err := s.validateOnboardingConfig(); err != nil {
+		return nil, err
+	}
 	result := &OnboardResult{}
 
 	// Inject the private key into the SDK so subsequent Docker commands can sign.
@@ -164,6 +170,16 @@ func (s *Service) OnboardWithCSR(csrPEM, privateKeyPEM string) (*OnboardResult, 
 	s.Config.ProductionPassword = prodResp.Secret
 
 	return result, nil
+}
+
+func (s *Service) validateOnboardingConfig() error {
+	if s == nil || s.Config == nil {
+		return fmt.Errorf("invalid ZATCA configuration: config is required")
+	}
+	if err := s.Config.Validate(); err != nil {
+		return fmt.Errorf("invalid ZATCA configuration: %w", err)
+	}
+	return nil
 }
 
 // submitComplianceInvoices submits the 6 required compliance invoices.

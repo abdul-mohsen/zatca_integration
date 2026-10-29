@@ -26,8 +26,10 @@ import (
 //
 // Optional (have sensible defaults):
 //   - InvoiceType      (defaults to "1100" = standard + simplified)
-//   - LocationCode     (single short-address string, e.g. "RRRD2929"; default "0000000000")
 //   - Country          (defaults to "SA")
+//
+// Required CSR input:
+//   - LocationCode     (single short-address string, e.g. "RRRD2929")
 type Taxpayer struct {
 	// Required
 	CompanyName      string // English legal name
@@ -45,9 +47,11 @@ type Taxpayer struct {
 	PostalCode string
 
 	// Optional — defaults applied if empty
-	InvoiceType  string // "1100" = standard+simplified (default)
-	LocationCode string // Single short-address string (e.g. "RRRD2929", default "0000000000")
-	Country      string // ISO 3166-1 alpha-2 (default: "SA")
+	InvoiceType string // "1100" = standard+simplified (default)
+	Country     string // ISO 3166-1 alpha-2 (default: "SA")
+
+	// CSR-required — no safe default
+	LocationCode string // Single short-address string (e.g. "RRRD2929")
 
 	// Auto-generated — filled by applyDefaults(), do not set manually
 	TIN            string // 9-digit EGS serial for CSR CommonName (e.g. "886431145")
@@ -120,12 +124,15 @@ func (t *Taxpayer) Validate() error {
 		{t.LocationCode, "LocationCode"},
 	}
 	for _, c := range checks {
-		if c.val == "" {
-			return fmt.Errorf("Taxpayer.%s is required", c.name)
+		if err := validateRequired(c.val, c.name); err != nil {
+			return err
 		}
 	}
-	if len(t.VATNumber) != 15 {
-		return fmt.Errorf("VATNumber must be 15 digits, got %d", len(t.VATNumber))
+	if err := validateSaudiVAT(t.VATNumber, "VATNumber"); err != nil {
+		return err
+	}
+	if err := validateShortAddress(t.LocationCode, "LocationCode"); err != nil {
+		return err
 	}
 	return nil
 }

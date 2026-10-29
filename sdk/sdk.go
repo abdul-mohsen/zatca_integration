@@ -123,6 +123,10 @@ type CSRResult struct {
 
 // GenerateCSR generates a Certificate Signing Request using the SDK.
 func (s *SDK) GenerateCSR(csrCfg config.CSRConfig) (*CSRResult, error) {
+	if err := csrCfg.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid CSR config: %w", err)
+	}
+
 	// Write CSR config properties
 	props := fmt.Sprintf(`csr.common.name=%s
 csr.serial.number=%s

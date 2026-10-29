@@ -1,10 +1,36 @@
 package zatca
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/zatca-go/zatca/config"
 )
+
+func TestOnboardRejectsInvalidCSRConfigBeforeSDK(t *testing.T) {
+	svc := New(&config.Config{
+		Env: config.Sandbox,
+		CSR: config.CSRConfig{
+			CommonName:       "TST-123456789-199999999900003",
+			SerialNumber:     "1-Test|2-TST|3-device",
+			OrgIdentifier:    "199999999900003",
+			OrgUnit:          "Main Branch",
+			OrgName:          "Test Company LTD",
+			Country:          "SA",
+			InvoiceType:      "1100",
+			Location:         "RRRD2929",
+			BusinessCategory: "Supply activities",
+		},
+	})
+
+	_, err := svc.Onboard()
+	if err == nil {
+		t.Fatal("Onboard accepted invalid CSR configuration")
+	}
+	if !strings.Contains(err.Error(), "invalid ZATCA configuration") {
+		t.Fatalf("Onboard error = %q, want local configuration validation error", err)
+	}
+}
 
 func TestPemToBase64(t *testing.T) {
 	pem := `-----BEGIN CERTIFICATE REQUEST-----

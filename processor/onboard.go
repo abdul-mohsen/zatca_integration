@@ -31,12 +31,6 @@ func OnboardBranch(db *sql.DB, baseCfg *config.Config, branchID int64, otp strin
 	if err := tp.Validate(); err != nil {
 		return fmt.Errorf("branch %d: %w", branchID, err)
 	}
-	// LocationCode ("csr.location.address") must be a 4 alpha + 4 digit
-	// short address per ZATCA. The default of all-zeros is a known
-	// rejection; require the user to set it explicitly.
-	if branch.CSRLocation == "" {
-		return fmt.Errorf("branch %d: csr_location is required (4 letters + 4 digits, e.g. RRRD2929)", branchID)
-	}
 
 	// Reuse the EGS identity (TIN + UUID) once it has been generated, so
 	// retries don't register a different device with ZATCA.
@@ -48,6 +42,9 @@ func OnboardBranch(db *sql.DB, baseCfg *config.Config, branchID int64, otp strin
 	}
 
 	cfg := tp.Config(baseCfg.Env, otp)
+	if err := cfg.Validate(); err != nil {
+		return fmt.Errorf("branch %d: %w", branchID, err)
+	}
 	svc := zatca.New(cfg)
 
 	log.Printf("Onboard branch %d: company=%s branch=%s vat=%s env=%s",

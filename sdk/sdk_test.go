@@ -1,10 +1,32 @@
 package sdk
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/zatca-go/zatca/config"
 )
+
+func TestGenerateCSRRejectsInvalidConfigBeforeSDK(t *testing.T) {
+	s := &SDK{}
+	_, err := s.GenerateCSR(config.CSRConfig{
+		CommonName:       "TST-123456789-199999999900003",
+		SerialNumber:     "1-Test|2-TST|3-device",
+		OrgIdentifier:    "199999999900003",
+		OrgUnit:          "Main Branch",
+		OrgName:          "Test Company LTD",
+		Country:          "SA",
+		InvoiceType:      "1100",
+		Location:         "RRRD2929",
+		BusinessCategory: "Supply activities",
+	})
+	if err == nil {
+		t.Fatal("GenerateCSR accepted invalid VAT configuration")
+	}
+	if !strings.Contains(err.Error(), "invalid CSR config") {
+		t.Fatalf("GenerateCSR error = %q, want local CSR validation error", err)
+	}
+}
 
 func TestParseCSROutput(t *testing.T) {
 	output := `===CSR===

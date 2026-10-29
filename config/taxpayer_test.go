@@ -30,6 +30,48 @@ func TestTaxpayerValidate(t *testing.T) {
 	}
 }
 
+func TestTaxpayerValidateRejectsMalformedVATAndLocation(t *testing.T) {
+	tests := []struct {
+		name string
+		edit func(*Taxpayer)
+	}{
+		{
+			name: "vat contains a non-digit",
+			edit: func(tp *Taxpayer) { tp.VATNumber = "39999999990000x" },
+		},
+		{
+			name: "vat does not start with three",
+			edit: func(tp *Taxpayer) { tp.VATNumber = "199999999900003" },
+		},
+		{
+			name: "vat does not end with three",
+			edit: func(tp *Taxpayer) { tp.VATNumber = "399999999900001" },
+		},
+		{
+			name: "location is eight digits",
+			edit: func(tp *Taxpayer) { tp.LocationCode = "12345678" },
+		},
+		{
+			name: "location has the wrong letter-digit shape",
+			edit: func(tp *Taxpayer) { tp.LocationCode = "ABC12345" },
+		},
+		{
+			name: "required value is whitespace-only",
+			edit: func(tp *Taxpayer) { tp.CompanyName = "   " },
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tp := validTaxpayer()
+			tt.edit(tp)
+			if err := tp.Validate(); err == nil {
+				t.Fatal("Validate() accepted malformed taxpayer data")
+			}
+		})
+	}
+}
+
 func TestTaxpayerCSR(t *testing.T) {
 	tp := validTaxpayer()
 	csr := tp.CSR()

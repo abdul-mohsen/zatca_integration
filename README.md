@@ -333,6 +333,12 @@ Get an OTP from the [Fatoora portal](https://fatoora.zatca.gov.sa), then publish
 publishOnboard(nc, "demo_db", 1, "354840")
 ```
 
+Before publishing, the branch taxpayer/CSR inputs must include a Saudi VAT
+registration number with 15 digits that starts and ends with `3`, all required
+taxpayer fields, and a Saudi National Address short address in the form
+`LLLLDDDD` (for example, `RRRD2929`). The daemon rejects malformed or
+whitespace-only values before invoking the SDK or contacting ZATCA.
+
 The daemon will:
 1. Load company/branch info from DB
 2. Generate CSR via the SDK
