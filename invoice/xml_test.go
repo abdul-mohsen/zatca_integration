@@ -135,6 +135,32 @@ func TestToXMLValidation(t *testing.T) {
 	}
 }
 
+func TestToXMLRejectsZeroICV(t *testing.T) {
+	inv := sampleInvoice()
+	inv.InvoiceCounterValue = 0
+
+	if _, err := inv.ToXML(); err == nil {
+		t.Fatal("expected zero ICV to be rejected")
+	}
+}
+
+func TestToXMLUsesNonDefaultChainPosition(t *testing.T) {
+	inv := sampleInvoice()
+	inv.PreviousInvoiceHash = "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXo="
+	inv.InvoiceCounterValue = 42
+
+	xml, err := inv.ToXML()
+	if err != nil {
+		t.Fatalf("ToXML() error: %v", err)
+	}
+	if !strings.Contains(xml, `<cbc:UUID>42</cbc:UUID>`) {
+		t.Fatal("XML does not contain the reserved non-default ICV")
+	}
+	if !strings.Contains(xml, inv.PreviousInvoiceHash) {
+		t.Fatal("XML does not contain the reserved PIH")
+	}
+}
+
 func TestLineItemCalc(t *testing.T) {
 	l := LineItem{
 		Quantity:    2,

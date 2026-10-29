@@ -151,15 +151,8 @@ func QueryCreditNoteByID(db *sql.DB, creditNoteID int64) (*CreditDebitRow, error
 	return &row, nil
 }
 
-// QueryDebitNoteByID is kept for compatibility but debit_note table does not exist
-// in the current backend schema. This will return an error if called.
+// QueryDebitNoteByID loads a debit note row by debit_note.id, JOINing bill.
 func QueryDebitNoteByID(db *sql.DB, debitNoteID int64) (*CreditDebitRow, error) {
-	return nil, fmt.Errorf("debit_note table does not exist in the current backend schema")
-}
-
-// queryDebitNoteByID_UNUSED is the original implementation preserved for when debit_note table is added.
-/*
-func queryDebitNoteByID_UNUSED(db *sql.DB, debitNoteID int64) (*CreditDebitRow, error) {
 	q := `SELECT
 		b.id,
 		CONCAT('https://ifritah.com/bill/', b.id) AS url,
@@ -232,7 +225,6 @@ func queryDebitNoteByID_UNUSED(db *sql.DB, debitNoteID int64) (*CreditDebitRow, 
 	row.URL = url
 	return &row, nil
 }
-*/
 
 // QueryPendingBills returns bill IDs where state < 3 for a given branch (used for startup replay).
 func QueryPendingBills(db *sql.DB, branchID int64) ([]int64, error) {
@@ -270,9 +262,22 @@ func QueryPendingCreditNotes(db *sql.DB, branchID int64) ([]int64, error) {
 	return ids, rows.Err()
 }
 
-// QueryPendingDebitNotes is a no-op: debit_note table does not exist in the current backend schema.
+// QueryPendingDebitNotes returns debit_note IDs where state = 1 for a branch.
 func QueryPendingDebitNotes(db *sql.DB, branchID int64) ([]int64, error) {
-	return nil, nil
+	rows, err := db.Query(`SELECT deb.id FROM debit_note deb JOIN bill b ON b.id = deb.bill_id WHERE b.branch_id = ? AND deb.state = 1 ORDER BY deb.id`, branchID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 // QueryActiveBranches returns all active branch IDs for a given tenant database.

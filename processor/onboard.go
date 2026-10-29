@@ -169,6 +169,9 @@ func OnboardBranch(db *sql.DB, baseCfg *config.Config, branchID int64, otp strin
 	); err != nil {
 		return fmt.Errorf("save credentials to DB: %w", err)
 	}
+	if err := InitializeBranchChainState(db, branchID); err != nil {
+		return fmt.Errorf("initialize branch chain state: %w", err)
+	}
 
 	log.Printf("Branch %d: Registration complete.", branchID)
 

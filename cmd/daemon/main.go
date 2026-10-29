@@ -268,15 +268,13 @@ func main() {
 
 		for _, branchID := range branches {
 			markBranchActive(dbName, branchID) // register so onboard won't duplicate
-			for _, docType := range []queue.DocType{queue.DocBill, queue.DocCredit, queue.DocDebit} {
-				wg.Add(1)
-				go func(dt queue.DocType, db string, bid int64) {
-					defer wg.Done()
-					runWorker(js, tenantMap, getService, dt, db, bid)
-				}(docType, dbName, branchID)
-			}
+			wg.Add(1)
+			go func(db string, bid int64) {
+				defer wg.Done()
+				runBranchWorker(js, tenantMap, getService, db, bid)
+			}(dbName, branchID)
 		}
-		log.Printf("  Started %d workers for tenant %s (%d branches × 3 doc types)", len(branches)*3, tc.tenant.Name, len(branches))
+		log.Printf("  Started %d branch workers for tenant %s (%d branches)", len(branches), tc.tenant.Name, len(branches))
 		if len(branches) == 0 {
 			log.Printf("  NOTE: No onboarded branches in %s — onboard a branch first, then bill workers will auto-start", tc.tenant.Name)
 		}

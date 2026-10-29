@@ -78,6 +78,9 @@ BEGIN
     SET @sql = CONCAT('GRANT SELECT, INSERT, UPDATE ON `', db_name, '`.`branch_zatca_config` TO ''zatca_daemon''@''%''');
     PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
+    SET @sql = CONCAT('GRANT SELECT, INSERT, UPDATE ON `', db_name, '`.`zatca_chain_position` TO ''zatca_daemon''@''%''');
+    PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
     -- == zatca_readonly grants ==
     SET @sql = CONCAT('GRANT SELECT ON `', db_name, '`.`branches` TO ''zatca_readonly''@''%''');
     PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;

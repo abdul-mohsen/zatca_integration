@@ -96,6 +96,23 @@ CREATE TABLE IF NOT EXISTS branch_zatca_config (
     UNIQUE KEY (branch_id)
 );
 
+CREATE TABLE IF NOT EXISTS zatca_chain_position (
+    branch_id             BIGINT UNSIGNED NOT NULL,
+    doc_type              VARCHAR(16) NOT NULL,
+    document_id           BIGINT UNSIGNED NOT NULL,
+    icv                   BIGINT UNSIGNED NOT NULL,
+    previous_invoice_hash VARCHAR(255) NOT NULL,
+    invoice_uuid          VARCHAR(100) NOT NULL,
+    issue_at              BIGINT UNSIGNED NOT NULL,
+    signed_xml            MEDIUMTEXT NOT NULL,
+    invoice_hash          VARCHAR(128) DEFAULT NULL,
+    status                VARCHAR(16) NOT NULL,
+    accepted_at           DATETIME DEFAULT NULL,
+    PRIMARY KEY (branch_id, doc_type, document_id),
+    UNIQUE KEY uq_zatca_chain_branch_icv (branch_id, icv),
+    KEY idx_zatca_chain_status (branch_id, status)
+);
+
 -- Seed branch_zatca_config so onboarding has all required CSR fields.
 -- csr_location must be 4 letters + 4 digits (BR-KSA-43); otherwise Validate() fails.
 INSERT IGNORE INTO branch_zatca_config

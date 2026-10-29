@@ -23,7 +23,7 @@ A production-ready Go daemon for Saudi Arabia's ZATCA (Zakat, Tax and Customs Au
 **Key components:**
 
 - **Embedded NATS** with JetStream — no external message broker needed (~15 MB RAM)
-- **Per-branch ordering** — each `(tenant × branch × doc_type)` gets its own consumer
+- **Per-branch ordering** — each `(tenant × branch)` gets one mixed-document consumer
 - **Combined Docker image** — Go daemon + JRE + ZATCA SDK (`fatoora`) in one container
 - **Startup replay** — on boot, scans all tenant DBs for pending documents and re-publishes them
 - **Email alerts** — sends failure notifications after exhausting retries
@@ -83,6 +83,7 @@ These tables must exist **inside each tenant's database**. The full schema is in
 | `bill_product` | Line items for each bill |
 | `credit_note` | Credit notes against existing bills |
 | `debit_note` | Debit notes against existing bills |
+| `zatca_chain_position` | Durable PIH/ICV reservation and prepared retry identity |
 
 **Minimum data you must populate before the daemon can process:**
 
@@ -184,7 +185,7 @@ go build -o bin/daemon ./cmd/daemon
 2. Connects to `zatca_master` and loads all enabled tenants
 3. Opens a DB connection to each tenant's database
 4. Discovers active branches per tenant
-5. Launches **3 workers per branch** (bill, credit, debit) + **1 onboard worker per tenant**
+5. Launches **1 mixed-document worker per branch** (bill, credit, and debit) + **1 onboard worker per tenant**
 6. **Replays** any pending documents found in the DB (catches items missed while the daemon was down)
 7. Waits for SIGINT/SIGTERM for graceful shutdown
 
@@ -485,6 +486,30 @@ bill (state=1) ──► Query bill + products from DB
   - ACKs the message (to avoid blocking the queue)
   - Leaves the document in its current state for manual handling
 - On startup, the daemon **replays** any documents still pending in the DB
+
+### PIH/ICV chain state
+
+The daemon does not use a fixed PIH or ICV for production documents. The
+backend/T016 integration must provision these fields in each branch's
+`branch_zatca_config` row:
+
+```sql
+previous_invoice_hash  -- accepted base64 SHA-256 chain value
+last_icv               -- accepted EGS counter
+```
+
+The daemon also requires the repository-local `zatca_chain_position` contract
+from `scripts/migration_zatca_schema.sql`. It reserves one position shared by
+invoices, credit notes, and debit notes, persists the exact signed request
+before submission, and updates the document plus accepted branch state in one
+transaction. A failed or rejected submission leaves accepted state unchanged;
+duplicate accepted acknowledgements are harmless. Missing fields/table are
+reported as an integration error rather than silently falling back to a
+constant.
+
+The separate backend repository must apply the equivalent T016 atomic
+reservation/PIH ownership contract before runtime rollout. This daemon change
+does not modify backend source code.
 
 ### SMTP Configuration (for alerts)
 

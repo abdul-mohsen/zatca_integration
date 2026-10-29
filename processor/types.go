@@ -6,8 +6,6 @@ import (
 	"time"
 )
 
-const DefaultPIH = "NWZlY2ViNjZmZmM4NmYzOGQ5NTI3ODZjNmQ2OTZjNzljMmRiYzIzOWRkNGU5MWI0NjcyOWQ3M2EyN2ZiNTdlOQ=="
-
 // ProductRow represents product columns from the bill_product table.
 type ProductRow struct {
 	ProductID         sql.NullInt64

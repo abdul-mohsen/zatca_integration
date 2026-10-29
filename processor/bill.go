@@ -7,7 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -20,6 +20,10 @@ import (
 
 // ProcessBill performs the full sign → submit → update pipeline for a single bill.
 func ProcessBill(db *sql.DB, svc *zatca.Service, cfg *config.Config, b BillRow) (string, error) {
+	return processBillWithChainStore(db, NewSQLChainStateStore(db), svc, cfg, b)
+}
+
+func processBillWithChainStore(db *sql.DB, chainStore ChainStateStore, svc *zatca.Service, cfg *config.Config, b BillRow) (string, error) {
 	log.Printf("Processing bill id=%d seq=%s", b.ID, b.SeqNumber.String)
 
 	issueTime, err := ParseDates(b.EffectiveDate, b.PaymentDue, b.ID)
@@ -32,7 +36,24 @@ func ProcessBill(db *sql.DB, svc *zatca.Service, cfg *config.Config, b BillRow) 
 		return "", fmt.Errorf("load products failed for bill %d: %w", b.ID, err)
 	}
 
+	position, err := reserveChainPosition(chainStore, ChainDocument{
+		BranchID:        b.BranchID,
+		Type:            DocumentBill,
+		DocumentID:      b.ID,
+		ProposedUUID:    uuid.New().String(),
+		ProposedIssueAt: issueTime,
+	})
+	if err != nil {
+		return "", err
+	}
+	if position.Status == chainPositionAccepted {
+		return position.InvoiceHash, nil
+	}
+
 	inv := BuildBillInvoice(cfg, b, products, issueTime)
+	if err := applyChainPosition(inv, position); err != nil {
+		return "", err
+	}
 	return signSubmitUpdate(db, svc, inv, b.ID, "bill", xmlMeta{
 		xmlDir:    cfg.XMLDir,
 		tenantID:  cfg.TenantID,
@@ -40,7 +61,7 @@ func ProcessBill(db *sql.DB, svc *zatca.Service, cfg *config.Config, b BillRow) 
 		branchID:  b.BranchID,
 		billType:  "invoice",
 		qrColumn:  "qr_code",
-	})
+	}, chainStore, position)
 }
 
 // BuildBillInvoice constructs an Invoice (type 388) from a BillRow.
@@ -69,9 +90,7 @@ func BuildBillInvoice(cfg *config.Config, b BillRow, products []ProductRow, issu
 			PostalCode:         cfg.Seller.PostalCode,
 			Country:            cfg.Seller.Country,
 		},
-		Customer:            customer,
-		PreviousInvoiceHash: DefaultPIH,
-		InvoiceCounterValue: 1,
+		Customer: customer,
 		PaymentMeans: func() string {
 			if b.PaymentMethod.Valid && b.PaymentMethod.String != "" {
 				return b.PaymentMethod.String
@@ -84,12 +103,6 @@ func BuildBillInvoice(cfg *config.Config, b BillRow, products []ProductRow, issu
 		inv.SubType = invoice.SubTypeStandard
 	} else {
 		inv.SubType = invoice.SubTypeSimplified
-	}
-
-	if b.SeqNumber.Valid {
-		if v, err := strconv.Atoi(b.SeqNumber.String); err == nil {
-			inv.InvoiceCounterValue = v
-		}
 	}
 
 	inv.Lines = buildLines(products)
@@ -107,15 +120,27 @@ type xmlMeta struct {
 }
 
 // signSubmitUpdate is the shared sign → submit → QR → save XML → UPDATE pipeline used by all doc types.
-func signSubmitUpdate(db *sql.DB, svc *zatca.Service, inv *invoice.Invoice, rowID int64, table string, meta xmlMeta) (string, error) {
-	xmlStr, err := inv.ToXML()
-	if err != nil {
-		return "", fmt.Errorf("ToXML failed: %w", err)
+func signSubmitUpdate(db *sql.DB, svc *zatca.Service, inv *invoice.Invoice, rowID int64, table string, meta xmlMeta, chainStore ChainStateStore, position ChainPosition) (string, error) {
+	var (
+		signedXML = position.SignedXML
+		hash      = position.InvoiceHash
+		err       error
+	)
+	if signedXML == "" {
+		xmlStr, xmlErr := inv.ToXML()
+		if xmlErr != nil {
+			return "", fmt.Errorf("ToXML failed: %w", xmlErr)
+		}
+		signedXML, hash, err = svc.SDK.SignInvoice(xmlStr)
+		if err != nil {
+			return "", fmt.Errorf("SignInvoice failed: %w", err)
+		}
+		if err := chainStore.SavePrepared(position, signedXML, hash); err != nil {
+			return "", fmt.Errorf("persist prepared chain position: %w", err)
+		}
 	}
-
-	signedXML, hash, err := svc.SDK.SignInvoice(xmlStr)
-	if err != nil {
-		return "", fmt.Errorf("SignInvoice failed: %w", err)
+	if signedXML == "" || hash == "" {
+		return "", fmt.Errorf("prepared signed XML and invoice hash are required")
 	}
 
 	// Save signed XML to filesystem:
@@ -151,6 +176,18 @@ func signSubmitUpdate(db *sql.DB, svc *zatca.Service, inv *invoice.Invoice, rowI
 	if err := json.Unmarshal([]byte(apiJSON), &apiReq); err != nil {
 		return "", fmt.Errorf("parse api json failed: %w", err)
 	}
+	if apiReq.InvoiceHash != "" && apiReq.InvoiceHash != hash {
+		return "", fmt.Errorf("prepared invoice hash %q differs from API request hash %q", hash, apiReq.InvoiceHash)
+	}
+	if apiReq.InvoiceHash == "" {
+		apiReq.InvoiceHash = hash
+	}
+	if apiReq.UUID != "" && apiReq.UUID != position.InvoiceUUID {
+		return "", fmt.Errorf("prepared invoice UUID %q differs from API request UUID %q", position.InvoiceUUID, apiReq.UUID)
+	}
+	if apiReq.UUID == "" {
+		apiReq.UUID = position.InvoiceUUID
+	}
 
 	var resp *models.InvoiceResponse
 	if inv.IsStandard() {
@@ -169,6 +206,9 @@ func signSubmitUpdate(db *sql.DB, svc *zatca.Service, inv *invoice.Invoice, rowI
 	if resp == nil {
 		return "", fmt.Errorf("invoice API returned nil response")
 	}
+	if !providerResponseAccepted(resp) {
+		return "", fmt.Errorf("invoice API did not accept %s %d: status=%q", meta.billType, rowID, resp.Status)
+	}
 
 	log.Printf("  Result: status=%s, hash=%s", resp.Status, apiReq.InvoiceHash)
 
@@ -181,22 +221,23 @@ func signSubmitUpdate(db *sql.DB, svc *zatca.Service, inv *invoice.Invoice, rowI
 		}
 	}
 
-	finalHash := apiReq.InvoiceHash
+	finalHash := strings.TrimSpace(resp.InvoiceHash)
 	if finalHash == "" {
-		finalHash = resp.InvoiceHash
+		finalHash = apiReq.InvoiceHash
 	}
 	if finalHash == "" {
 		finalHash = hash
 	}
-
-	qrCol := meta.qrColumn
-	if qrCol == "" {
-		qrCol = "qr_code"
+	if finalHash != hash {
+		return "", fmt.Errorf("accepted invoice hash %q differs from prepared hash %q", finalHash, hash)
 	}
 
-	updateQ := fmt.Sprintf(`UPDATE %s SET invoice_hash = ?, %s = ?, invoice_uuid = ?, state = 3 WHERE id = ?`, table, qrCol)
-	if _, uerr := db.Exec(updateQ, finalHash, qr, apiReq.UUID, rowID); uerr != nil {
-		return "", fmt.Errorf("update metadata failed for %s %d: %w", table, rowID, uerr)
+	if err := chainStore.CommitAccepted(position, ChainAcceptance{
+		InvoiceHash: finalHash,
+		InvoiceUUID: apiReq.UUID,
+		QR:          qr,
+	}); err != nil {
+		return "", fmt.Errorf("commit accepted chain position: %w", err)
 	}
 
 	if len(resp.Warnings) > 0 {
@@ -212,6 +253,43 @@ func signSubmitUpdate(db *sql.DB, svc *zatca.Service, inv *invoice.Invoice, rowI
 		return resp.InvoiceHash, nil
 	}
 	return "", fmt.Errorf("no invoice hash returned for %s %d", table, rowID)
+}
+
+func reserveChainPosition(store ChainStateStore, document ChainDocument) (ChainPosition, error) {
+	if store == nil {
+		return ChainPosition{}, fmt.Errorf("T017 chain state contract unavailable: store is not configured")
+	}
+	return store.Reserve(document)
+}
+
+func applyChainPosition(inv *invoice.Invoice, position ChainPosition) error {
+	if position.ICV == 0 {
+		return fmt.Errorf("chain position ICV must be positive")
+	}
+	if position.ICV > uint64(^uint(0)>>1) {
+		return fmt.Errorf("chain position ICV %d exceeds invoice counter capacity", position.ICV)
+	}
+	if strings.TrimSpace(position.PreviousInvoiceHash) == "" {
+		return fmt.Errorf("chain position PIH is required")
+	}
+	inv.UUID = position.InvoiceUUID
+	inv.PreviousInvoiceHash = position.PreviousInvoiceHash
+	inv.InvoiceCounterValue = int(position.ICV)
+	inv.IssueDate = position.IssueAt
+	inv.IssueTime = position.IssueAt
+	return nil
+}
+
+func providerResponseAccepted(resp *models.InvoiceResponse) bool {
+	if resp == nil || len(resp.Errors) > 0 {
+		return false
+	}
+	switch strings.ToUpper(strings.TrimSpace(resp.Status)) {
+	case "REPORTED", "CLEARED", "ACCEPTED", "SUCCESS", "PASS":
+		return true
+	}
+	return resp.ValidationResults != nil &&
+		strings.EqualFold(strings.TrimSpace(resp.ValidationResults.Status), "PASS")
 }
 
 // buildCustomer builds the Customer party from BillRow.

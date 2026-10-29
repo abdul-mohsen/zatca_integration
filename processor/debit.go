@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
-	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -16,6 +15,10 @@ import (
 
 // ProcessDebitNote processes a single debit note row through the full pipeline.
 func ProcessDebitNote(db *sql.DB, svc *zatca.Service, cfg *config.Config, row CreditDebitRow) (string, error) {
+	return processDebitNoteWithChainStore(db, NewSQLChainStateStore(db), svc, cfg, row)
+}
+
+func processDebitNoteWithChainStore(db *sql.DB, chainStore ChainStateStore, svc *zatca.Service, cfg *config.Config, row CreditDebitRow) (string, error) {
 	log.Printf("Processing debit note for bill id=%d seq=%s", row.ID, row.SeqNumber.String)
 
 	issueTime := time.Now()
@@ -30,15 +33,33 @@ func ProcessDebitNote(db *sql.DB, svc *zatca.Service, cfg *config.Config, row Cr
 		return "", fmt.Errorf("load products for bill %d: %w", row.ID, err)
 	}
 
+	debitNoteID := row.NoteID.Int64
+	position, err := reserveChainPosition(chainStore, ChainDocument{
+		BranchID:        row.BranchID,
+		Type:            DocumentDebit,
+		DocumentID:      debitNoteID,
+		ProposedUUID:    uuid.New().String(),
+		ProposedIssueAt: issueTime,
+	})
+	if err != nil {
+		return "", err
+	}
+	if position.Status == chainPositionAccepted {
+		return position.InvoiceHash, nil
+	}
+
 	inv := BuildDebitNoteInvoice(cfg, row, products, issueTime)
-	return signSubmitUpdate(db, svc, inv, row.ID, "bill", xmlMeta{
+	if err := applyChainPosition(inv, position); err != nil {
+		return "", err
+	}
+	return signSubmitUpdate(db, svc, inv, debitNoteID, "debit_note", xmlMeta{
 		xmlDir:    cfg.XMLDir,
 		tenantID:  cfg.TenantID,
 		companyID: row.CompanyID,
 		branchID:  row.BranchID,
 		billType:  "debit",
-		qrColumn:  "qr_code",
-	})
+		qrColumn:  "invoice_qr",
+	}, chainStore, position)
 }
 
 // BuildDebitNoteInvoice constructs an Invoice (type 383) from a CreditDebitRow.
@@ -67,9 +88,7 @@ func BuildDebitNoteInvoice(cfg *config.Config, row CreditDebitRow, products []Pr
 			PostalCode:         cfg.Seller.PostalCode,
 			Country:            cfg.Seller.Country,
 		},
-		Customer:            customer,
-		PreviousInvoiceHash: DefaultPIH,
-		InvoiceCounterValue: 1,
+		Customer: customer,
 		PaymentMeans: func() string {
 			if row.PaymentMethod.Valid && row.PaymentMethod.String != "" {
 				return row.PaymentMethod.String
@@ -94,12 +113,6 @@ func BuildDebitNoteInvoice(cfg *config.Config, row CreditDebitRow, products []Pr
 		inv.SubType = invoice.SubTypeStandard
 	} else {
 		inv.SubType = invoice.SubTypeSimplified
-	}
-
-	if row.SeqNumber.Valid {
-		if v, err := strconv.Atoi(row.SeqNumber.String); err == nil {
-			inv.InvoiceCounterValue = v
-		}
 	}
 
 	inv.Lines = buildLines(products)

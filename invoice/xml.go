@@ -1,6 +1,7 @@
 package invoice
 
 import (
+	"encoding/base64"
 	"encoding/xml"
 	"fmt"
 	"strings"
@@ -139,8 +140,15 @@ func (inv *Invoice) validate() error {
 	if inv.IsStandard() && inv.Customer.VAT == "" {
 		return fmt.Errorf("customer VAT number is required for standard invoices")
 	}
-	if inv.PreviousInvoiceHash == "" {
+	pih := strings.TrimSpace(inv.PreviousInvoiceHash)
+	if pih == "" {
 		return fmt.Errorf("previous invoice hash (PIH) is required")
+	}
+	if decoded, err := base64.StdEncoding.DecodeString(pih); err != nil || len(decoded) == 0 {
+		return fmt.Errorf("previous invoice hash (PIH) must be base64")
+	}
+	if inv.InvoiceCounterValue <= 0 {
+		return fmt.Errorf("invoice counter value (ICV) must be positive")
 	}
 	return nil
 }

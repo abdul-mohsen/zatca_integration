@@ -33,9 +33,31 @@ ALTER TABLE `branch_zatca_config`
 -- Reset to NULL/0 on re-onboard.
 ALTER TABLE `branch_zatca_config`
     ADD COLUMN `previous_invoice_hash` VARCHAR(255) DEFAULT NULL
-        COMMENT 'base64(sha256(prev_signed_xml)); null = first document',
+        COMMENT 'base64 SHA-256 PIH; must be initialized before first production document',
     ADD COLUMN `last_icv`              BIGINT UNSIGNED NOT NULL DEFAULT 0
         COMMENT 'Strictly increasing per-EGS Invoice Counter Value (shared across bill/credit/debit)';
+
+-- T017 repository-local reservation contract. The backend T016 integration
+-- must apply this table or expose an equivalent atomic reservation/commit
+-- adapter before production rollout. Reserved rows retain the exact signed
+-- request identity across retries; accepted rows advance branch state only
+-- through one transaction.
+CREATE TABLE IF NOT EXISTS `zatca_chain_position` (
+    `branch_id`             BIGINT UNSIGNED NOT NULL,
+    `doc_type`              VARCHAR(16) NOT NULL,
+    `document_id`           BIGINT UNSIGNED NOT NULL,
+    `icv`                   BIGINT UNSIGNED NOT NULL,
+    `previous_invoice_hash` VARCHAR(255) NOT NULL,
+    `invoice_uuid`          VARCHAR(100) NOT NULL,
+    `issue_at`              BIGINT UNSIGNED NOT NULL,
+    `signed_xml`            MEDIUMTEXT NOT NULL,
+    `invoice_hash`          VARCHAR(128) DEFAULT NULL,
+    `status`                VARCHAR(16) NOT NULL,
+    `accepted_at`           DATETIME DEFAULT NULL,
+    PRIMARY KEY (`branch_id`, `doc_type`, `document_id`),
+    UNIQUE KEY `uq_zatca_chain_branch_icv` (`branch_id`, `icv`),
+    KEY `idx_zatca_chain_status` (`branch_id`, `status`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 -- 2. bill: store the signed XML path so operators can find it later --------
 ALTER TABLE `bill`

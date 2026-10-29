@@ -32,6 +32,22 @@ func Subject(docType DocType, dbName string, branchID int64) string {
 	return fmt.Sprintf("zatca.%s.%s.%d", docType, dbName, branchID)
 }
 
+// BranchSubject matches all invoice, credit-note, and debit-note messages for
+// one tenant/branch so one consumer owns the shared EGS chain position.
+func BranchSubject(dbName string, branchID int64) string {
+	return fmt.Sprintf("zatca.*.%s.%d", dbName, branchID)
+}
+
+// BranchDocumentSubjects returns the exact document subjects owned by one
+// mixed-document branch consumer. Onboarding is intentionally excluded.
+func BranchDocumentSubjects(dbName string, branchID int64) []string {
+	return []string{
+		Subject(DocBill, dbName, branchID),
+		Subject(DocCredit, dbName, branchID),
+		Subject(DocDebit, dbName, branchID),
+	}
+}
+
 // StreamName is the JetStream stream that captures all ZATCA subjects.
 const StreamName = "ZATCA"
 
@@ -41,4 +57,10 @@ const SubjectAll = "zatca.>"
 // ConsumerName builds a durable consumer name for a specific (tenant, branch, doc) combination.
 func ConsumerName(docType DocType, dbName string, branchID int64) string {
 	return fmt.Sprintf("zatca_%s_%s_%d", docType, dbName, branchID)
+}
+
+// BranchConsumerName builds the durable consumer name for all document types
+// belonging to one tenant/branch.
+func BranchConsumerName(dbName string, branchID int64) string {
+	return fmt.Sprintf("zatca_branch_%s_%d", dbName, branchID)
 }

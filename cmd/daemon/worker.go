@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"strings"
 	"sync"
 	"time"
 
@@ -52,18 +53,19 @@ func markBranchActive(dbName string, branchID int64) bool {
 
 type getServiceFunc func(dbName string, branchID int64) (*zatca.Service, *config.Config, error)
 
-// runWorker subscribes to a specific (docType, dbName, branchID) subject and processes messages sequentially.
-func runWorker(
+// runBranchWorker subscribes to all document subjects for one branch and
+// processes them sequentially so invoice, credit-note, and debit-note chain
+// positions share one owner.
+func runBranchWorker(
 	js nats.JetStreamContext,
 	tenantMap map[string]*tenantCtx,
 	getService getServiceFunc,
-	docType queue.DocType,
 	dbName string,
 	branchID int64,
 ) {
-	subject := queue.Subject(docType, dbName, branchID)
-	consName := queue.ConsumerName(docType, dbName, branchID)
-	pullAndProcess(js, tenantMap, getService, subject, consName)
+	subjects := queue.BranchDocumentSubjects(dbName, branchID)
+	consName := queue.BranchConsumerName(dbName, branchID)
+	pullAndProcessSubjects(js, tenantMap, getService, subjects, consName)
 }
 
 // runOnboardWorker listens on zatca.onboard.{dbName}.* for branch registration requests.
@@ -214,6 +216,36 @@ func pullAndProcess(
 		log.Printf("ERROR: subscribe %s: %v", subject, err)
 		return
 	}
+	processPullSubscription(sub, tenantMap, getService, subject, onSuccess...)
+}
+
+func pullAndProcessSubjects(
+	js nats.JetStreamContext,
+	tenantMap map[string]*tenantCtx,
+	getService getServiceFunc,
+	subjects []string,
+	consName string,
+	onSuccess ...func(queue.Message),
+) {
+	sub, err := js.PullSubscribe("", consName,
+		nats.BindStream(queue.StreamName),
+		nats.ConsumerFilterSubjects(subjects...),
+		nats.AckWait(5*time.Minute),
+	)
+	if err != nil {
+		log.Printf("ERROR: subscribe %s: %v", strings.Join(subjects, ","), err)
+		return
+	}
+	processPullSubscription(sub, tenantMap, getService, strings.Join(subjects, ","), onSuccess...)
+}
+
+func processPullSubscription(
+	sub *nats.Subscription,
+	tenantMap map[string]*tenantCtx,
+	getService getServiceFunc,
+	subject string,
+	onSuccess ...func(queue.Message),
+) {
 	log.Printf("Worker started: %s", subject)
 
 	for {
@@ -344,7 +376,8 @@ func processMessage(
 	}
 }
 
-// spawnBranchWorkers starts bill/credit/debit workers for a branch if not already running.
+// spawnBranchWorkers starts one mixed-document worker for a branch if not
+// already running.
 func spawnBranchWorkers(
 	js nats.JetStreamContext,
 	tenantMap map[string]*tenantCtx,
@@ -356,14 +389,12 @@ func spawnBranchWorkers(
 	if !markBranchActive(dbName, branchID) {
 		return // workers already running for this branch
 	}
-	log.Printf("Spawning doc workers for branch %d in %s (post-onboard)", branchID, dbName)
-	for _, dt := range []queue.DocType{queue.DocBill, queue.DocCredit, queue.DocDebit} {
-		wg.Add(1)
-		go func(docType queue.DocType) {
-			defer wg.Done()
-			runWorker(js, tenantMap, getService, docType, dbName, branchID)
-		}(dt)
-	}
+	log.Printf("Spawning mixed-document worker for branch %d in %s (post-onboard)", branchID, dbName)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runBranchWorker(js, tenantMap, getService, dbName, branchID)
+	}()
 }
 
 func tenantKeys(m map[string]*tenantCtx) []string {
