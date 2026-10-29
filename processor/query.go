@@ -5,6 +5,54 @@ import (
 	"fmt"
 )
 
+const debitNoteByIDQuery = `SELECT
+		b.id,
+		CONCAT('https://ifritah.com/bill/', b.id) AS url,
+		b.effective_date,
+		b.payment_due_date,
+		b.state,
+		b.discount,
+		deb.branch_id,
+		company.id as company_id,
+		b.total_before_vat,
+		b.total_vat,
+		b.total,
+		deb.sequence_number,
+		deb.merchant_id,
+		b.note,
+		b.payment_method,
+		deb.note as debit_note,
+		deb.id as debit_id,
+		b.userName,
+		b.user_phone_number,
+		company.name as company_name,
+		company.vat_registration_number,
+		store.address_name,
+		cl.name as buyer_name,
+		cl.company_name as buyer_company,
+		cl.vat_number as buyer_vat,
+		cl.address as buyer_address,
+		cl.street as buyer_street,
+		cl.building as buyer_building,
+		cl.district as buyer_district,
+		cl.city as buyer_city,
+		cl.postal_code as buyer_postal_code,
+		cl.country as buyer_country,
+		cl.scheme_id as buyer_scheme_id,
+		cl.registration_id as buyer_registration_id
+	FROM debit_note deb
+	JOIN bill_totals b on b.id = deb.bill_id
+	JOIN store on store.id = b.store_id
+	JOIN company on company.id = store.company_id
+	LEFT JOIN client cl on cl.id = b.client_id
+	WHERE deb.id = ?`
+
+const pendingDebitNotesQuery = `SELECT deb.id
+	FROM debit_note deb
+	JOIN bill b ON b.id = deb.bill_id
+	WHERE deb.branch_id = ? AND deb.state = 1
+	ORDER BY deb.id`
+
 // QueryBillByID loads a single bill row by ID (for daemon consumption).
 func QueryBillByID(db *sql.DB, billID int64) (*BillRow, error) {
 	q := `SELECT 
@@ -50,7 +98,6 @@ func QueryBillByID(db *sql.DB, billID int64) (*BillRow, error) {
 		b           BillRow
 		url         sql.NullString
 		state       sql.NullInt64
-		discount    sql.NullFloat64
 		totalBefore sql.NullFloat64
 		totalVAT    sql.NullFloat64
 		total       sql.NullFloat64
@@ -60,7 +107,7 @@ func QueryBillByID(db *sql.DB, billID int64) (*BillRow, error) {
 		vatReg      sql.NullString
 	)
 	err := db.QueryRow(q, billID).Scan(
-		&b.ID, &url, &b.EffectiveDate, &b.PaymentDue, &state, &discount, &b.BranchID, &b.CompanyID,
+		&b.ID, &url, &b.EffectiveDate, &b.PaymentDue, &state, &b.Discount, &b.BranchID, &b.CompanyID,
 		&totalBefore, &totalVAT, &total, &b.SeqNumber, &merchantID, &note, &b.PaymentMethod,
 		&b.UserName, &userPhone,
 		&b.CompanyName, &vatReg, &b.AddressName,
@@ -73,6 +120,9 @@ func QueryBillByID(db *sql.DB, billID int64) (*BillRow, error) {
 		return nil, fmt.Errorf("query bill %d: %w", billID, err)
 	}
 	b.URL = url
+	if merchantID.Valid {
+		b.MerchantID = merchantID.Int64
+	}
 	return &b, nil
 }
 
@@ -124,7 +174,6 @@ func QueryCreditNoteByID(db *sql.DB, creditNoteID int64) (*CreditDebitRow, error
 		row         CreditDebitRow
 		url         sql.NullString
 		state       sql.NullInt64
-		discount    sql.NullFloat64
 		totalBefore sql.NullFloat64
 		totalVAT    sql.NullFloat64
 		total       sql.NullFloat64
@@ -134,7 +183,7 @@ func QueryCreditNoteByID(db *sql.DB, creditNoteID int64) (*CreditDebitRow, error
 		vatReg      sql.NullString
 	)
 	err := db.QueryRow(q, creditNoteID).Scan(
-		&row.ID, &url, &row.EffectiveDate, &row.PaymentDue, &state, &discount, &row.BranchID, &row.CompanyID,
+		&row.ID, &url, &row.EffectiveDate, &row.PaymentDue, &state, &row.Discount, &row.BranchID, &row.CompanyID,
 		&totalBefore, &totalVAT, &total, &row.SeqNumber, &merchantID, &note, &row.PaymentMethod,
 		&row.NoteText, &row.NoteID,
 		&row.UserName, &userPhone,
@@ -148,58 +197,18 @@ func QueryCreditNoteByID(db *sql.DB, creditNoteID int64) (*CreditDebitRow, error
 		return nil, fmt.Errorf("query credit note %d: %w", creditNoteID, err)
 	}
 	row.URL = url
+	if merchantID.Valid {
+		row.MerchantID = merchantID.Int64
+	}
 	return &row, nil
 }
 
 // QueryDebitNoteByID loads a debit note row by debit_note.id, JOINing bill.
 func QueryDebitNoteByID(db *sql.DB, debitNoteID int64) (*CreditDebitRow, error) {
-	q := `SELECT
-		b.id,
-		CONCAT('https://ifritah.com/bill/', b.id) AS url,
-		b.effective_date,
-		b.payment_due_date,
-		b.state,
-		b.discount,
-		b.branch_id,
-		company.id as company_id,
-		b.total_before_vat,
-		b.total_vat,
-		b.total,
-		b.sequence_number,
-		b.merchant_id,
-		b.note,
-		b.payment_method,
-		deb.note as debit_note,
-		deb.id as debit_id,
-		b.userName,
-		b.user_phone_number,
-		company.name as company_name,
-		company.vat_registration_number,
-		store.address_name,
-		cl.name as buyer_name,
-		cl.company_name as buyer_company,
-		cl.vat_number as buyer_vat,
-		cl.address as buyer_address,
-		cl.street as buyer_street,
-		cl.building as buyer_building,
-		cl.district as buyer_district,
-		cl.city as buyer_city,
-		cl.postal_code as buyer_postal_code,
-		cl.country as buyer_country,
-		cl.scheme_id as buyer_scheme_id,
-		cl.registration_id as buyer_registration_id
-	FROM debit_note deb
-	JOIN bill_totals b on b.id = deb.bill_id
-	JOIN store on store.id = b.store_id
-	JOIN company on company.id = store.company_id
-	LEFT JOIN client cl on cl.id = b.client_id
-	WHERE deb.id = ?`
-
 	var (
 		row         CreditDebitRow
 		url         sql.NullString
 		state       sql.NullInt64
-		discount    sql.NullFloat64
 		totalBefore sql.NullFloat64
 		totalVAT    sql.NullFloat64
 		total       sql.NullFloat64
@@ -208,8 +217,8 @@ func QueryDebitNoteByID(db *sql.DB, debitNoteID int64) (*CreditDebitRow, error) 
 		userPhone   sql.NullString
 		vatReg      sql.NullString
 	)
-	err := db.QueryRow(q, debitNoteID).Scan(
-		&row.ID, &url, &row.EffectiveDate, &row.PaymentDue, &state, &discount, &row.BranchID, &row.CompanyID,
+	err := db.QueryRow(debitNoteByIDQuery, debitNoteID).Scan(
+		&row.ID, &url, &row.EffectiveDate, &row.PaymentDue, &state, &row.Discount, &row.BranchID, &row.CompanyID,
 		&totalBefore, &totalVAT, &total, &row.SeqNumber, &merchantID, &note, &row.PaymentMethod,
 		&row.NoteText, &row.NoteID,
 		&row.UserName, &userPhone,
@@ -223,6 +232,9 @@ func QueryDebitNoteByID(db *sql.DB, debitNoteID int64) (*CreditDebitRow, error) 
 		return nil, fmt.Errorf("query debit note %d: %w", debitNoteID, err)
 	}
 	row.URL = url
+	if merchantID.Valid {
+		row.MerchantID = merchantID.Int64
+	}
 	return &row, nil
 }
 
@@ -264,7 +276,7 @@ func QueryPendingCreditNotes(db *sql.DB, branchID int64) ([]int64, error) {
 
 // QueryPendingDebitNotes returns debit_note IDs where state = 1 for a branch.
 func QueryPendingDebitNotes(db *sql.DB, branchID int64) ([]int64, error) {
-	rows, err := db.Query(`SELECT deb.id FROM debit_note deb JOIN bill b ON b.id = deb.bill_id WHERE b.branch_id = ? AND deb.state = 1 ORDER BY deb.id`, branchID)
+	rows, err := db.Query(pendingDebitNotesQuery, branchID)
 	if err != nil {
 		return nil, err
 	}

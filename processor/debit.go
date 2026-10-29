@@ -66,9 +66,13 @@ func processDebitNoteWithChainStore(db *sql.DB, chainStore ChainStateStore, svc 
 func BuildDebitNoteInvoice(cfg *config.Config, row CreditDebitRow, products []ProductRow, issueTime time.Time) *invoice.Invoice {
 	isStandard := row.BuyerVAT.Valid && row.BuyerVAT.String != ""
 	customer := buildCustomer(row.BillRow, isStandard)
+	debitNoteID := row.NoteID.Int64
+	if debitNoteID <= 0 {
+		debitNoteID = row.ID
+	}
 
 	inv := &invoice.Invoice{
-		ID:               fmt.Sprintf("INV-DN-%d", row.ID),
+		ID:               fmt.Sprintf("INV-DN-%d", debitNoteID),
 		UUID:             uuid.New().String(),
 		IssueDate:        issueTime,
 		IssueTime:        issueTime,
@@ -88,7 +92,10 @@ func BuildDebitNoteInvoice(cfg *config.Config, row CreditDebitRow, products []Pr
 			PostalCode:         cfg.Seller.PostalCode,
 			Country:            cfg.Seller.Country,
 		},
-		Customer: customer,
+		Customer:           customer,
+		Discount:           nullFloat64OrZero(row.Discount),
+		DiscountTax:        invoice.TaxStandard,
+		DiscountTaxPercent: discountTaxPercent(products),
 		PaymentMeans: func() string {
 			if row.PaymentMethod.Valid && row.PaymentMethod.String != "" {
 				return row.PaymentMethod.String
@@ -101,12 +108,7 @@ func BuildDebitNoteInvoice(cfg *config.Config, row CreditDebitRow, products []Pr
 			}
 			return ""
 		}(),
-		BillingReferenceID: func() string {
-			if row.SeqNumber.Valid {
-				return row.SeqNumber.String
-			}
-			return ""
-		}(),
+		BillingReferenceID: fmt.Sprintf("INV-%d", row.ID),
 	}
 
 	if isStandard {

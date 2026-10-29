@@ -85,6 +85,13 @@ These tables must exist **inside each tenant's database**. The full schema is in
 | `debit_note` | Debit notes against existing bills |
 | `zatca_chain_position` | Durable PIH/ICV reservation and prepared retry identity |
 
+Debit-note processing requires the backend T024 debit-domain migrations
+(`0011_zatca_debit_note.sql` and `0012_zatca_submission_sources.sql`) before
+runtime enablement. The daemon reads the durable `debit_note` source/context,
+replays rows with `state=1`, and persists accepted UUID, hash, QR, state, and
+signed XML path back to that source. A tenant with only the legacy debit table
+will fail explicitly with a schema/runtime integration error.
+
 **Minimum data you must populate before the daemon can process:**
 
 ```sql

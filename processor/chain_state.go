@@ -73,6 +73,7 @@ type ChainAcceptance struct {
 	InvoiceHash string
 	InvoiceUUID string
 	QR          string
+	XMLPath     string
 }
 
 // ChainStateStore owns reservation and accepted-state transitions for one
@@ -499,9 +500,9 @@ func (s *SQLChainStateStore) CommitAccepted(position ChainPosition, acceptance C
 		return fmt.Errorf("unsupported chain document type %q", position.Document.Type)
 	}
 	result, err := tx.Exec(fmt.Sprintf(
-		`UPDATE %s SET invoice_hash = ?, %s = ?, invoice_uuid = ?, state = 3 WHERE id = ?`,
+		`UPDATE %s SET invoice_hash = ?, %s = ?, invoice_uuid = ?, invoice_xml_path = NULLIF(?, ''), state = 3 WHERE id = ?`,
 		table, qrColumn,
-	), acceptance.InvoiceHash, acceptance.QR, invoiceUUID, position.Document.DocumentID)
+	), acceptance.InvoiceHash, acceptance.QR, invoiceUUID, acceptance.XMLPath, position.Document.DocumentID)
 	if err != nil {
 		return chainContractError(err)
 	}

@@ -236,6 +236,7 @@ func signSubmitUpdate(db *sql.DB, svc *zatca.Service, inv *invoice.Invoice, rowI
 		InvoiceHash: finalHash,
 		InvoiceUUID: apiReq.UUID,
 		QR:          qr,
+		XMLPath:     xmlPath,
 	}); err != nil {
 		return "", fmt.Errorf("commit accepted chain position: %w", err)
 	}
@@ -358,11 +359,27 @@ func buildLines(products []ProductRow) []invoice.LineItem {
 			Quantity:    p.QuantityOrZero(),
 			UnitCode:    "PCE",
 			UnitPrice:   p.PriceOrZero(),
-			Discount:    0,
+			Discount:    nullFloat64OrZero(p.Discount),
 			TaxCategory: invoice.TaxStandard,
 			TaxPercent:  p.VATOrZero(),
 		}
 		lines = append(lines, li)
 	}
 	return lines
+}
+
+func nullFloat64OrZero(value sql.NullFloat64) float64 {
+	if value.Valid {
+		return value.Float64
+	}
+	return 0
+}
+
+func discountTaxPercent(products []ProductRow) float64 {
+	for _, product := range products {
+		if product.VAT.Valid {
+			return product.VAT.Float64
+		}
+	}
+	return 15
 }
