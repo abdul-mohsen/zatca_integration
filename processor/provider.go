@@ -59,15 +59,18 @@ type SubmissionProvider interface {
 // ProviderResult is the normalized provider response consumed by the
 // processor. Empty optional values remain empty and are persisted as NULL.
 type ProviderResult struct {
-	State            OutcomeState
-	ProviderCode     string
-	WarningCode      string
-	WarningMessage   string
-	ProviderRef      string
-	RejectionCode    string
-	RejectionMessage string
-	InvoiceHash      string
-	ClearedXML       string
+	State                OutcomeState
+	ProviderCode         string
+	WarningCode          string
+	WarningMessage       string
+	ProviderRef          string
+	RejectionCode        string
+	RejectionMessage     string
+	InvoiceHash          string
+	ClearedXML           string
+	ResponseXML          string
+	ProviderResponse     string
+	ProviderResponseType string
 }
 
 // ProviderError describes a provider failure with an explicit durable state.
@@ -172,6 +175,10 @@ func normalizeProviderResponse(resp *models.InvoiceResponse) *ProviderResult {
 		ProviderCode: strings.TrimSpace(resp.Status),
 		InvoiceHash:  strings.TrimSpace(resp.InvoiceHash),
 	}
+	if response, err := json.Marshal(resp); err == nil {
+		result.ProviderResponse = string(response)
+		result.ProviderResponseType = "application/json"
+	}
 
 	if len(resp.Errors) > 0 {
 		result.State = OutcomeRejected
@@ -212,6 +219,7 @@ func normalizeProviderResponse(resp *models.InvoiceResponse) *ProviderResult {
 			}
 		}
 		result.ClearedXML = string(decoded)
+		result.ResponseXML = result.ClearedXML
 	}
 	return result
 }

@@ -156,18 +156,22 @@ func signSubmitUpdateWithProvider(
 		return fail(fmt.Errorf("provider returned invalid outcome state %q", result.State), "INVALID_PROVIDER_STATE")
 	}
 
-	clearedPath := ""
-	if result.ClearedXML != "" {
-		var clearedArtifact artifactRecord
-		clearedPath, clearedArtifact, err = saveXMLArtifact(meta, rowID, "-cleared", result.ClearedXML)
-		if err != nil {
-			return fail(err, "CLEARED_ARTIFACT_FAILED")
-		}
-		if clearedArtifact.Path != "" {
-			artifacts = append(artifacts, clearedArtifact)
-		}
+	responseXML := result.ResponseXML
+	if strings.TrimSpace(responseXML) == "" && inv.IsStandard() {
+		responseXML = result.ClearedXML
 	}
 
+	responsePayload := result.ProviderResponse
+	responseContentType := result.ProviderResponseType
+	if strings.TrimSpace(responsePayload) == "" && strings.TrimSpace(responseXML) != "" {
+		responsePayload = responseXML
+		responseContentType = "application/xml"
+	}
+	if strings.TrimSpace(responsePayload) != "" && responseContentType == "" {
+		responseContentType = "application/json"
+	}
+
+	clearedPath := ""
 	finalHash := req.InvoiceHash
 	if finalHash == "" {
 		finalHash = result.InvoiceHash
@@ -191,7 +195,7 @@ func signSubmitUpdateWithProvider(
 		NextRetryAt:      outcomeRetryTime(startedAt, result.State, attempt.attemptNumber),
 		ProviderCalled:   true,
 		RequestXMLPath:   requestPath,
-		ClearedXMLPath:   clearedPath,
+		ResponseXML:      responseXML,
 	}
 	if !result.State.success() {
 		outcome.ErrorCode = outcome.RejectionCode
@@ -203,6 +207,47 @@ func signSubmitUpdateWithProvider(
 			outcome.ErrorMessage = fmt.Sprintf("provider outcome is %s", outcome.State)
 		}
 	}
+	artifactFailure := func(processErr error, code string) (string, error) {
+		failedOutcome := outcome
+		failedOutcome.State = OutcomeTerminalFailure
+		failedOutcome.ErrorCode = code
+		failedOutcome.ErrorMessage = limitText(processErr.Error(), 1024)
+		failedOutcome.NextRetryAt = nil
+		update.MarkIssued = false
+		logOutcome(failedOutcome)
+		return "", finishSubmission(store, attempt, failedOutcome, update, artifacts, processErr)
+	}
+
+	if result.ClearedXML != "" {
+		var clearedArtifact artifactRecord
+		clearedPath, clearedArtifact, err = saveXMLArtifact(meta, rowID, "-cleared", result.ClearedXML)
+		if err != nil {
+			return artifactFailure(err, "CLEARED_ARTIFACT_FAILED")
+		}
+		if clearedArtifact.Path != "" {
+			artifacts = append(artifacts, clearedArtifact)
+		}
+	}
+
+	if responsePayload != "" {
+		var responseArtifact artifactRecord
+		_, responseArtifact, err = saveArtifact(
+			meta,
+			rowID,
+			"-response",
+			responsePayload,
+			"response_xml",
+			responseContentType,
+		)
+		if err != nil {
+			return artifactFailure(err, "RESPONSE_ARTIFACT_FAILED")
+		}
+		if responseArtifact.Path != "" {
+			artifacts = append(artifacts, responseArtifact)
+		}
+	}
+
+	outcome.ClearedXMLPath = clearedPath
 	update.InvoiceHash = finalHash
 	update.InvoiceUUID = req.UUID
 	update.QR = qr

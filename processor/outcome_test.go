@@ -216,6 +216,125 @@ func TestSignSubmitUpdateWithProviderPreservesProviderWarning(t *testing.T) {
 	}
 }
 
+func TestStandardClearanceRetainsAuthoritativeClearedXML(t *testing.T) {
+	defer os.RemoveAll("processor_test_artifacts")
+
+	const clearedXML = `<Invoice><cbc:UUID>cleared-41</cbc:UUID><cbc:QR>stamped</cbc:QR></Invoice>`
+	store := &fakeSubmissionStore{}
+	provider := fakeSubmissionProvider{
+		result: &ProviderResult{
+			State:        OutcomeAccepted,
+			ProviderCode: "CLEARED",
+			ProviderRef:  "clearance-ref-41",
+			ClearedXML:   clearedXML,
+		},
+	}
+
+	if _, err := signSubmitUpdateWithProvider(provider, store, outcomeTestInvoice(), 41, outcomeTestMeta()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if store.outcome.ResponseXML != clearedXML {
+		t.Fatalf("response XML = %q, want authoritative cleared XML %q", store.outcome.ResponseXML, clearedXML)
+	}
+	if store.outcome.ClearedXMLPath == "" {
+		t.Fatal("cleared XML path is empty")
+	}
+	if store.outcome.ProviderRef != "clearance-ref-41" {
+		t.Fatalf("provider reference = %q, want clearance-ref-41", store.outcome.ProviderRef)
+	}
+
+	var clearedArtifact artifactRecord
+	for _, artifact := range store.arts {
+		if artifact.Kind == "cleared_xml" {
+			clearedArtifact = artifact
+			break
+		}
+	}
+	if clearedArtifact.Path == "" {
+		t.Fatal("cleared XML artifact was not recorded")
+	}
+	got, err := os.ReadFile(clearedArtifact.Path)
+	if err != nil {
+		t.Fatalf("read cleared XML artifact: %v", err)
+	}
+	if string(got) != clearedXML {
+		t.Fatalf("cleared XML artifact = %q, want %q", string(got), clearedXML)
+	}
+}
+
+func TestReportingRetainsSubmittedAndProviderResponseArtifacts(t *testing.T) {
+	defer os.RemoveAll("processor_test_artifacts")
+
+	const providerResponse = `{"status":"REPORTED","reference":"report-ref-41"}`
+	store := &fakeSubmissionStore{}
+	provider := fakeSubmissionProvider{
+		result: &ProviderResult{
+			State:                OutcomeAccepted,
+			ProviderCode:         "REPORTED",
+			ProviderRef:          "report-ref-41",
+			ProviderResponse:     providerResponse,
+			ProviderResponseType: "application/json",
+		},
+	}
+	inv := outcomeTestInvoice()
+	inv.SubType = invoice.SubTypeSimplified
+
+	if _, err := signSubmitUpdateWithProvider(provider, store, inv, 41, outcomeTestMeta()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if store.outcome.ClearedXMLPath != "" {
+		t.Fatalf("cleared XML path = %q, want empty for reporting", store.outcome.ClearedXMLPath)
+	}
+	if store.outcome.ProviderRef != "report-ref-41" {
+		t.Fatalf("provider reference = %q, want report-ref-41", store.outcome.ProviderRef)
+	}
+
+	var responseArtifact artifactRecord
+	for _, artifact := range store.arts {
+		if artifact.Kind == "response_xml" {
+			responseArtifact = artifact
+			break
+		}
+	}
+	if responseArtifact.Path == "" {
+		t.Fatal("provider response artifact was not recorded")
+	}
+	got, err := os.ReadFile(responseArtifact.Path)
+	if err != nil {
+		t.Fatalf("read provider response artifact: %v", err)
+	}
+	if string(got) != providerResponse {
+		t.Fatalf("provider response artifact = %q, want %q", string(got), providerResponse)
+	}
+}
+
+func TestArtifactStoreFailureIsExplicit(t *testing.T) {
+	store := &fakeSubmissionStore{}
+	meta := outcomeTestMeta()
+	meta.xmlDir = ""
+	provider := fakeSubmissionProvider{
+		result: &ProviderResult{
+			State:        OutcomeAccepted,
+			ProviderCode: "CLEARED",
+			ClearedXML:   "<cleared-invoice/>",
+		},
+	}
+
+	_, err := signSubmitUpdateWithProvider(provider, store, outcomeTestInvoice(), 41, meta)
+	if err == nil {
+		t.Fatal("expected an artifact-store error")
+	}
+	if store.outcome.State != OutcomeTerminalFailure {
+		t.Fatalf("outcome state = %q, want terminal_failure", store.outcome.State)
+	}
+	if store.update.MarkIssued {
+		t.Fatal("artifact-store failure must not mark the document issued")
+	}
+	if !strings.Contains(err.Error(), "artifact store") {
+		t.Fatalf("error = %q, want artifact-store context", err)
+	}
+}
+
 func TestProviderErrorUnwrapsCause(t *testing.T) {
 	cause := errors.New("network failure")
 	err := &ProviderError{State: OutcomeAmbiguous, Code: "NETWORK", Err: cause}

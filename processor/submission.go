@@ -43,6 +43,7 @@ type submissionOutcome struct {
 	ProviderCalled   bool
 	RequestXMLPath   string
 	ClearedXMLPath   string
+	ResponseXML      string
 }
 
 type documentUpdate struct {
@@ -274,7 +275,8 @@ func (s *sqlSubmissionStore) CompleteSubmission(
 			next_retry_at = ?,
 			outcome_at = ?,
 			request_xml_path = ?,
-			cleared_xml_path = ?
+			cleared_xml_path = ?,
+			response_xml = ?
 		WHERE id = ? AND merchant_id = ?`,
 		status,
 		outcome.State,
@@ -292,6 +294,7 @@ func (s *sqlSubmissionStore) CompleteSubmission(
 		time.Now(),
 		nullableText(outcome.RequestXMLPath),
 		nullableText(outcome.ClearedXMLPath),
+		nullableText(outcome.ResponseXML),
 		attempt.submissionID,
 		attempt.merchantID,
 	); err != nil {
@@ -349,8 +352,11 @@ func (s *sqlSubmissionStore) CompleteSubmission(
 	}
 
 	for _, artifact := range artifacts {
-		if artifact.Path == "" {
-			continue
+		if strings.TrimSpace(artifact.Kind) == "" {
+			return fmt.Errorf("record ZATCA artifact for submission %d: artifact kind is empty", attempt.submissionID)
+		}
+		if strings.TrimSpace(artifact.Path) == "" {
+			return fmt.Errorf("record ZATCA artifact %s for submission %d: artifact path is empty", artifact.Kind, attempt.submissionID)
 		}
 		if _, err := tx.Exec(`
 			INSERT INTO zatca_submission_artifact
@@ -454,8 +460,23 @@ func nullableJSON(data []byte) any {
 }
 
 func saveXMLArtifact(meta xmlMeta, rowID int64, suffix, content string) (string, artifactRecord, error) {
-	if meta.xmlDir == "" {
-		return "", artifactRecord{}, nil
+	kind := "request_xml"
+	if suffix != "" {
+		kind = "cleared_xml"
+	}
+	return saveArtifact(meta, rowID, suffix, content, kind, "application/xml")
+}
+
+func saveArtifact(
+	meta xmlMeta,
+	rowID int64,
+	suffix string,
+	content string,
+	kind string,
+	contentType string,
+) (string, artifactRecord, error) {
+	if strings.TrimSpace(meta.xmlDir) == "" {
+		return "", artifactRecord{}, fmt.Errorf("%s artifact store is not configured", kind)
 	}
 	dir := filepath.Join(
 		meta.xmlDir,
@@ -465,21 +486,21 @@ func saveXMLArtifact(meta xmlMeta, rowID int64, suffix, content string) (string,
 		meta.billType,
 	)
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		return "", artifactRecord{}, fmt.Errorf("create XML artifact directory %s: %w", dir, err)
+		return "", artifactRecord{}, fmt.Errorf("create %s artifact directory %s: %w", kind, dir, err)
 	}
-	name := fmt.Sprintf("%d%s.xml", rowID, suffix)
+	extension := ".xml"
+	if contentType == "application/json" {
+		extension = ".json"
+	}
+	name := fmt.Sprintf("%d%s%s", rowID, suffix, extension)
 	path := filepath.Join(dir, name)
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
-		return "", artifactRecord{}, fmt.Errorf("write XML artifact %s: %w", path, err)
-	}
-	kind := "request_xml"
-	if suffix != "" {
-		kind = "cleared_xml"
+		return "", artifactRecord{}, fmt.Errorf("write %s artifact %s: %w", kind, path, err)
 	}
 	return path, artifactRecord{
 		Kind:        kind,
 		Path:        path,
-		ContentType: "application/xml",
+		ContentType: contentType,
 		SHA256:      sha256Hex([]byte(content)),
 	}, nil
 }

@@ -365,8 +365,9 @@ The daemon will:
 3. Build UBL 2.1 XML
 4. Sign via SDK (`fatoora`)
 5. Submit to ZATCA (ClearInvoice for B2B, ReportInvoice for B2C)
-6. Persist the T003 submission, attempt, outcome, provider details, and XML
-   artifact references
+6. Persist the T003 submission, attempt, outcome, provider response/reference,
+   and artifact references, including the authoritative stamped XML returned
+   by clearance
 7. Update `invoice_hash`, `invoice_qr`, `invoice_uuid`, and
    `invoice_xml_path`; set `state=3` only for `accepted` or
    `accepted_with_warning`. Rejected, pending, ambiguous, terminal, and
@@ -453,7 +454,8 @@ bill (state=1) ──► Query bill + products from DB
                    ──► SDK: sign invoice (fatoora)
                    ──► ZATCA API: ClearInvoice (B2B) or ReportInvoice (B2C)
                    ──► Persist pending/final T003 outcome + attempt
-                   ──► Save request/cleared XML and artifact references
+                   ──► Save submitted request, provider response, and (B2B)
+                       authoritative cleared/stamped XML
                    ──► Update bill metadata; state=3 only on accepted outcome
 ```
 
@@ -464,8 +466,11 @@ process bills. Each bill uses the numeric master tenant ID plus a stable
 document UUID. Processing records `pending`, `accepted`,
 `accepted_with_warning`, `rejected`, `ambiguous`, or `terminal_failure` in
 `zatca_submission`, with linked attempts and artifact references. Provider
-codes, warning codes/messages, retry timestamps, request XML paths, and
-cleared XML paths remain nullable when the provider does not return them.
+codes, warning codes/messages, provider references, retry timestamps, request
+XML paths, cleared XML paths, and response evidence remain nullable when the
+provider does not return them. Standard clearance retains the exact stamped
+XML returned by ZATCA as a `cleared_xml` artifact; reporting retains the
+signed submitted XML and its provider response artifact.
 
 Only `accepted` and `accepted_with_warning` set the legacy bill state to `3`.
 The daemon does not silently fall back to legacy-only updates if the T003
@@ -513,6 +518,9 @@ must have `SELECT, INSERT, UPDATE` on `zatca_submission`,
   - ACKs the message (to avoid blocking the queue)
   - Leaves the document in its current state for manual handling
 - On startup, the daemon **replays** any documents still pending in the DB
+- If a submitted or cleared/response artifact cannot be written, processing
+  returns an explicit error and records terminal failure; it never silently
+  treats the document as issued.
 
 ### SMTP Configuration (for alerts)
 
@@ -528,15 +536,17 @@ SMTP_FROM=alerts@yourcompany.com
 
 ---
 
-## 8. Signed XML Storage
+## 8. Submission Artifact Storage
 
-Signed XML files are saved to the filesystem at:
+Submitted and provider artifacts are saved to the tenant-scoped filesystem at:
 
 ```
-{xml-dir}/{company_id}/{branch_id}/{bill_type}/{row_id}.xml
+{xml-dir}/{tenant}/{company_id}/{branch_id}/{bill_type}/{row_id}.xml
+{xml-dir}/{tenant}/{company_id}/{branch_id}/{bill_type}/{row_id}-cleared.xml
+{xml-dir}/{tenant}/{company_id}/{branch_id}/{bill_type}/{row_id}-response.json
 ```
 
-Example: `/data/zatca-xml/1/3/invoice/42.xml`
+Example: `/data/zatca-xml/demo_db/1/3/invoice/42-cleared.xml`
 
 In Docker, mount a volume to persist XMLs:
 
@@ -544,7 +554,11 @@ In Docker, mount a volume to persist XMLs:
 docker run -v zatca-xml:/data/zatca-xml ...
 ```
 
-The path is also stored in the bill row as `invoice_xml_path`.
+The signed request path is stored in the bill row as `invoice_xml_path`; the
+submission and attempt rows retain the request/cleared paths, while response
+artifact metadata is linked through `zatca_submission_artifact`. An unset or
+unwritable `xml-dir` is an explicit processing failure, never a successful
+legacy-only fallback.
 
 ---
 
