@@ -244,7 +244,7 @@ func pullAndProcess(
 				if ok && tc.tenant.AlertEmail != "" {
 					sendAlert(tc.tenant.AlertEmail, qmsg, err)
 				}
-				// Ack to move on — the row stays in DB with state < 3 for manual handling
+				// Ack to move on — the row stays in DB with state = 1 for manual handling
 				msg.Ack()
 				continue
 			}

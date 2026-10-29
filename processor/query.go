@@ -234,9 +234,10 @@ func queryDebitNoteByID_UNUSED(db *sql.DB, debitNoteID int64) (*CreditDebitRow, 
 }
 */
 
-// QueryPendingBills returns bill IDs where state < 3 for a given branch (used for startup replay).
+// QueryPendingBills returns bill IDs in the backend's queued/submittable state
+// for a given branch (used for startup replay). Drafts are not submittable.
 func QueryPendingBills(db *sql.DB, branchID int64) ([]int64, error) {
-	rows, err := db.Query(`SELECT id FROM bill WHERE branch_id = ? AND state < 3 ORDER BY id`, branchID)
+	rows, err := db.Query(`SELECT id FROM bill WHERE branch_id = ? AND state = 1 ORDER BY id`, branchID)
 	if err != nil {
 		return nil, err
 	}

@@ -28,7 +28,7 @@ func replayPending(js nats.JetStreamContext, db *sql.DB, dbName string, branches
 func replayBranch(js nats.JetStreamContext, db *sql.DB, dbName string, branchID int64) int {
 	count := 0
 
-	// Bills with state < 3
+	// Bills with the backend's queued/submittable/retryable state.
 	if ids, err := processor.QueryPendingBills(db, branchID); err == nil {
 		for _, id := range ids {
 			if publishReplay(js, queue.DocBill, dbName, branchID, id) == nil {

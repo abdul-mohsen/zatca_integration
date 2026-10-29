@@ -79,7 +79,7 @@ These tables must exist **inside each tenant's database**. The full schema is in
 | `branch_csr` | CSR configuration inputs used during onboarding (auto-filled) |
 | `branch_zatca` | Credentials returned by ZATCA after onboarding (auto-filled) |
 | `client` | Buyer info — if a bill has a `buyer_id` with a VAT number, it's treated as B2B |
-| `bill` | Invoices. `state=1` = new, `state=3` = submitted to ZATCA |
+| `bill` | Invoices. `state=0` = draft, `state=1` = queued/submittable/retryable, `state=3` = submitted to ZATCA |
 | `bill_product` | Line items for each bill |
 | `credit_note` | Credit notes against existing bills |
 | `debit_note` | Debit notes against existing bills |
@@ -564,7 +564,7 @@ The `INSERT ... ON DUPLICATE KEY UPDATE` in the onboarding flow handles both ini
 | What | How | Frequency |
 |---|---|---|
 | ZATCA API reachable | `store_status --ping` | Every 6 hours |
-| Unprocessed bills | `SELECT COUNT(*) FROM bill WHERE state < 3` | Every 5 minutes |
+| Queued/retryable bills | `SELECT COUNT(*) FROM bill WHERE state = 1` | Every 5 minutes |
 | Failed submissions | Daemon logs (`ERROR:` entries) | Real-time |
 | Certificate expiry | Parse `production_certificate` from `branch_zatca` | Daily |
 | Unregistered branches | `store_status --json` → filter `not_registered` | On new branch creation |
