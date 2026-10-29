@@ -230,6 +230,13 @@ func (inv *Invoice) writeCustomer(b *strings.Builder) {
 	b.WriteString("    <cac:AccountingCustomerParty>\n")
 	b.WriteString("        <cac:Party>\n")
 
+	if inv.Customer.ID != "" {
+		b.WriteString("            <cac:PartyIdentification>\n")
+		b.WriteString(fmt.Sprintf(`                <cbc:ID schemeID="%s">%s</cbc:ID>`+"\n",
+			xmlEscape(orDefault(inv.Customer.SchemeID, "CRN")), xmlEscape(inv.Customer.ID)))
+		b.WriteString("            </cac:PartyIdentification>\n")
+	}
+
 	inv.writeAddress(b, "            ", inv.Customer)
 
 	if inv.Customer.VAT != "" {

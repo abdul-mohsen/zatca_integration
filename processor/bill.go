@@ -60,7 +60,7 @@ func BuildBillInvoice(cfg *config.Config, b BillRow, products []ProductRow, issu
 			RegistrationName:   cfg.Seller.Name,
 			RegistrationNameAR: cfg.Seller.NameAR,
 			VAT:                cfg.Seller.VAT,
-			SchemeID:           cfg.Seller.CRN,
+			SchemeID:           "CRN",
 			ID:                 cfg.Seller.CRN,
 			Street:             cfg.Seller.Street,
 			Building:           cfg.Seller.Building,
