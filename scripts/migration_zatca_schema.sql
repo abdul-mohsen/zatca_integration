@@ -72,6 +72,6 @@ CREATE TABLE IF NOT EXISTS `debit_note` (
 ALTER TABLE `bill`
     ADD INDEX `idx_bill_state_branch` (`state`, `branch_id`);
 
--- 5. zatca_otp should be cleared after successful onboard. No schema change
---    needed; do it from the daemon: UPDATE branch_zatca_config SET zatca_otp=''
---    WHERE branch_id = ? after step 4 succeeds. Documented here as a TODO.
+-- 5. zatca_otp is a legacy field and is intentionally not written by the
+--    daemon. The onboarding OTP is a single-use message value; no schema
+--    migration or post-onboard cleanup statement is required.

@@ -111,13 +111,10 @@ func OnboardBranch(db *sql.DB, baseCfg *config.Config, branchID int64, otp strin
 		return fmt.Errorf("encrypt production secret: %w", err)
 	}
 
-	// NOTE: `zatca_otp` is intentionally NOT written here. The OTP arrives
-	// via NATS (single-use) and persisting it would only retain plaintext
-	// PII. Some deployments' `branch_zatca_config` tables also lack the
-	// column entirely (Error 1054: Unknown column 'zatca_otp'), so writing
-	// it would break onboarding on those tenants. The post-insert
-	// "clear OTP" UPDATE below is best-effort for legacy schemas that DO
-	// have the column.
+	// NOTE: `zatca_otp` is intentionally not written here. The OTP arrives
+	// via NATS as a single-use value and persisting it would retain plaintext
+	// PII. The active branch_zatca_config schema does not require that legacy
+	// column, so onboarding must not reference it.
 	credQ := `INSERT INTO branch_zatca_config
 		(branch_id, csr_org_identifier, csr_org_unit, csr_org_name, csr_country, csr_location, business_category, seller_vat, seller_crn, street, building, district, postal_code, zatca_csr, zatca_private_key, zatca_compliance_certificate, zatca_compliance_secret, zatca_compliance_request_id, zatca_production_username, zatca_production_password, zatca_production_request_id, zatca_registered_at)
 	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
@@ -171,11 +168,6 @@ func OnboardBranch(db *sql.DB, baseCfg *config.Config, branchID int64, otp strin
 	}
 
 	log.Printf("Branch %d: Registration complete.", branchID)
-
-	// Clear the OTP — it's single-use and should not be retained in plaintext.
-	if _, err := db.Exec(`UPDATE branch_zatca_config SET zatca_otp = '' WHERE branch_id = ?`, branchID); err != nil {
-		log.Printf("WARN: branch %d: clear OTP: %v", branchID, err)
-	}
 	return nil
 }
 
