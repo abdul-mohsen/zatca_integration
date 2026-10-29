@@ -44,6 +44,8 @@ func ProcessBill(db *sql.DB, svc *zatca.Service, cfg *config.Config, b BillRow) 
 		attempt:           cfg.Attempt,
 		attemptCount:      cfg.AttemptCount,
 		attemptID:         cfg.AttemptID,
+		retryAttempt:      cfg.RetryAttempt,
+		deadLetter:        cfg.DeadLetter,
 	})
 }
 
@@ -119,6 +121,8 @@ type xmlMeta struct {
 	attempt           uint32 // T014 publication attempt
 	attemptCount      uint32 // T014 prior publication attempts
 	attemptID         string // T014 publication-attempt identity
+	retryAttempt      uint32 // local worker retry ordinal
+	deadLetter        bool   // final terminal/dead-letter processing attempt
 }
 
 // buildCustomer builds the Customer party from BillRow.

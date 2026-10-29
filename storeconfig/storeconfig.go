@@ -118,6 +118,8 @@ func (bz *BranchZATCA) ToConfig(base *config.Config) *config.Config {
 		Attempt:            base.Attempt,
 		AttemptCount:       base.AttemptCount,
 		AttemptID:          base.AttemptID,
+		RetryAttempt:       base.RetryAttempt,
+		DeadLetter:         base.DeadLetter,
 		ProductionUsername: bz.ProductionUsername,
 		ProductionPassword: bz.ProductionPassword,
 		CSR: config.CSRConfig{

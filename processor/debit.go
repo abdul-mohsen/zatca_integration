@@ -46,6 +46,8 @@ func ProcessDebitNote(db *sql.DB, svc *zatca.Service, cfg *config.Config, row Cr
 		attempt:           cfg.Attempt,
 		attemptCount:      cfg.AttemptCount,
 		attemptID:         cfg.AttemptID,
+		retryAttempt:      cfg.RetryAttempt,
+		deadLetter:        cfg.DeadLetter,
 	})
 }
 

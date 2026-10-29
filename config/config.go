@@ -70,6 +70,8 @@ type Config struct {
 	Attempt            uint32 // T014 1-based publication attempt, when available
 	AttemptCount       uint32 // T014 prior publication attempt count, when available
 	AttemptID          string // T014 deterministic publication-attempt identity
+	RetryAttempt       uint32 // local worker retry ordinal for the current processing call
+	DeadLetter         bool   // local worker context for the final terminal attempt
 	CSR                CSRConfig
 	Seller             SellerInfo
 }

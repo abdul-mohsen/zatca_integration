@@ -50,6 +50,11 @@ type Message struct {
 	Attempt           uint32  `json:"attempt,omitempty"`
 	AttemptCount      uint32  `json:"attempt_count,omitempty"`
 	AttemptID         string  `json:"attempt_id,omitempty"`
+
+	// RetryAttempt and DeadLetter are local worker context. They are not part
+	// of the published T014 envelope and do not change stable identity.
+	RetryAttempt uint32 `json:"-"`
+	DeadLetter   bool   `json:"-"`
 }
 
 // Subject returns the NATS subject for this message.

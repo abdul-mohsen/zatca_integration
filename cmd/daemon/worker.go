@@ -266,25 +266,58 @@ func processWithRetry(
 	getService getServiceFunc,
 	msg queue.Message,
 ) error {
+	return processWithRetryFunc(
+		msg,
+		maxRetries,
+		time.Sleep,
+		func(attempt queue.Message) error {
+			return processMessage(tenantMap, getService, attempt)
+		},
+	)
+}
+
+func processWithRetryFunc(
+	msg queue.Message,
+	retryLimit int,
+	sleep func(time.Duration),
+	process func(queue.Message) error,
+) error {
+	if retryLimit < 1 {
+		retryLimit = 1
+	}
+	if sleep == nil {
+		sleep = time.Sleep
+	}
+	if process == nil {
+		return fmt.Errorf("process function is nil")
+	}
+
 	var lastErr error
-	for attempt := 0; attempt < maxRetries; attempt++ {
+	for attempt := 0; attempt < retryLimit; attempt++ {
+		attemptMsg := msg
+		attemptMsg.RetryAttempt = msg.RetryAttempt + uint32(attempt) + 1
+		attemptMsg.DeadLetter = attempt == retryLimit-1
+
 		if attempt > 0 {
 			backoff := time.Duration(math.Pow(2, float64(attempt))) * time.Second
 			if backoff > 5*time.Minute {
 				backoff = 5 * time.Minute
 			}
-			log.Printf("  Retry %d/%d for %s id=%d in %v", attempt+1, maxRetries, msg.DocType, msg.ID, backoff)
-			time.Sleep(backoff)
+			log.Printf("  Retry %d/%d for %s id=%d in %v", attempt+1, retryLimit, msg.DocType, msg.ID, backoff)
+			sleep(backoff)
 		}
 
-		err := processMessage(tenantMap, getService, msg)
+		err := process(attemptMsg)
 		if err == nil {
 			return nil
 		}
 		lastErr = err
-		log.Printf("  Attempt %d failed for %s id=%d: %v", attempt+1, msg.DocType, msg.ID, err)
+		log.Printf("  Attempt %d failed for %s id=%d: %v", attempt+1, attemptMsg.DocType, attemptMsg.ID, err)
+		if !processor.IsRetryableError(err) {
+			return err
+		}
 	}
-	return fmt.Errorf("all %d retries exhausted: %w", maxRetries, lastErr)
+	return fmt.Errorf("all %d retries exhausted: %w", retryLimit, lastErr)
 }
 
 // processMessage handles a single queue message by querying the tenant DB and processing.
@@ -376,6 +409,8 @@ func configForMessage(base *config.Config, msg queue.Message) *config.Config {
 	cfg.Attempt = msg.Attempt
 	cfg.AttemptCount = msg.AttemptCount
 	cfg.AttemptID = msg.AttemptID
+	cfg.RetryAttempt = msg.RetryAttempt
+	cfg.DeadLetter = msg.DeadLetter
 	return &cfg
 }
 

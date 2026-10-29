@@ -24,6 +24,8 @@ type submissionMeta struct {
 	attempt           uint32
 	attemptCount      uint32
 	attemptID         string
+	retryAttempt      uint32
+	deadLetter        bool
 }
 
 type submissionAttempt struct {
@@ -36,9 +38,13 @@ type submissionAttempt struct {
 	invoiceHash         string
 	providerCode        string
 	providerRef         string
+	outcomeState        OutcomeState
+	errorCode           string
+	errorMessage        string
 	requestXMLPath      string
 	clearedXMLPath      string
 	resolved            bool
+	terminal            bool
 	inFlight            bool
 	needsReconciliation bool
 }
@@ -58,6 +64,7 @@ type submissionOutcome struct {
 	ProviderCalled   bool
 	RequestXMLPath   string
 	ClearedXMLPath   string
+	Retryable        bool
 }
 
 type documentUpdate struct {
@@ -178,15 +185,25 @@ func (s *sqlSubmissionStore) startSubmission(meta submissionMeta, documentID str
 		stateText        string
 		providerCode     sql.NullString
 		providerRef      sql.NullString
+		rejectionCode    sql.NullString
+		rejectionMessage sql.NullString
 	)
 	if err := tx.QueryRow(`
 		SELECT merchant_id, document_id, outcome_state, provider_code,
-		       provider_reference
+		       provider_reference, rejection_code, rejection_msg
 		  FROM zatca_submission
 		 WHERE id = ?
 		 FOR UPDATE`,
 		submissionID,
-	).Scan(&storedMerchantID, &storedDocumentID, &stateText, &providerCode, &providerRef); err != nil {
+	).Scan(
+		&storedMerchantID,
+		&storedDocumentID,
+		&stateText,
+		&providerCode,
+		&providerRef,
+		&rejectionCode,
+		&rejectionMessage,
+	); err != nil {
 		return submissionAttempt{}, fmt.Errorf("verify ZATCA submission %d identity: %w", submissionID, err)
 	}
 	if storedMerchantID != meta.merchantID {
@@ -247,12 +264,15 @@ func (s *sqlSubmissionStore) startSubmission(meta submissionMeta, documentID str
 		latestCompletedRaw any
 		latestProviderCode sql.NullString
 		latestProviderRef  sql.NullString
+		latestErrorCode    sql.NullString
+		latestErrorMessage sql.NullString
 		latestRequestPath  sql.NullString
 		latestClearedPath  sql.NullString
 	)
 	latestErr := tx.QueryRow(`
 		SELECT id, attempt_number, attempt_state, started_at, completed_at,
-		       provider_code, provider_reference, request_xml_path, cleared_xml_path
+		       provider_code, provider_reference, error_code, error_message,
+		       request_xml_path, cleared_xml_path
 		  FROM zatca_submission_attempt
 		 WHERE submission_id = ?
 		 ORDER BY attempt_number DESC
@@ -267,6 +287,8 @@ func (s *sqlSubmissionStore) startSubmission(meta submissionMeta, documentID str
 		&latestCompletedRaw,
 		&latestProviderCode,
 		&latestProviderRef,
+		&latestErrorCode,
+		&latestErrorMessage,
 		&latestRequestPath,
 		&latestClearedPath,
 	)
@@ -292,6 +314,9 @@ func (s *sqlSubmissionStore) startSubmission(meta submissionMeta, documentID str
 		invoiceHash:    storedInvoiceHash.String,
 		providerCode:   providerCode.String,
 		providerRef:    providerRef.String,
+		outcomeState:   currentState,
+		errorCode:      rejectionCode.String,
+		errorMessage:   rejectionMessage.String,
 		requestXMLPath: latestRequestPath.String,
 		clearedXMLPath: latestClearedPath.String,
 	}
@@ -300,6 +325,12 @@ func (s *sqlSubmissionStore) startSubmission(meta submissionMeta, documentID str
 	}
 	if baseAttempt.providerRef == "" {
 		baseAttempt.providerRef = latestProviderRef.String
+	}
+	if baseAttempt.errorCode == "" {
+		baseAttempt.errorCode = latestErrorCode.String
+	}
+	if baseAttempt.errorMessage == "" {
+		baseAttempt.errorMessage = latestErrorMessage.String
 	}
 
 	commit := func() error {
@@ -318,6 +349,13 @@ func (s *sqlSubmissionStore) startSubmission(meta submissionMeta, documentID str
 		return baseAttempt, nil
 	}
 	if !forceNewAttempt {
+		if currentState == OutcomeRejected || currentState == OutcomeTerminalFailure {
+			baseAttempt.terminal = true
+			if err := commit(); err != nil {
+				return submissionAttempt{}, fmt.Errorf("commit terminal duplicate for submission %d: %w", submissionID, err)
+			}
+			return baseAttempt, nil
+		}
 		if currentState == OutcomeAmbiguous {
 			if latestErr == sql.ErrNoRows || latestAttemptID == 0 {
 				return submissionAttempt{}, fmt.Errorf("ZATCA submission %d is ambiguous without an attempt to reconcile", submissionID)
@@ -747,6 +785,9 @@ func eventArtifactMetadata(meta xmlMeta) []byte {
 	if strings.TrimSpace(meta.attemptID) != "" {
 		values["attempt_id"] = meta.attemptID
 	}
+	if meta.retryAttempt > 0 {
+		values["retry_attempt"] = meta.retryAttempt
+	}
 	if len(values) == 0 {
 		return nil
 	}
@@ -769,8 +810,8 @@ func sha256Hex(data []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func outcomeRetryTime(now time.Time, state OutcomeState, attemptNumber int) *time.Time {
-	if state == OutcomeTerminalFailure || state.success() {
+func outcomeRetryTime(now time.Time, retryable bool, attemptNumber int) *time.Time {
+	if !retryable {
 		return nil
 	}
 	if attemptNumber < 1 {
@@ -800,15 +841,16 @@ func outcomeError(outcome submissionOutcome) error {
 		message = fmt.Sprintf("ZATCA outcome is %s", outcome.State)
 	}
 	return &ProviderError{
-		State:   outcome.State,
-		Code:    outcome.ErrorCode,
-		Message: message,
+		State:     outcome.State,
+		Code:      outcome.ErrorCode,
+		Message:   message,
+		Retryable: outcome.Retryable,
 	}
 }
 
 func providerErrorOutcome(err error) submissionOutcome {
-	var providerErr *ProviderError
-	if errors.As(err, &providerErr) {
+	providerErr := normalizeProviderError(err)
+	if providerErr != nil {
 		state := providerErr.State
 		if !state.valid() {
 			state = OutcomeAmbiguous
@@ -818,6 +860,7 @@ func providerErrorOutcome(err error) submissionOutcome {
 			ProviderCode: providerErr.Code,
 			ErrorCode:    providerErr.Code,
 			ErrorMessage: providerErr.Message,
+			Retryable:    IsRetryableError(providerErr),
 		}
 	}
 	return submissionOutcome{
@@ -825,6 +868,46 @@ func providerErrorOutcome(err error) submissionOutcome {
 		ProviderCode: "TRANSPORT_ERROR",
 		ErrorCode:    "TRANSPORT_ERROR",
 		ErrorMessage: err.Error(),
+		Retryable:    true,
+	}
+}
+
+func terminalizeRetryExhaustion(outcome submissionOutcome) submissionOutcome {
+	if !outcome.Retryable {
+		return outcome
+	}
+	originalCode := outcome.ErrorCode
+	if originalCode == "" {
+		originalCode = outcome.ProviderCode
+	}
+	originalMessage := outcome.ErrorMessage
+	if originalMessage == "" {
+		originalMessage = fmt.Sprintf("ZATCA outcome is %s", outcome.State)
+	}
+	outcome.State = OutcomeTerminalFailure
+	outcome.Retryable = false
+	outcome.ErrorCode = "RETRY_EXHAUSTED"
+	outcome.ErrorMessage = limitText(
+		fmt.Sprintf("%s: %s", originalCode, originalMessage),
+		1024,
+	)
+	return outcome
+}
+
+func terminalizeProviderError(err *ProviderError) *ProviderError {
+	if err == nil || !IsRetryableError(err) {
+		return err
+	}
+	message := err.Message
+	if message == "" {
+		message = fmt.Sprintf("retry budget exhausted after %s", err.State)
+	}
+	return &ProviderError{
+		State:     OutcomeTerminalFailure,
+		Code:      "RETRY_EXHAUSTED",
+		Message:   limitText(message, 1024),
+		Err:       err,
+		Retryable: false,
 	}
 }
 

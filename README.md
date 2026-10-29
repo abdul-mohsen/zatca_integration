@@ -527,11 +527,22 @@ metadata because the T003 schema has no dedicated stable-key columns.
 
 ## 7. Retry & Error Handling
 
-- Each message is retried up to **10 times** with exponential backoff (2s, 4s, 8s, ... capped at 5 min)
-- After exhausting retries, the daemon:
-  - Sends an **alert email** to the tenant's `alert_email`
-  - ACKs the message (to avoid blocking the queue)
-  - Leaves the document in its current state for manual handling
+- Permanent provider 4xx responses (except 408, 409, 425, and 429) and
+  invalid signed/request/cleared XML are recorded without another retry.
+- Timeouts, transport uncertainty, retryable 4xx responses, and 5xx responses
+  are recorded as ambiguous and retried up to **10 times** with exponential
+  backoff (2s, 4s, 8s, ... capped at 5 min).
+- Every durable attempt records its attempt/retry count and next retry time.
+  Invalid-content failures and exhausted transient failures are recorded as
+  `terminal_failure` with terminal evidence and no next retry; definitive
+  provider business rejections remain `rejected`. In both cases the message
+  is dead-lettered by alerting and acknowledging it.
+- If an ambiguous submission is retried, the daemon first uses the provider
+  reconciliation seam with the stable UUID and invoice hash. The current
+  ZATCA client has no lookup-by-UUID endpoint, so production records
+  `RECONCILIATION_UNSUPPORTED` and remains ambiguous rather than blindly
+  submitting a duplicate. Fake-provider tests cover the acceptance-found
+  reconciliation path.
 - On startup, the daemon **replays** any documents still pending in the DB
 
 ### SMTP Configuration (for alerts)

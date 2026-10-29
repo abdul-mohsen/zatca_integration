@@ -63,6 +63,8 @@ func signSubmitUpdateWithProvider(
 			attempt:           meta.attempt,
 			attemptCount:      meta.attemptCount,
 			attemptID:         meta.attemptID,
+			retryAttempt:      meta.retryAttempt,
+			deadLetter:        meta.deadLetter,
 		},
 		inv.UUID,
 		startedAt,
@@ -75,6 +77,14 @@ func signSubmitUpdateWithProvider(
 			return attempt.invoiceHash, nil
 		}
 		return inv.UUID, nil
+	}
+	if attempt.terminal {
+		return "", &ProviderError{
+			State:     attempt.outcomeState,
+			Code:      attempt.errorCode,
+			Message:   attempt.errorMessage,
+			Retryable: false,
+		}
 	}
 	if attempt.inFlight {
 		return "", &DuplicateDeliveryError{DocumentID: inv.UUID}
@@ -89,13 +99,21 @@ func signSubmitUpdateWithProvider(
 	outcome := submissionOutcome{
 		State:      OutcomeTerminalFailure,
 		RetryCount: attempt.attemptNumber - 1,
+		Retryable:  false,
 	}
 	var artifacts []artifactRecord
 	fail := func(processErr error, code string) (string, error) {
+		terminalErr := &ProviderError{
+			State:     OutcomeTerminalFailure,
+			Code:      code,
+			Message:   limitText(processErr.Error(), 1024),
+			Err:       processErr,
+			Retryable: false,
+		}
 		outcome.State = OutcomeTerminalFailure
 		outcome.ErrorCode = code
-		outcome.ErrorMessage = limitText(processErr.Error(), 1024)
-		return "", finishSubmission(store, attempt, outcome, update, artifacts, processErr)
+		outcome.ErrorMessage = terminalErr.Message
+		return "", finishSubmission(store, attempt, outcome, update, artifacts, terminalErr)
 	}
 
 	if provider == nil {
@@ -113,6 +131,9 @@ func signSubmitUpdateWithProvider(
 	}
 	if strings.TrimSpace(signedXML) == "" {
 		return fail(fmt.Errorf("SignInvoice returned empty XML"), "EMPTY_SIGNED_XML")
+	}
+	if err := validateXMLContent(signedXML); err != nil {
+		return fail(err, "INVALID_SIGNED_XML")
 	}
 
 	requestPath, requestArtifact, err := saveXMLArtifact(meta, rowID, "", signedXML)
@@ -158,17 +179,22 @@ func signSubmitUpdateWithProvider(
 	update.QR = qr
 
 	finishProviderError := func(providerErr error, providerCalled bool) (string, error) {
-		outcome = providerErrorOutcome(providerErr)
+		normalizedErr := normalizeProviderError(providerErr)
+		outcome = providerErrorOutcome(normalizedErr)
 		outcome.ProviderCalled = providerCalled
 		outcome.RequestXMLPath = requestPath
 		outcome.RetryCount = attempt.attemptNumber - 1
-		outcome.NextRetryAt = outcomeRetryTime(startedAt, outcome.State, attempt.attemptNumber)
+		if meta.deadLetter {
+			outcome = terminalizeRetryExhaustion(outcome)
+			normalizedErr = terminalizeProviderError(normalizedErr)
+		}
+		outcome.NextRetryAt = outcomeRetryTime(startedAt, outcome.Retryable, attempt.attemptNumber)
 		update.InvoiceHash = req.InvoiceHash
 		update.InvoiceUUID = req.UUID
 		update.QR = qr
 		update.XMLPath = requestPath
 		logOutcome(outcome)
-		return "", finishSubmission(store, attempt, outcome, update, artifacts, providerErr)
+		return "", finishSubmission(store, attempt, outcome, update, artifacts, normalizedErr)
 	}
 
 	var (
@@ -225,6 +251,8 @@ func signSubmitUpdateWithProvider(
 					attempt:           meta.attempt,
 					attemptCount:      meta.attemptCount,
 					attemptID:         meta.attemptID,
+					retryAttempt:      meta.retryAttempt,
+					deadLetter:        meta.deadLetter,
 				},
 				req.UUID,
 				startedAt,
@@ -290,7 +318,7 @@ func signSubmitUpdateWithProvider(
 		RejectionCode:    limitText(result.RejectionCode, 32),
 		RejectionMessage: limitText(result.RejectionMessage, 512),
 		RetryCount:       attempt.attemptNumber - 1,
-		NextRetryAt:      outcomeRetryTime(startedAt, result.State, attempt.attemptNumber),
+		Retryable:        result.State == OutcomePending || result.State == OutcomeAmbiguous,
 		ProviderCalled:   providerCalled,
 		RequestXMLPath:   requestPath,
 		ClearedXMLPath:   clearedPath,
@@ -305,6 +333,10 @@ func signSubmitUpdateWithProvider(
 			outcome.ErrorMessage = fmt.Sprintf("provider outcome is %s", outcome.State)
 		}
 	}
+	if meta.deadLetter {
+		outcome = terminalizeRetryExhaustion(outcome)
+	}
+	outcome.NextRetryAt = outcomeRetryTime(startedAt, outcome.Retryable, attempt.attemptNumber)
 	update.InvoiceHash = finalHash
 	update.InvoiceUUID = req.UUID
 	update.QR = qr

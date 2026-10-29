@@ -3,8 +3,10 @@ package processor
 import (
 	"encoding/base64"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 
@@ -90,10 +92,11 @@ type ProviderResult struct {
 
 // ProviderError describes a provider failure with an explicit durable state.
 type ProviderError struct {
-	State   OutcomeState
-	Code    string
-	Message string
-	Err     error
+	State     OutcomeState
+	Code      string
+	Message   string
+	Err       error
+	Retryable bool
 }
 
 func (e *ProviderError) Error() string {
@@ -237,6 +240,15 @@ func normalizeProviderResponse(resp *models.InvoiceResponse) *ProviderResult {
 			return &ProviderResult{
 				State:            OutcomeTerminalFailure,
 				ProviderCode:     "INVALID_CLEARED_XML",
+				RejectionCode:    "INVALID_CLEARED_XML",
+				RejectionMessage: err.Error(),
+			}
+		}
+		if err := validateXMLContent(string(decoded)); err != nil {
+			return &ProviderResult{
+				State:            OutcomeTerminalFailure,
+				ProviderCode:     "INVALID_CLEARED_XML",
+				RejectionCode:    "INVALID_CLEARED_XML",
 				RejectionMessage: err.Error(),
 			}
 		}
@@ -263,33 +275,99 @@ func classifyProviderError(err error) error {
 
 	var apiErr *client.APIError
 	if errors.As(err, &apiErr) {
+		retryable := retryableHTTPStatus(apiErr.StatusCode)
 		state := OutcomeRejected
-		if apiErr.StatusCode == 408 || apiErr.StatusCode == 409 || apiErr.StatusCode == 429 || apiErr.StatusCode >= 500 {
+		if retryable {
 			state = OutcomeAmbiguous
 		}
 		return &ProviderError{
-			State:   state,
-			Code:    fmt.Sprintf("HTTP_%d", apiErr.StatusCode),
-			Message: apiErr.Error(),
-			Err:     err,
+			State:     state,
+			Code:      fmt.Sprintf("HTTP_%d", apiErr.StatusCode),
+			Message:   apiErr.Error(),
+			Err:       err,
+			Retryable: retryable,
 		}
 	}
 
 	var netErr net.Error
 	if errors.As(err, &netErr) && netErr.Timeout() {
 		return &ProviderError{
-			State:   OutcomeAmbiguous,
-			Code:    "TIMEOUT",
-			Message: err.Error(),
-			Err:     err,
+			State:     OutcomeAmbiguous,
+			Code:      "TIMEOUT",
+			Message:   err.Error(),
+			Err:       err,
+			Retryable: true,
 		}
 	}
 
 	return &ProviderError{
-		State:   OutcomeAmbiguous,
-		Code:    "TRANSPORT_ERROR",
-		Message: err.Error(),
-		Err:     err,
+		State:     OutcomeAmbiguous,
+		Code:      "TRANSPORT_ERROR",
+		Message:   err.Error(),
+		Err:       err,
+		Retryable: true,
+	}
+}
+
+func retryableHTTPStatus(status int) bool {
+	return status == 408 || status == 409 || status == 425 || status == 429 || status >= 500
+}
+
+// IsRetryableError reports whether the worker should make another processing
+// attempt. Unknown errors remain retryable so infrastructure failures are not
+// silently dead-lettered without a durable provider classification.
+func IsRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	var providerErr *ProviderError
+	if !errors.As(err, &providerErr) {
+		return true
+	}
+	switch providerErr.State {
+	case OutcomeAccepted, OutcomeAcceptedWithWarning, OutcomeRejected, OutcomeTerminalFailure:
+		return false
+	case OutcomeAmbiguous, OutcomePending:
+		return true
+	}
+	return true
+}
+
+func normalizeProviderError(err error) *ProviderError {
+	if err == nil {
+		return nil
+	}
+	var providerErr *ProviderError
+	if errors.As(err, &providerErr) {
+		return providerErr
+	}
+	classified, ok := classifyProviderError(err).(*ProviderError)
+	if ok {
+		return classified
+	}
+	return &ProviderError{
+		State:     OutcomeAmbiguous,
+		Code:      "TRANSPORT_ERROR",
+		Message:   err.Error(),
+		Err:       err,
+		Retryable: true,
+	}
+}
+
+func validateXMLContent(content string) error {
+	if strings.TrimSpace(content) == "" {
+		return fmt.Errorf("XML content is empty")
+	}
+	decoder := xml.NewDecoder(strings.NewReader(content))
+	for {
+		_, err := decoder.Token()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("invalid XML: %w", err)
+		}
 	}
 }
 
