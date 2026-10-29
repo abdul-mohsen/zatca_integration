@@ -22,6 +22,30 @@ import (
 // values take precedence over any company/store joins so what the user
 // entered is what gets sent to ZATCA.
 func OnboardBranch(db *sql.DB, baseCfg *config.Config, branchID int64, otp string, encKey *secutil.Key) error {
+	return OnboardBranchWithProgress(db, baseCfg, branchID, otp, encKey, nil)
+}
+
+// OnboardBranchWithProgress performs onboarding and reports the active step
+// before each durable provider stage. It keeps the existing OnboardBranch API
+// available for callers that do not need progress updates.
+func OnboardBranchWithProgress(
+	db *sql.DB,
+	baseCfg *config.Config,
+	branchID int64,
+	otp string,
+	encKey *secutil.Key,
+	progress func(string) error,
+) error {
+	report := func(step string) error {
+		if progress == nil {
+			return nil
+		}
+		if err := progress(step); err != nil {
+			return fmt.Errorf("persist onboarding step %s: %w", step, err)
+		}
+		return nil
+	}
+
 	branch, err := loadOnboardBranch(db, branchID, encKey)
 	if err != nil {
 		return err
@@ -68,6 +92,9 @@ func OnboardBranch(db *sql.DB, baseCfg *config.Config, branchID int64, otp strin
 		return fmt.Errorf("branch %d: onboarding already completed (compliance certificate is present); revoke and clear branch_zatca_config to re-onboard", branchID)
 	}
 
+	if err := report("csr"); err != nil {
+		return err
+	}
 	var csrPEM, privateKey string
 	if branch.ExistingCSR != "" {
 		log.Printf("Branch %d: discarding stale CSR (no compliance cert saved); generating fresh CSR with new OTP", branchID)
@@ -91,7 +118,7 @@ func OnboardBranch(db *sql.DB, baseCfg *config.Config, branchID int64, otp strin
 
 	// Run the rest of onboarding (compliance CSID → 6 invoices → production CSID)
 	// using the already-generated key.
-	result, err := svc.OnboardWithCSR(csrPEM, privateKey)
+	result, err := svc.OnboardWithCSRProgress(csrPEM, privateKey, report)
 	if err != nil {
 		return fmt.Errorf("onboarding failed: %w", err)
 	}
@@ -111,13 +138,8 @@ func OnboardBranch(db *sql.DB, baseCfg *config.Config, branchID int64, otp strin
 		return fmt.Errorf("encrypt production secret: %w", err)
 	}
 
-	// NOTE: `zatca_otp` is intentionally NOT written here. The OTP arrives
-	// via NATS (single-use) and persisting it would only retain plaintext
-	// PII. Some deployments' `branch_zatca_config` tables also lack the
-	// column entirely (Error 1054: Unknown column 'zatca_otp'), so writing
-	// it would break onboarding on those tenants. The post-insert
-	// "clear OTP" UPDATE below is best-effort for legacy schemas that DO
-	// have the column.
+	// The one-time OTP arrives through NATS and is intentionally not written
+	// to branch_zatca_config.
 	credQ := `INSERT INTO branch_zatca_config
 		(branch_id, csr_org_identifier, csr_org_unit, csr_org_name, csr_country, csr_location, business_category, seller_vat, seller_crn, street, building, district, postal_code, zatca_csr, zatca_private_key, zatca_compliance_certificate, zatca_compliance_secret, zatca_compliance_request_id, zatca_production_username, zatca_production_password, zatca_production_request_id, zatca_registered_at)
 	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
@@ -171,11 +193,6 @@ func OnboardBranch(db *sql.DB, baseCfg *config.Config, branchID int64, otp strin
 	}
 
 	log.Printf("Branch %d: Registration complete.", branchID)
-
-	// Clear the OTP — it's single-use and should not be retained in plaintext.
-	if _, err := db.Exec(`UPDATE branch_zatca_config SET zatca_otp = '' WHERE branch_id = ?`, branchID); err != nil {
-		log.Printf("WARN: branch %d: clear OTP: %v", branchID, err)
-	}
 	return nil
 }
 

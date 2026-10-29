@@ -91,12 +91,27 @@ func (s *Service) Onboard() (*OnboardResult, error) {
 // The CSR + private key are NOT included in the returned OnboardResult
 // so the caller is expected to know them already.
 func (s *Service) OnboardWithCSR(csrPEM, privateKeyPEM string) (*OnboardResult, error) {
+	return s.OnboardWithCSRProgress(csrPEM, privateKeyPEM, nil)
+}
+
+// OnboardWithCSRProgress runs steps 2–4 and reports each step immediately
+// before the corresponding provider operation.
+func (s *Service) OnboardWithCSRProgress(
+	csrPEM string,
+	privateKeyPEM string,
+	progress func(string) error,
+) (*OnboardResult, error) {
 	result := &OnboardResult{}
 
 	// Inject the private key into the SDK so subsequent Docker commands can sign.
 	s.SDK.SetCredentials(privateKeyPEM, "")
 
 	// Step 2: Request Compliance CSID
+	if progress != nil {
+		if err := progress("compliance"); err != nil {
+			return nil, err
+		}
+	}
 	csrBase64 := pemToBase64(csrPEM)
 	log.Printf("Onboard step 2/4: requesting compliance CSID (URL=%s/compliance)", s.Config.BaseURL())
 	compResp, err := s.Client.ComplianceCSID(csrBase64)
@@ -142,6 +157,11 @@ func (s *Service) OnboardWithCSR(csrPEM, privateKeyPEM string) (*OnboardResult, 
 	s.SDK.SetCredentials(privateKeyPEM, certPEM)
 
 	// Step 3: Submit 6 compliance invoices
+	if progress != nil {
+		if err := progress("invoices"); err != nil {
+			return nil, err
+		}
+	}
 	log.Printf("Onboard step 3/4: submitting 6 compliance invoices")
 	if err := s.submitComplianceInvoices(privateKeyPEM, compResp.BinarySecurityToken); err != nil {
 		return nil, fmt.Errorf("step 3 (compliance invoices): %w", err)
@@ -149,6 +169,11 @@ func (s *Service) OnboardWithCSR(csrPEM, privateKeyPEM string) (*OnboardResult, 
 	log.Printf("Onboard step 3/4: OK — all 6 compliance invoices passed")
 
 	// Step 4: Request Production CSID
+	if progress != nil {
+		if err := progress("production"); err != nil {
+			return nil, err
+		}
+	}
 	log.Printf("Onboard step 4/4: requesting production CSID (requestID=%s)", compResp.RequestID.String())
 	prodResp, err := s.Client.ProductionCSID(compResp.RequestID.String())
 	if err != nil {

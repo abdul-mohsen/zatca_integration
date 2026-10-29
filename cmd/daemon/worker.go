@@ -22,11 +22,12 @@ import (
 const maxRetries = 10
 
 type tenantCtx struct {
-	tenant  tenant.Tenant
-	db      *sql.DB // runtime: SELECT + column-level UPDATE only
-	adminDB *sql.DB // admin: also has INSERT/UPDATE on branch_zatca_config
-	cfg     *config.Config
-	encKey  *secutil.Key
+	tenant          tenant.Tenant
+	db              *sql.DB // runtime: SELECT + column-level UPDATE only
+	adminDB         *sql.DB // admin: INSERT/UPDATE on onboarding config and attempt tables
+	cfg             *config.Config
+	encKey          *secutil.Key
+	onboardingState onboardingStateStore
 }
 
 // activeBranches tracks which branches already have doc workers running.
@@ -158,18 +159,21 @@ func runOnboardWorker(
 				log.Printf("Processing onboard: branch=%d db=%s otp=%s (latest OTP)",
 					q.BranchID, q.DBName, maskOTP(q.OTP))
 
-				// Onboard runs once — OTP is single-use, retrying would always fail with Invalid-OTP
-				if err := processMessage(tenantMap, nil, q); err != nil {
-					log.Printf("ERROR: onboard branch=%d FAILED: %v", q.BranchID, err)
-					tc, ok := tenantMap[q.DBName]
-					if ok && tc.tenant.AlertEmail != "" {
-						sendAlert(tc.tenant.AlertEmail, q, err)
-					}
-					m.Ack()
+				tc, ok := tenantMap[q.DBName]
+				if !ok {
+					log.Printf("ERROR: onboard branch=%d db=%s: unknown tenant", q.BranchID, q.DBName)
 					continue
 				}
-				spawnBranchWorkers(js, tenantMap, getService, wg, q.DBName, q.BranchID)
-				m.Ack()
+				handleOnboardMessage(
+					tc,
+					q,
+					onboardingStateStoreFor(tc),
+					runOnboarding,
+					func(msg queue.Message) {
+						spawnBranchWorkers(js, tenantMap, getService, wg, msg.DBName, msg.BranchID)
+					},
+					func() error { return m.Ack() },
+				)
 			}
 		}
 	}

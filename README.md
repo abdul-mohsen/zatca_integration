@@ -341,6 +341,23 @@ The daemon will:
 5. Request Production CSID
 6. Save all credentials to `branch_csr` and `branch_zatca` tables
 
+### Durable onboarding state
+
+The daemon writes onboarding progress to the T010 backend contract:
+`queued`, CSR, compliance, compliance invoices, production, `done`, or
+`failed`, along with the current step, bounded error evidence, retry count,
+and queued/started/completed/last-attempt timestamps. The current branch row
+and its matching `zatca_onboarding_attempt` history row are updated together.
+
+Apply the backend migration
+`pkg/db/migrations/0009_zatca_onboarding_state.sql` from T010 to every tenant
+database before enabling this worker. The daemon uses the write-capable
+`--admin-dsn` connection when configured and falls back to `--base-dsn`.
+Failures are acknowledged only after failed state is durable; if that write
+fails, JetStream can redeliver the message. Successful onboarding is marked
+`done` before branch invoice workers are activated. The one-time OTP is never
+stored.
+
 ### Step 5: Create and submit invoices
 
 ```sql
