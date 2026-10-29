@@ -56,6 +56,24 @@ type SubmissionProvider interface {
 	Submit(request models.InvoiceRequest, standard bool) (*ProviderResult, error)
 }
 
+// ProviderIdentity is the stable identity used to reconcile an ambiguous
+// provider response. DocumentID and InvoiceHash are the values sent in the
+// ZATCA request; ProviderRef is retained when the provider supplied one.
+type ProviderIdentity struct {
+	DocumentID  string
+	InvoiceHash string
+	ProviderRef string
+	StableKey   string
+}
+
+// SubmissionReconciler is an optional provider capability. A nil result with
+// a nil error means the provider has no record for the identity. An error is
+// treated as an unresolved ambiguous outcome and must not trigger a blind
+// second request.
+type SubmissionReconciler interface {
+	Reconcile(identity ProviderIdentity, standard bool) (*ProviderResult, error)
+}
+
 // ProviderResult is the normalized provider response consumed by the
 // processor. Empty optional values remain empty and are persisted as NULL.
 type ProviderResult struct {
@@ -164,6 +182,17 @@ func (p serviceSubmissionProvider) Submit(request models.InvoiceRequest, standar
 		}
 	}
 	return normalizeProviderResponse(resp), nil
+}
+
+// Reconcile reports the current provider limitation explicitly. The current
+// ZATCA client exposes submit endpoints but no query-by-UUID endpoint, so an
+// ambiguous result cannot be safely converted into a new request.
+func (p serviceSubmissionProvider) Reconcile(ProviderIdentity, bool) (*ProviderResult, error) {
+	return nil, &ProviderError{
+		State:   OutcomeAmbiguous,
+		Code:    "RECONCILIATION_UNSUPPORTED",
+		Message: "ZATCA provider does not expose a submission lookup endpoint",
+	}
 }
 
 func normalizeProviderResponse(resp *models.InvoiceResponse) *ProviderResult {

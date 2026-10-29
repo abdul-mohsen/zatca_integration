@@ -54,15 +54,30 @@ func signSubmitUpdateWithProvider(
 	startedAt := time.Now()
 	attempt, err := store.StartSubmission(
 		submissionMeta{
-			merchantID:   meta.merchantID,
-			sourceBillID: meta.sourceBillID,
-			documentKind: meta.documentKind,
+			merchantID:        meta.merchantID,
+			sourceBillID:      meta.sourceBillID,
+			documentKind:      meta.documentKind,
+			stableDocumentKey: meta.stableDocumentKey,
+			eventID:           meta.eventID,
+			outboxID:          meta.outboxID,
+			attempt:           meta.attempt,
+			attemptCount:      meta.attemptCount,
+			attemptID:         meta.attemptID,
 		},
 		inv.UUID,
 		startedAt,
 	)
 	if err != nil {
 		return "", err
+	}
+	if attempt.resolved {
+		if attempt.invoiceHash != "" {
+			return attempt.invoiceHash, nil
+		}
+		return inv.UUID, nil
+	}
+	if attempt.inFlight {
+		return "", &DuplicateDeliveryError{DocumentID: inv.UUID}
 	}
 
 	update := documentUpdate{
@@ -104,6 +119,7 @@ func signSubmitUpdateWithProvider(
 	if err != nil {
 		return fail(err, "REQUEST_ARTIFACT_FAILED")
 	}
+	requestArtifact.Metadata = eventArtifactMetadata(meta)
 	if requestArtifact.Path != "" {
 		artifacts = append(artifacts, requestArtifact)
 	}
@@ -117,6 +133,12 @@ func signSubmitUpdateWithProvider(
 	}
 	if req.UUID == "" {
 		req.UUID = inv.UUID
+	}
+	if req.UUID != inv.UUID {
+		return fail(
+			fmt.Errorf("provider request UUID %q does not match stable document UUID %q", req.UUID, inv.UUID),
+			"DOCUMENT_IDENTITY_MISMATCH",
+		)
 	}
 	if req.InvoiceHash == "" {
 		req.InvoiceHash = hash
@@ -135,10 +157,9 @@ func signSubmitUpdateWithProvider(
 	}
 	update.QR = qr
 
-	result, err := provider.Submit(req, inv.IsStandard())
-	if err != nil {
-		outcome = providerErrorOutcome(err)
-		outcome.ProviderCalled = true
+	finishProviderError := func(providerErr error, providerCalled bool) (string, error) {
+		outcome = providerErrorOutcome(providerErr)
+		outcome.ProviderCalled = providerCalled
 		outcome.RequestXMLPath = requestPath
 		outcome.RetryCount = attempt.attemptNumber - 1
 		outcome.NextRetryAt = outcomeRetryTime(startedAt, outcome.State, attempt.attemptNumber)
@@ -147,7 +168,88 @@ func signSubmitUpdateWithProvider(
 		update.QR = qr
 		update.XMLPath = requestPath
 		logOutcome(outcome)
-		return "", finishSubmission(store, attempt, outcome, update, artifacts, err)
+		return "", finishSubmission(store, attempt, outcome, update, artifacts, providerErr)
+	}
+
+	var (
+		result         *ProviderResult
+		providerCalled bool
+		reconciled     bool
+	)
+	if attempt.needsReconciliation {
+		reconciler, ok := provider.(SubmissionReconciler)
+		if !ok {
+			return finishProviderError(&ProviderError{
+				State:   OutcomeAmbiguous,
+				Code:    "RECONCILIATION_UNSUPPORTED",
+				Message: "provider does not support submission reconciliation",
+			}, false)
+		}
+		identity := ProviderIdentity{
+			DocumentID:  req.UUID,
+			InvoiceHash: req.InvoiceHash,
+			ProviderRef: attempt.providerRef,
+			StableKey:   meta.stableDocumentKey,
+		}
+		if attempt.invoiceHash != "" && attempt.invoiceHash != req.InvoiceHash {
+			return finishProviderError(&ProviderError{
+				State:   OutcomeTerminalFailure,
+				Code:    "DOCUMENT_CONTENT_MISMATCH",
+				Message: "stable provider identity has a different invoice hash",
+			}, false)
+		}
+		result, err = reconciler.Reconcile(identity, inv.IsStandard())
+		if err != nil {
+			return finishProviderError(err, false)
+		}
+		if result != nil {
+			reconciled = true
+			providerCalled = true
+		} else {
+			starter, ok := store.(submissionRetryStarter)
+			if !ok {
+				return finishProviderError(&ProviderError{
+					State:   OutcomeAmbiguous,
+					Code:    "RECONCILIATION_NOT_FOUND",
+					Message: "provider identity was not found and the store cannot allocate a retry attempt",
+				}, false)
+			}
+			attempt, err = starter.StartRetrySubmission(
+				submissionMeta{
+					merchantID:        meta.merchantID,
+					sourceBillID:      meta.sourceBillID,
+					documentKind:      meta.documentKind,
+					stableDocumentKey: meta.stableDocumentKey,
+					eventID:           meta.eventID,
+					outboxID:          meta.outboxID,
+					attempt:           meta.attempt,
+					attemptCount:      meta.attemptCount,
+					attemptID:         meta.attemptID,
+				},
+				req.UUID,
+				startedAt,
+			)
+			if err != nil {
+				return "", err
+			}
+			if attempt.resolved {
+				if attempt.invoiceHash != "" {
+					return attempt.invoiceHash, nil
+				}
+				return req.InvoiceHash, nil
+			}
+			if attempt.inFlight {
+				return "", &DuplicateDeliveryError{DocumentID: req.UUID}
+			}
+		}
+	}
+
+	if !reconciled {
+		result, err = provider.Submit(req, inv.IsStandard())
+		providerCalled = true
+	}
+	if err != nil {
+		return finishProviderError(err, providerCalled)
 	}
 	if result == nil {
 		return fail(fmt.Errorf("invoice API returned nil response"), "NIL_PROVIDER_RESPONSE")
@@ -189,7 +291,7 @@ func signSubmitUpdateWithProvider(
 		RejectionMessage: limitText(result.RejectionMessage, 512),
 		RetryCount:       attempt.attemptNumber - 1,
 		NextRetryAt:      outcomeRetryTime(startedAt, result.State, attempt.attemptNumber),
-		ProviderCalled:   true,
+		ProviderCalled:   providerCalled,
 		RequestXMLPath:   requestPath,
 		ClearedXMLPath:   clearedPath,
 	}

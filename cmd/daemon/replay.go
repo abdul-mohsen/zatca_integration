@@ -59,18 +59,26 @@ func replayBranch(js nats.JetStreamContext, db *sql.DB, dbName string, branchID 
 }
 
 func publishReplay(js nats.JetStreamContext, docType queue.DocType, dbName string, branchID int64, id int64) error {
-	msg := queue.Message{
+	msg, err := (queue.Message{
 		DocType:  docType,
 		ID:       id,
 		BranchID: branchID,
 		DBName:   dbName,
+	}).Normalize()
+	if err != nil {
+		return err
 	}
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return err
 	}
 	// Use PublishMsgID for deduplication — if the message was already published by Gin,
-	// JetStream will skip the duplicate.
-	_, err = js.Publish(msg.Subject(), data, nats.MsgId(fmt.Sprintf("%s-%d", msg.Subject(), id)))
+	// JetStream will skip the duplicate. T014 live publications use the same
+	// stable document key, while attempt metadata remains payload-only.
+	messageID := msg.NATSMessageID()
+	if messageID == "" {
+		messageID = fmt.Sprintf("%s-%d", msg.Subject(), id)
+	}
+	_, err = js.Publish(msg.Subject(), data, nats.MsgId(messageID))
 	return err
 }

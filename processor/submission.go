@@ -15,17 +15,32 @@ import (
 )
 
 type submissionMeta struct {
-	merchantID   int64
-	sourceBillID int64
-	documentKind string
+	merchantID        int64
+	sourceBillID      int64
+	documentKind      string
+	stableDocumentKey string
+	eventID           string
+	outboxID          uint64
+	attempt           uint32
+	attemptCount      uint32
+	attemptID         string
 }
 
 type submissionAttempt struct {
-	submissionID  int64
-	attemptID     int64
-	attemptNumber int
-	merchantID    int64
-	startedAt     time.Time
+	submissionID        int64
+	attemptID           int64
+	attemptNumber       int
+	merchantID          int64
+	startedAt           time.Time
+	documentID          string
+	invoiceHash         string
+	providerCode        string
+	providerRef         string
+	requestXMLPath      string
+	clearedXMLPath      string
+	resolved            bool
+	inFlight            bool
+	needsReconciliation bool
 }
 
 type submissionOutcome struct {
@@ -69,15 +84,46 @@ type submissionStore interface {
 	CompleteSubmission(attempt submissionAttempt, outcome submissionOutcome, update documentUpdate, artifacts []artifactRecord) error
 }
 
+type submissionRetryStarter interface {
+	StartRetrySubmission(meta submissionMeta, documentID string, startedAt time.Time) (submissionAttempt, error)
+}
+
+var ErrDuplicateDelivery = errors.New("duplicate ZATCA delivery is already being processed")
+
+type DuplicateDeliveryError struct {
+	DocumentID string
+}
+
+func (e *DuplicateDeliveryError) Error() string {
+	if e == nil || e.DocumentID == "" {
+		return ErrDuplicateDelivery.Error()
+	}
+	return fmt.Sprintf("%s: document_id=%s", ErrDuplicateDelivery, e.DocumentID)
+}
+
+func (e *DuplicateDeliveryError) Unwrap() error {
+	return ErrDuplicateDelivery
+}
+
 type sqlSubmissionStore struct {
 	db *sql.DB
 }
+
+const pendingAttemptLease = 5 * time.Minute
 
 func newSQLSubmissionStore(db *sql.DB) submissionStore {
 	return &sqlSubmissionStore{db: db}
 }
 
 func (s *sqlSubmissionStore) StartSubmission(meta submissionMeta, documentID string, startedAt time.Time) (submissionAttempt, error) {
+	return s.startSubmission(meta, documentID, startedAt, false)
+}
+
+func (s *sqlSubmissionStore) StartRetrySubmission(meta submissionMeta, documentID string, startedAt time.Time) (submissionAttempt, error) {
+	return s.startSubmission(meta, documentID, startedAt, true)
+}
+
+func (s *sqlSubmissionStore) startSubmission(meta submissionMeta, documentID string, startedAt time.Time, forceNewAttempt bool) (submissionAttempt, error) {
 	if s == nil || s.db == nil {
 		return submissionAttempt{}, fmt.Errorf("durable submission store is not configured")
 	}
@@ -119,19 +165,28 @@ func (s *sqlSubmissionStore) StartSubmission(meta submissionMeta, documentID str
 	}
 	if submissionID == 0 {
 		if err := tx.QueryRow(
-			`SELECT id FROM zatca_submission WHERE bill_id = ? AND merchant_id = ? FOR UPDATE`,
-			meta.sourceBillID, meta.merchantID,
+			`SELECT id FROM zatca_submission WHERE bill_id = ? FOR UPDATE`,
+			meta.sourceBillID,
 		).Scan(&submissionID); err != nil {
 			return submissionAttempt{}, fmt.Errorf("find ZATCA submission for bill %d: %w", meta.sourceBillID, err)
 		}
 	}
 
-	var storedMerchantID int64
-	var storedDocumentID string
-	if err := tx.QueryRow(
-		`SELECT merchant_id, document_id FROM zatca_submission WHERE id = ? FOR UPDATE`,
+	var (
+		storedMerchantID int64
+		storedDocumentID string
+		stateText        string
+		providerCode     sql.NullString
+		providerRef      sql.NullString
+	)
+	if err := tx.QueryRow(`
+		SELECT merchant_id, document_id, outcome_state, provider_code,
+		       provider_reference
+		  FROM zatca_submission
+		 WHERE id = ?
+		 FOR UPDATE`,
 		submissionID,
-	).Scan(&storedMerchantID, &storedDocumentID); err != nil {
+	).Scan(&storedMerchantID, &storedDocumentID, &stateText, &providerCode, &providerRef); err != nil {
 		return submissionAttempt{}, fmt.Errorf("verify ZATCA submission %d identity: %w", submissionID, err)
 	}
 	if storedMerchantID != meta.merchantID {
@@ -145,6 +200,147 @@ func (s *sqlSubmissionStore) StartSubmission(meta submissionMeta, documentID str
 			"ZATCA submission %d document mismatch: stored document_id=%q, current document_id=%q",
 			submissionID, storedDocumentID, documentID,
 		)
+	}
+
+	var storedInvoiceHash sql.NullString
+	if err := tx.QueryRow(
+		`SELECT invoice_hash FROM bill WHERE id = ? AND merchant_id = ?`,
+		meta.sourceBillID, meta.merchantID,
+	).Scan(&storedInvoiceHash); err != nil && err != sql.ErrNoRows {
+		return submissionAttempt{}, fmt.Errorf("read stable invoice hash for bill %d: %w", meta.sourceBillID, err)
+	}
+	if stableKey := strings.TrimSpace(meta.stableDocumentKey); stableKey != "" {
+		var metadata []byte
+		err := tx.QueryRow(`
+			SELECT metadata
+			  FROM zatca_submission_artifact
+			 WHERE submission_id = ?
+			   AND artifact_kind = 'request_xml'
+			 ORDER BY id DESC
+			 LIMIT 1`,
+			submissionID,
+		).Scan(&metadata)
+		if err != nil && err != sql.ErrNoRows {
+			return submissionAttempt{}, fmt.Errorf("read stable event identity for submission %d: %w", submissionID, err)
+		}
+		if storedKey := artifactStableKey(metadata); storedKey != "" && storedKey != stableKey {
+			return submissionAttempt{}, fmt.Errorf(
+				"ZATCA submission %d stable document key mismatch: stored=%q current=%q",
+				submissionID, storedKey, stableKey,
+			)
+		}
+	}
+
+	currentState := OutcomeState(strings.TrimSpace(stateText))
+	if currentState == "" {
+		currentState = OutcomePending
+	}
+	if !currentState.valid() {
+		return submissionAttempt{}, fmt.Errorf("ZATCA submission %d has invalid outcome_state %q", submissionID, stateText)
+	}
+
+	var (
+		latestAttemptID    int64
+		latestAttemptNum   int
+		latestAttemptState string
+		latestStartedRaw   any
+		latestCompletedRaw any
+		latestProviderCode sql.NullString
+		latestProviderRef  sql.NullString
+		latestRequestPath  sql.NullString
+		latestClearedPath  sql.NullString
+	)
+	latestErr := tx.QueryRow(`
+		SELECT id, attempt_number, attempt_state, started_at, completed_at,
+		       provider_code, provider_reference, request_xml_path, cleared_xml_path
+		  FROM zatca_submission_attempt
+		 WHERE submission_id = ?
+		 ORDER BY attempt_number DESC
+		 LIMIT 1
+		 FOR UPDATE`,
+		submissionID,
+	).Scan(
+		&latestAttemptID,
+		&latestAttemptNum,
+		&latestAttemptState,
+		&latestStartedRaw,
+		&latestCompletedRaw,
+		&latestProviderCode,
+		&latestProviderRef,
+		&latestRequestPath,
+		&latestClearedPath,
+	)
+	if latestErr != nil && latestErr != sql.ErrNoRows {
+		return submissionAttempt{}, fmt.Errorf("inspect latest ZATCA attempt for submission %d: %w", submissionID, latestErr)
+	}
+	latestStartedAt, _, err := databaseTime(latestStartedRaw)
+	if err != nil {
+		return submissionAttempt{}, fmt.Errorf("parse latest ZATCA attempt start for submission %d: %w", submissionID, err)
+	}
+	_, latestCompleted, err := databaseTime(latestCompletedRaw)
+	if err != nil {
+		return submissionAttempt{}, fmt.Errorf("parse latest ZATCA attempt completion for submission %d: %w", submissionID, err)
+	}
+
+	baseAttempt := submissionAttempt{
+		submissionID:   submissionID,
+		attemptID:      latestAttemptID,
+		attemptNumber:  latestAttemptNum,
+		merchantID:     meta.merchantID,
+		startedAt:      latestStartedAt,
+		documentID:     storedDocumentID,
+		invoiceHash:    storedInvoiceHash.String,
+		providerCode:   providerCode.String,
+		providerRef:    providerRef.String,
+		requestXMLPath: latestRequestPath.String,
+		clearedXMLPath: latestClearedPath.String,
+	}
+	if baseAttempt.providerCode == "" {
+		baseAttempt.providerCode = latestProviderCode.String
+	}
+	if baseAttempt.providerRef == "" {
+		baseAttempt.providerRef = latestProviderRef.String
+	}
+
+	commit := func() error {
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		committed = true
+		return nil
+	}
+
+	if currentState.success() {
+		baseAttempt.resolved = true
+		if err := commit(); err != nil {
+			return submissionAttempt{}, fmt.Errorf("commit resolved duplicate for submission %d: %w", submissionID, err)
+		}
+		return baseAttempt, nil
+	}
+	if !forceNewAttempt {
+		if currentState == OutcomeAmbiguous {
+			if latestErr == sql.ErrNoRows || latestAttemptID == 0 {
+				return submissionAttempt{}, fmt.Errorf("ZATCA submission %d is ambiguous without an attempt to reconcile", submissionID)
+			}
+			baseAttempt.needsReconciliation = true
+			if err := commit(); err != nil {
+				return submissionAttempt{}, fmt.Errorf("commit ambiguous lookup for submission %d: %w", submissionID, err)
+			}
+			return baseAttempt, nil
+		}
+		if currentState == OutcomePending &&
+			latestErr == nil &&
+			latestAttemptState == string(OutcomePending) &&
+			!latestCompleted &&
+			!latestStartedAt.IsZero() &&
+			!startedAt.Before(latestStartedAt) &&
+			startedAt.Sub(latestStartedAt) < pendingAttemptLease {
+			baseAttempt.inFlight = true
+			if err := commit(); err != nil {
+				return submissionAttempt{}, fmt.Errorf("commit in-flight duplicate for submission %d: %w", submissionID, err)
+			}
+			return baseAttempt, nil
+		}
 	}
 
 	var attemptNumber int
@@ -207,6 +403,7 @@ func (s *sqlSubmissionStore) StartSubmission(meta submissionMeta, documentID str
 		attemptNumber: attemptNumber,
 		merchantID:    meta.merchantID,
 		startedAt:     startedAt,
+		documentID:    storedDocumentID,
 	}, nil
 }
 
@@ -267,8 +464,8 @@ func (s *sqlSubmissionStore) CompleteSubmission(
 			provider_reference = ?,
 			rejection_code = ?,
 			rejection_msg = ?,
-			submitted_at = ?,
-			cleared_at = ?,
+			submitted_at = COALESCE(?, submitted_at),
+			cleared_at = COALESCE(?, cleared_at),
 			retry_count = ?,
 			last_attempt_at = ?,
 			next_retry_at = ?,
@@ -453,6 +650,52 @@ func nullableJSON(data []byte) any {
 	return data
 }
 
+func artifactStableKey(data []byte) string {
+	if len(data) == 0 {
+		return ""
+	}
+	var values map[string]any
+	if err := json.Unmarshal(data, &values); err != nil {
+		return ""
+	}
+	key, _ := values["stable_document_key"].(string)
+	return strings.TrimSpace(key)
+}
+
+func databaseTime(value any) (time.Time, bool, error) {
+	switch v := value.(type) {
+	case nil:
+		return time.Time{}, false, nil
+	case time.Time:
+		return v, true, nil
+	case []byte:
+		return parseDatabaseTime(string(v))
+	case string:
+		return parseDatabaseTime(v)
+	default:
+		return time.Time{}, false, fmt.Errorf("unsupported database time type %T", value)
+	}
+}
+
+func parseDatabaseTime(value string) (time.Time, bool, error) {
+	value = strings.TrimSpace(value)
+	if value == "" || value == "0000-00-00 00:00:00" {
+		return time.Time{}, false, nil
+	}
+	if parsed, err := time.Parse(time.RFC3339Nano, value); err == nil {
+		return parsed, true, nil
+	}
+	for _, layout := range []string{
+		"2006-01-02 15:04:05.999999",
+		"2006-01-02 15:04:05",
+	} {
+		if parsed, err := time.ParseInLocation(layout, value, time.Local); err == nil {
+			return parsed, true, nil
+		}
+	}
+	return time.Time{}, false, fmt.Errorf("unsupported database time %q", value)
+}
+
 func saveXMLArtifact(meta xmlMeta, rowID int64, suffix, content string) (string, artifactRecord, error) {
 	if meta.xmlDir == "" {
 		return "", artifactRecord{}, nil
@@ -482,6 +725,36 @@ func saveXMLArtifact(meta xmlMeta, rowID int64, suffix, content string) (string,
 		ContentType: "application/xml",
 		SHA256:      sha256Hex([]byte(content)),
 	}, nil
+}
+
+func eventArtifactMetadata(meta xmlMeta) []byte {
+	values := map[string]any{}
+	if strings.TrimSpace(meta.stableDocumentKey) != "" {
+		values["stable_document_key"] = meta.stableDocumentKey
+	}
+	if strings.TrimSpace(meta.eventID) != "" {
+		values["event_id"] = meta.eventID
+	}
+	if meta.outboxID > 0 {
+		values["outbox_id"] = meta.outboxID
+	}
+	if meta.attempt > 0 {
+		values["attempt"] = meta.attempt
+	}
+	if meta.attemptCount > 0 {
+		values["attempt_count"] = meta.attemptCount
+	}
+	if strings.TrimSpace(meta.attemptID) != "" {
+		values["attempt_id"] = meta.attemptID
+	}
+	if len(values) == 0 {
+		return nil
+	}
+	data, err := json.Marshal(values)
+	if err != nil {
+		return nil
+	}
+	return data
 }
 
 func tenantPath(tenantID string) string {

@@ -479,6 +479,26 @@ must have `SELECT, INSERT, UPDATE` on `zatca_submission`,
 `UPDATE(invoice_hash, qr_code, invoice_uuid, invoice_xml_path, state)` on
 `bill`.
 
+### Idempotent live/replay consumption
+
+The daemon accepts both the T014 versioned event envelope and the legacy
+top-level `doc_type`, `id`, `branch_id`, and `db_name` fields. The envelope's
+`stable_document_key` is also the JetStream message identity, so startup
+replay and a live publication share duplicate suppression. Durable submission
+state remains the source of truth after redelivery or a JetStream duplicate
+window expires: accepted outcomes are acknowledged without another provider
+request, and a recent pending attempt is treated as in flight.
+
+The T004 deterministic provider invoice UUID remains stable for both legacy and
+versioned deliveries; the T014 stable key is the delivery identity used to
+gate duplicates and correlate attempts. If a previous provider call ended
+ambiguously, the daemon must reconcile that UUID and invoice hash before submitting again. A successful reconciliation records
+the accepted outcome without a second request. The current provider client has
+no lookup endpoint, so the production adapter records an explicit
+`RECONCILIATION_UNSUPPORTED` ambiguous outcome rather than blindly submitting
+again. T014 outbox/attempt context is retained in request-artifact JSON
+metadata because the T003 schema has no dedicated stable-key columns.
+
 ### B2B vs B2C Detection
 
 | Condition | Type | SubType | API |

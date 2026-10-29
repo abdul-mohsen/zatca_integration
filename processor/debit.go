@@ -30,16 +30,22 @@ func ProcessDebitNote(db *sql.DB, svc *zatca.Service, cfg *config.Config, row Cr
 
 	inv := BuildDebitNoteInvoice(cfg, row, products, issueTime)
 	return signSubmitUpdate(db, svc, inv, row.ID, "bill", xmlMeta{
-		xmlDir:       cfg.XMLDir,
-		tenantID:     cfg.TenantID,
-		merchantID:   cfg.MerchantID,
-		sourceBillID: row.ID,
-		companyID:    row.CompanyID,
-		branchID:     row.BranchID,
-		billType:     "debit",
-		documentKind: "debit_note",
-		table:        "debit_note",
-		qrColumn:     "qr_code",
+		xmlDir:            cfg.XMLDir,
+		tenantID:          cfg.TenantID,
+		merchantID:        cfg.MerchantID,
+		sourceBillID:      row.ID,
+		companyID:         row.CompanyID,
+		branchID:          row.BranchID,
+		billType:          "debit",
+		documentKind:      "debit_note",
+		table:             "debit_note",
+		qrColumn:          "qr_code",
+		stableDocumentKey: cfg.StableDocumentKey,
+		eventID:           cfg.EventID,
+		outboxID:          cfg.OutboxID,
+		attempt:           cfg.Attempt,
+		attemptCount:      cfg.AttemptCount,
+		attemptID:         cfg.AttemptID,
 	})
 }
 

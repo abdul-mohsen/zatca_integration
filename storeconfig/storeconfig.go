@@ -111,6 +111,13 @@ func (bz *BranchZATCA) ToConfig(base *config.Config) *config.Config {
 		XMLDir:             base.XMLDir,
 		TenantID:           base.TenantID,
 		MerchantID:         base.MerchantID,
+		BranchID:           bz.BranchID,
+		StableDocumentKey:  base.StableDocumentKey,
+		EventID:            base.EventID,
+		OutboxID:           base.OutboxID,
+		Attempt:            base.Attempt,
+		AttemptCount:       base.AttemptCount,
+		AttemptID:          base.AttemptID,
 		ProductionUsername: bz.ProductionUsername,
 		ProductionPassword: bz.ProductionPassword,
 		CSR: config.CSRConfig{

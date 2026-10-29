@@ -31,16 +31,22 @@ func ProcessCreditNote(db *sql.DB, svc *zatca.Service, cfg *config.Config, row C
 	creditNoteID := row.NoteID.Int64
 	inv := BuildCreditNoteInvoice(cfg, row, products, issueTime)
 	return signSubmitUpdate(db, svc, inv, creditNoteID, "credit_note", xmlMeta{
-		xmlDir:       cfg.XMLDir,
-		tenantID:     cfg.TenantID,
-		merchantID:   cfg.MerchantID,
-		sourceBillID: row.ID,
-		companyID:    row.CompanyID,
-		branchID:     row.BranchID,
-		billType:     "credit",
-		documentKind: "credit_note",
-		table:        "credit_note",
-		qrColumn:     "invoice_qr",
+		xmlDir:            cfg.XMLDir,
+		tenantID:          cfg.TenantID,
+		merchantID:        cfg.MerchantID,
+		sourceBillID:      row.ID,
+		companyID:         row.CompanyID,
+		branchID:          row.BranchID,
+		billType:          "credit",
+		documentKind:      "credit_note",
+		table:             "credit_note",
+		qrColumn:          "invoice_qr",
+		stableDocumentKey: cfg.StableDocumentKey,
+		eventID:           cfg.EventID,
+		outboxID:          cfg.OutboxID,
+		attempt:           cfg.Attempt,
+		attemptCount:      cfg.AttemptCount,
+		attemptID:         cfg.AttemptID,
 	})
 }
 

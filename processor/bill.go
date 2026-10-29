@@ -28,16 +28,22 @@ func ProcessBill(db *sql.DB, svc *zatca.Service, cfg *config.Config, b BillRow) 
 
 	inv := BuildBillInvoice(cfg, b, products, issueTime)
 	return signSubmitUpdate(db, svc, inv, b.ID, "bill", xmlMeta{
-		xmlDir:       cfg.XMLDir,
-		tenantID:     cfg.TenantID,
-		merchantID:   cfg.MerchantID,
-		sourceBillID: b.ID,
-		companyID:    b.CompanyID,
-		branchID:     b.BranchID,
-		billType:     "invoice",
-		documentKind: "bill",
-		table:        "bill",
-		qrColumn:     "qr_code",
+		xmlDir:            cfg.XMLDir,
+		tenantID:          cfg.TenantID,
+		merchantID:        cfg.MerchantID,
+		sourceBillID:      b.ID,
+		companyID:         b.CompanyID,
+		branchID:          b.BranchID,
+		billType:          "invoice",
+		documentKind:      "bill",
+		table:             "bill",
+		qrColumn:          "qr_code",
+		stableDocumentKey: cfg.StableDocumentKey,
+		eventID:           cfg.EventID,
+		outboxID:          cfg.OutboxID,
+		attempt:           cfg.Attempt,
+		attemptCount:      cfg.AttemptCount,
+		attemptID:         cfg.AttemptID,
 	})
 }
 
@@ -97,16 +103,22 @@ func BuildBillInvoice(cfg *config.Config, b BillRow, products []ProductRow, issu
 // xmlMeta holds the tenant/document context for durable submission and
 // filesystem artifact paths.
 type xmlMeta struct {
-	xmlDir       string // base directory (e.g. /data/zatca-xml)
-	tenantID     string // tenant identifier (db_name) - prevents cross-tenant collisions
-	merchantID   int64  // numeric master tenant id used by T003 persistence
-	sourceBillID int64  // source bill id for zatca_submission.bill_id
-	companyID    int64
-	branchID     int64
-	billType     string // "invoice", "credit", "debit"
-	documentKind string // "bill", "credit_note", "debit_note"
-	table        string // closed internal legacy table name
-	qrColumn     string // DB column name for QR code ("qr_code" for bill, "invoice_qr" for credit_note)
+	xmlDir            string // base directory (e.g. /data/zatca-xml)
+	tenantID          string // tenant identifier (db_name) - prevents cross-tenant collisions
+	merchantID        int64  // numeric master tenant id used by T003 persistence
+	sourceBillID      int64  // source bill id for zatca_submission.bill_id
+	companyID         int64
+	branchID          int64
+	billType          string // "invoice", "credit", "debit"
+	documentKind      string // "bill", "credit_note", "debit_note"
+	table             string // closed internal legacy table name
+	qrColumn          string // DB column name for QR code ("qr_code" for bill, "invoice_qr" for credit_note)
+	stableDocumentKey string // T014 stable logical document identity
+	eventID           string // T014 event identity
+	outboxID          uint64 // T014 committed outbox row identity
+	attempt           uint32 // T014 publication attempt
+	attemptCount      uint32 // T014 prior publication attempts
+	attemptID         string // T014 publication-attempt identity
 }
 
 // buildCustomer builds the Customer party from BillRow.

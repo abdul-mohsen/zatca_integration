@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -292,6 +293,15 @@ func processMessage(
 	getService getServiceFunc,
 	msg queue.Message,
 ) error {
+	normalized, err := msg.Normalize()
+	if err != nil {
+		return fmt.Errorf("normalize ZATCA message: %w", err)
+	}
+	if err := normalized.Validate(); err != nil {
+		return fmt.Errorf("validate ZATCA message: %w", err)
+	}
+	msg = normalized
+
 	tc, ok := tenantMap[msg.DBName]
 	if !ok {
 		return fmt.Errorf("unknown tenant db: %s (known tenants: %v)", msg.DBName, tenantKeys(tenantMap))
@@ -313,6 +323,7 @@ func processMessage(
 	if err != nil {
 		return fmt.Errorf("get service for branch %d: %w", msg.BranchID, err)
 	}
+	messageCfg := configForMessage(branchCfg, msg)
 
 	switch msg.DocType {
 	case queue.DocBill:
@@ -320,7 +331,10 @@ func processMessage(
 		if err != nil {
 			return err
 		}
-		_, err = processor.ProcessBill(tc.db, svc, branchCfg, *bill)
+		_, err = processor.ProcessBill(tc.db, svc, messageCfg, *bill)
+		if errors.Is(err, processor.ErrDuplicateDelivery) {
+			return nil
+		}
 		return err
 
 	case queue.DocCredit:
@@ -328,7 +342,10 @@ func processMessage(
 		if err != nil {
 			return err
 		}
-		_, err = processor.ProcessCreditNote(tc.db, svc, branchCfg, *row)
+		_, err = processor.ProcessCreditNote(tc.db, svc, messageCfg, *row)
+		if errors.Is(err, processor.ErrDuplicateDelivery) {
+			return nil
+		}
 		return err
 
 	case queue.DocDebit:
@@ -336,12 +353,30 @@ func processMessage(
 		if err != nil {
 			return err
 		}
-		_, err = processor.ProcessDebitNote(tc.db, svc, branchCfg, *row)
+		_, err = processor.ProcessDebitNote(tc.db, svc, messageCfg, *row)
+		if errors.Is(err, processor.ErrDuplicateDelivery) {
+			return nil
+		}
 		return err
 
 	default:
 		return fmt.Errorf("unknown doc type: %s", msg.DocType)
 	}
+}
+
+func configForMessage(base *config.Config, msg queue.Message) *config.Config {
+	if base == nil {
+		return nil
+	}
+	cfg := *base
+	cfg.BranchID = msg.BranchID
+	cfg.StableDocumentKey = msg.StableKey()
+	cfg.EventID = msg.EventID
+	cfg.OutboxID = msg.OutboxID
+	cfg.Attempt = msg.Attempt
+	cfg.AttemptCount = msg.AttemptCount
+	cfg.AttemptID = msg.AttemptID
+	return &cfg
 }
 
 // spawnBranchWorkers starts bill/credit/debit workers for a branch if not already running.

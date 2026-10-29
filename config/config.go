@@ -63,6 +63,13 @@ type Config struct {
 	XMLDir             string
 	TenantID           string // tenant identifier (e.g. db_name) used to scope XML storage
 	MerchantID         int64  // numeric tenant id used by durable T003 submission persistence
+	BranchID           int64  // branch identity for stable event/provider document keys
+	StableDocumentKey  string // T014 logical document identity, when processing an envelope
+	EventID            string // T014 durable event identity, when processing an envelope
+	OutboxID           uint64 // T014 committed outbox row identity, when available
+	Attempt            uint32 // T014 1-based publication attempt, when available
+	AttemptCount       uint32 // T014 prior publication attempt count, when available
+	AttemptID          string // T014 deterministic publication-attempt identity
 	CSR                CSRConfig
 	Seller             SellerInfo
 }
