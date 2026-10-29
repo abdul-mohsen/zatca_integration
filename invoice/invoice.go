@@ -1,7 +1,6 @@
 package invoice
 
 import (
-	"fmt"
 	"time"
 )
 
@@ -26,10 +25,10 @@ const (
 type TaxCategory string
 
 const (
-	TaxStandard TaxCategory = "S"  // Standard rated (15% or 5%)
-	TaxZero     TaxCategory = "Z"  // Zero rated
-	TaxExempt   TaxCategory = "E"  // Exempt
-	TaxOutScope TaxCategory = "O"  // Out of scope
+	TaxStandard TaxCategory = "S" // Standard rated (15% or 5%)
+	TaxZero     TaxCategory = "Z" // Zero rated
+	TaxExempt   TaxCategory = "E" // Exempt
+	TaxOutScope TaxCategory = "O" // Out of scope
 )
 
 // PaymentMeans codes.
@@ -44,15 +43,15 @@ const (
 type Party struct {
 	RegistrationName   string
 	RegistrationNameAR string
-	VAT                string  // 15-digit VAT number
-	SchemeID           string  // CRN, MOM, MLS, SAG, OTH, etc.
-	ID                 string  // registration number value
+	VAT                string // 15-digit VAT number
+	SchemeID           string // CRN, MOM, MLS, SAG, OTH, etc.
+	ID                 string // registration number value
 	Street             string
 	Building           string
 	District           string
 	City               string
 	PostalCode         string
-	Country            string  // ISO 3166-1 alpha-2 (SA)
+	Country            string // ISO 3166-1 alpha-2 (SA)
 }
 
 // LineItem represents a single invoice line.
@@ -60,7 +59,7 @@ type LineItem struct {
 	ID          string
 	Name        string
 	Quantity    float64
-	UnitCode    string  // PCE, EA, etc.
+	UnitCode    string // PCE, EA, etc.
 	UnitPrice   float64
 	Discount    float64 // line-level discount
 	TaxCategory TaxCategory
@@ -69,24 +68,24 @@ type LineItem struct {
 
 // NetAmount returns quantity * unitPrice - discount.
 func (l *LineItem) NetAmount() float64 {
-	return roundTo2(l.Quantity*l.UnitPrice - l.Discount)
+	return l.netAmount().float64()
 }
 
 // TaxAmount returns the tax on the net amount.
 func (l *LineItem) TaxAmount() float64 {
-	return roundTo2(l.NetAmount() * l.TaxPercent / 100)
+	return l.taxAmount().float64()
 }
 
 // TotalWithTax returns net + tax.
 func (l *LineItem) TotalWithTax() float64 {
-	return roundTo2(l.NetAmount() + l.TaxAmount())
+	return l.netAmount().add(l.taxAmount()).round(2).float64()
 }
 
 // Invoice holds all data needed to generate a UBL 2.1 XML invoice.
 type Invoice struct {
 	// Metadata
-	ID        string    // Invoice number (e.g., SME00023)
-	UUID      string    // Unique identifier (UUID v4)
+	ID        string // Invoice number (e.g., SME00023)
+	UUID      string // Unique identifier (UUID v4)
 	IssueDate time.Time
 	IssueTime time.Time // only time part used
 
@@ -117,8 +116,8 @@ type Invoice struct {
 	BillingReferenceID string
 
 	// Document level discount
-	Discount     float64
-	DiscountTax  TaxCategory
+	Discount           float64
+	DiscountTax        TaxCategory
 	DiscountTaxPercent float64
 
 	// Line items
@@ -134,29 +133,17 @@ type Invoice struct {
 
 // TaxableAmount returns the sum of all line net amounts.
 func (inv *Invoice) TaxableAmount() float64 {
-	total := -inv.Discount
-	for _, l := range inv.Lines {
-		total += l.NetAmount()
-	}
-	return roundTo2(total)
+	return inv.taxableAmount().float64()
 }
 
 // TotalTax returns the total VAT amount.
 func (inv *Invoice) TotalTax() float64 {
-	total := 0.0
-	for _, l := range inv.Lines {
-		total += l.TaxAmount()
-	}
-	// Subtract discount tax if applicable
-	if inv.Discount > 0 && inv.DiscountTaxPercent > 0 {
-		total -= roundTo2(inv.Discount * inv.DiscountTaxPercent / 100)
-	}
-	return roundTo2(total)
+	return inv.totalTax().float64()
 }
 
 // TotalWithTax returns taxable + tax.
 func (inv *Invoice) TotalWithTax() float64 {
-	return roundTo2(inv.TaxableAmount() + inv.TotalTax())
+	return inv.taxableAmount().add(inv.totalTax()).round(2).float64()
 }
 
 // IsSimplified returns true if this is a B2C invoice.
@@ -195,9 +182,66 @@ func (inv *Invoice) deliveryDateStr() string {
 }
 
 func roundTo2(v float64) float64 {
-	return float64(int(v*100+0.5)) / 100
+	return amountFromFloat(v).round(2).float64()
 }
 
 func fmtAmount(v float64) string {
-	return fmt.Sprintf("%.2f", v)
+	return amountFromFloat(v).format2()
+}
+
+func (l *LineItem) netAmount() amount {
+	return amountFromFloat(l.Quantity).
+		mul(amountFromFloat(l.UnitPrice)).
+		sub(amountFromFloat(l.Discount)).
+		round(2)
+}
+
+func (l *LineItem) taxAmount() amount {
+	return l.netAmount().
+		mul(amountFromFloat(l.TaxPercent)).
+		div(amountFromFloat(100)).
+		round(2)
+}
+
+func (inv *Invoice) taxableAmount() amount {
+	total := amount{}
+	for i := range inv.Lines {
+		total = total.add(inv.Lines[i].netAmount())
+	}
+	return total.sub(amountFromFloat(inv.Discount)).round(2)
+}
+
+func (inv *Invoice) discountTaxCategory() TaxCategory {
+	if inv.DiscountTax != "" {
+		return inv.DiscountTax
+	}
+	return TaxStandard
+}
+
+func (inv *Invoice) discountTaxPercent() float64 {
+	if inv.DiscountTaxPercent != 0 {
+		return inv.DiscountTaxPercent
+	}
+	if inv.discountTaxCategory() == TaxStandard {
+		return 15
+	}
+	return 0
+}
+
+func (inv *Invoice) discountTaxAmount() amount {
+	return amountFromFloat(inv.Discount).
+		mul(amountFromFloat(inv.discountTaxPercent())).
+		div(amountFromFloat(100)).
+		round(2)
+}
+
+func (inv *Invoice) totalTax() amount {
+	total := amount{}
+	for i := range inv.Lines {
+		total = total.add(inv.Lines[i].taxAmount())
+	}
+	if inv.Discount > 0 && inv.discountTaxPercent() > 0 {
+		total = total.sub(inv.discountTaxAmount())
+	}
+	return total.round(2)
 }

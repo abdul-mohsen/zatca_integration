@@ -50,7 +50,6 @@ func QueryBillByID(db *sql.DB, billID int64) (*BillRow, error) {
 		b           BillRow
 		url         sql.NullString
 		state       sql.NullInt64
-		discount    sql.NullFloat64
 		totalBefore sql.NullFloat64
 		totalVAT    sql.NullFloat64
 		total       sql.NullFloat64
@@ -60,7 +59,7 @@ func QueryBillByID(db *sql.DB, billID int64) (*BillRow, error) {
 		vatReg      sql.NullString
 	)
 	err := db.QueryRow(q, billID).Scan(
-		&b.ID, &url, &b.EffectiveDate, &b.PaymentDue, &state, &discount, &b.BranchID, &b.CompanyID,
+		&b.ID, &url, &b.EffectiveDate, &b.PaymentDue, &state, &b.Discount, &b.BranchID, &b.CompanyID,
 		&totalBefore, &totalVAT, &total, &b.SeqNumber, &merchantID, &note, &b.PaymentMethod,
 		&b.UserName, &userPhone,
 		&b.CompanyName, &vatReg, &b.AddressName,
@@ -124,7 +123,6 @@ func QueryCreditNoteByID(db *sql.DB, creditNoteID int64) (*CreditDebitRow, error
 		row         CreditDebitRow
 		url         sql.NullString
 		state       sql.NullInt64
-		discount    sql.NullFloat64
 		totalBefore sql.NullFloat64
 		totalVAT    sql.NullFloat64
 		total       sql.NullFloat64
@@ -134,7 +132,7 @@ func QueryCreditNoteByID(db *sql.DB, creditNoteID int64) (*CreditDebitRow, error
 		vatReg      sql.NullString
 	)
 	err := db.QueryRow(q, creditNoteID).Scan(
-		&row.ID, &url, &row.EffectiveDate, &row.PaymentDue, &state, &discount, &row.BranchID, &row.CompanyID,
+		&row.ID, &url, &row.EffectiveDate, &row.PaymentDue, &state, &row.Discount, &row.BranchID, &row.CompanyID,
 		&totalBefore, &totalVAT, &total, &row.SeqNumber, &merchantID, &note, &row.PaymentMethod,
 		&row.NoteText, &row.NoteID,
 		&row.UserName, &userPhone,

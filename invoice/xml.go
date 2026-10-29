@@ -284,16 +284,10 @@ func (inv *Invoice) writeAllowanceCharge(b *strings.Builder) {
 	writeElementIndent(b, "        ", "cbc:ChargeIndicator", "false")
 	writeElementIndent(b, "        ", "cbc:AllowanceChargeReason", "discount")
 	b.WriteString(fmt.Sprintf(`        <cbc:Amount currencyID="%s">%s</cbc:Amount>`+"\n",
-		orDefault(inv.DocumentCurrency, "SAR"), fmtAmount(inv.Discount)))
+		orDefault(inv.DocumentCurrency, "SAR"), amountFromFloat(inv.Discount).format2()))
 
-	taxCat := inv.DiscountTax
-	if taxCat == "" {
-		taxCat = TaxStandard
-	}
-	taxPct := inv.DiscountTaxPercent
-	if taxPct == 0 && taxCat == TaxStandard {
-		taxPct = 15.00
-	}
+	taxCat := inv.discountTaxCategory()
+	taxPct := inv.discountTaxPercent()
 
 	b.WriteString("        <cac:TaxCategory>\n")
 	b.WriteString(fmt.Sprintf(`            <cbc:ID schemeID="UN/ECE 5305" schemeAgencyID="6">%s</cbc:ID>`+"\n", taxCat))
@@ -307,27 +301,27 @@ func (inv *Invoice) writeAllowanceCharge(b *strings.Builder) {
 
 func (inv *Invoice) writeTaxTotals(b *strings.Builder) {
 	cur := orDefault(inv.DocumentCurrency, "SAR")
-	totalTax := inv.TotalTax()
+	totalTax := inv.totalTax()
 
 	// First TaxTotal (summary)
 	b.WriteString("    <cac:TaxTotal>\n")
 	b.WriteString(fmt.Sprintf(`        <cbc:TaxAmount currencyID="%s">%s</cbc:TaxAmount>`+"\n",
-		cur, fmtAmount(totalTax)))
+		cur, totalTax.format2()))
 	b.WriteString("    </cac:TaxTotal>\n")
 
 	// Second TaxTotal (with subtotals by category)
 	b.WriteString("    <cac:TaxTotal>\n")
 	b.WriteString(fmt.Sprintf(`        <cbc:TaxAmount currencyID="%s">%s</cbc:TaxAmount>`+"\n",
-		cur, fmtAmount(totalTax)))
+		cur, totalTax.format2()))
 
 	// Group by tax category
 	groups := inv.taxGroups()
 	for _, g := range groups {
 		b.WriteString("        <cac:TaxSubtotal>\n")
 		b.WriteString(fmt.Sprintf(`            <cbc:TaxableAmount currencyID="%s">%s</cbc:TaxableAmount>`+"\n",
-			cur, fmtAmount(g.taxable)))
+			cur, g.taxable.format2()))
 		b.WriteString(fmt.Sprintf(`            <cbc:TaxAmount currencyID="%s">%s</cbc:TaxAmount>`+"\n",
-			cur, fmtAmount(g.tax)))
+			cur, g.tax.format2()))
 		b.WriteString("            <cac:TaxCategory>\n")
 		b.WriteString(fmt.Sprintf(`                <cbc:ID schemeID="UN/ECE 5305" schemeAgencyID="6">%s</cbc:ID>`+"\n", g.category))
 		b.WriteString(fmt.Sprintf(`                <cbc:Percent>%s</cbc:Percent>`+"\n", fmtAmount(g.percent)))
@@ -343,8 +337,8 @@ func (inv *Invoice) writeTaxTotals(b *strings.Builder) {
 type taxGroup struct {
 	category TaxCategory
 	percent  float64
-	taxable  float64
-	tax      float64
+	taxable  amount
+	tax      amount
 }
 
 func (inv *Invoice) taxGroups() []taxGroup {
@@ -354,40 +348,56 @@ func (inv *Invoice) taxGroups() []taxGroup {
 	for _, l := range inv.Lines {
 		key := fmt.Sprintf("%s-%.2f", l.TaxCategory, l.TaxPercent)
 		if _, ok := m[key]; !ok {
-			m[key] = &taxGroup{category: l.TaxCategory, percent: l.TaxPercent}
+			m[key] = &taxGroup{
+				category: l.TaxCategory,
+				percent:  l.TaxPercent,
+			}
 			keys = append(keys, key)
 		}
-		m[key].taxable += l.NetAmount()
-		m[key].tax += l.TaxAmount()
+		m[key].taxable = m[key].taxable.add(l.netAmount())
+		m[key].tax = m[key].tax.add(l.taxAmount())
 	}
 
 	var result []taxGroup
 	for _, k := range keys {
 		g := m[k]
-		g.taxable = roundTo2(g.taxable)
-		g.tax = roundTo2(g.tax)
+		g.taxable = g.taxable.round(2)
+		g.tax = g.tax.round(2)
 		result = append(result, *g)
+	}
+
+	if inv.Discount > 0 {
+		discountCategory := inv.discountTaxCategory()
+		discountRate := inv.discountTaxPercent()
+		for i := range result {
+			if result[i].category == discountCategory &&
+				(discountRate == 0 || result[i].percent == discountRate) {
+				result[i].taxable = result[i].taxable.sub(amountFromFloat(inv.Discount)).round(2)
+				result[i].tax = result[i].tax.sub(inv.discountTaxAmount()).round(2)
+				break
+			}
+		}
 	}
 	return result
 }
 
 func (inv *Invoice) writeLegalMonetaryTotal(b *strings.Builder) {
 	cur := orDefault(inv.DocumentCurrency, "SAR")
-	lineExt := 0.0
-	for _, l := range inv.Lines {
-		lineExt += l.NetAmount()
+	lineExt := amount{}
+	for i := range inv.Lines {
+		lineExt = lineExt.add(inv.Lines[i].netAmount())
 	}
-	lineExt = roundTo2(lineExt)
-	taxExcl := roundTo2(lineExt - inv.Discount)
-	taxIncl := roundTo2(taxExcl + inv.TotalTax())
+	lineExt = lineExt.round(2)
+	taxExcl := lineExt.sub(amountFromFloat(inv.Discount)).round(2)
+	taxIncl := taxExcl.add(inv.totalTax()).round(2)
 
 	b.WriteString("    <cac:LegalMonetaryTotal>\n")
-	b.WriteString(fmt.Sprintf(`        <cbc:LineExtensionAmount currencyID="%s">%s</cbc:LineExtensionAmount>`+"\n", cur, fmtAmount(lineExt)))
-	b.WriteString(fmt.Sprintf(`        <cbc:TaxExclusiveAmount currencyID="%s">%s</cbc:TaxExclusiveAmount>`+"\n", cur, fmtAmount(taxExcl)))
-	b.WriteString(fmt.Sprintf(`        <cbc:TaxInclusiveAmount currencyID="%s">%s</cbc:TaxInclusiveAmount>`+"\n", cur, fmtAmount(taxIncl)))
-	b.WriteString(fmt.Sprintf(`        <cbc:AllowanceTotalAmount currencyID="%s">%s</cbc:AllowanceTotalAmount>`+"\n", cur, fmtAmount(inv.Discount)))
+	b.WriteString(fmt.Sprintf(`        <cbc:LineExtensionAmount currencyID="%s">%s</cbc:LineExtensionAmount>`+"\n", cur, lineExt.format2()))
+	b.WriteString(fmt.Sprintf(`        <cbc:TaxExclusiveAmount currencyID="%s">%s</cbc:TaxExclusiveAmount>`+"\n", cur, taxExcl.format2()))
+	b.WriteString(fmt.Sprintf(`        <cbc:TaxInclusiveAmount currencyID="%s">%s</cbc:TaxInclusiveAmount>`+"\n", cur, taxIncl.format2()))
+	b.WriteString(fmt.Sprintf(`        <cbc:AllowanceTotalAmount currencyID="%s">%s</cbc:AllowanceTotalAmount>`+"\n", cur, amountFromFloat(inv.Discount).format2()))
 	b.WriteString(fmt.Sprintf(`        <cbc:PrepaidAmount currencyID="%s">0.00</cbc:PrepaidAmount>`+"\n", cur))
-	b.WriteString(fmt.Sprintf(`        <cbc:PayableAmount currencyID="%s">%s</cbc:PayableAmount>`+"\n", cur, fmtAmount(taxIncl)))
+	b.WriteString(fmt.Sprintf(`        <cbc:PayableAmount currencyID="%s">%s</cbc:PayableAmount>`+"\n", cur, taxIncl.format2()))
 	b.WriteString("    </cac:LegalMonetaryTotal>\n")
 }
 
@@ -403,14 +413,14 @@ func (inv *Invoice) writeLine(b *strings.Builder, line *LineItem, seq int) {
 	b.WriteString(fmt.Sprintf(`        <cbc:InvoicedQuantity unitCode="%s">%f</cbc:InvoicedQuantity>`+"\n",
 		orDefault(line.UnitCode, "PCE"), line.Quantity))
 	b.WriteString(fmt.Sprintf(`        <cbc:LineExtensionAmount currencyID="%s">%s</cbc:LineExtensionAmount>`+"\n",
-		cur, fmtAmount(line.NetAmount())))
+		cur, line.netAmount().format2()))
 
 	// Line tax total
 	b.WriteString("        <cac:TaxTotal>\n")
 	b.WriteString(fmt.Sprintf(`            <cbc:TaxAmount currencyID="%s">%s</cbc:TaxAmount>`+"\n",
-		cur, fmtAmount(line.TaxAmount())))
+		cur, line.taxAmount().format2()))
 	b.WriteString(fmt.Sprintf(`            <cbc:RoundingAmount currencyID="%s">%s</cbc:RoundingAmount>`+"\n",
-		cur, fmtAmount(line.TotalWithTax())))
+		cur, line.netAmount().add(line.taxAmount()).round(2).format2()))
 	b.WriteString("        </cac:TaxTotal>\n")
 
 	// Item
@@ -428,16 +438,17 @@ func (inv *Invoice) writeLine(b *strings.Builder, line *LineItem, seq int) {
 	// Price
 	b.WriteString("        <cac:Price>\n")
 	b.WriteString(fmt.Sprintf(`            <cbc:PriceAmount currencyID="%s">%s</cbc:PriceAmount>`+"\n",
-		cur, fmtAmount(line.UnitPrice)))
-	if line.Discount > 0 {
-		b.WriteString("            <cac:AllowanceCharge>\n")
-		writeElementIndent(b, "                ", "cbc:ChargeIndicator", "false")
-		writeElementIndent(b, "                ", "cbc:AllowanceChargeReason", "discount")
-		b.WriteString(fmt.Sprintf(`                <cbc:Amount currencyID="%s">%s</cbc:Amount>`+"\n",
-			cur, fmtAmount(line.Discount)))
-		b.WriteString("            </cac:AllowanceCharge>\n")
-	}
+		cur, amountFromFloat(line.UnitPrice).format2()))
 	b.WriteString("        </cac:Price>\n")
+
+	if line.Discount > 0 {
+		b.WriteString("        <cac:AllowanceCharge>\n")
+		writeElementIndent(b, "            ", "cbc:ChargeIndicator", "false")
+		writeElementIndent(b, "            ", "cbc:AllowanceChargeReason", "discount")
+		b.WriteString(fmt.Sprintf(`            <cbc:Amount currencyID="%s">%s</cbc:Amount>`+"\n",
+			cur, amountFromFloat(line.Discount).format2()))
+		b.WriteString("        </cac:AllowanceCharge>\n")
+	}
 
 	b.WriteString("    </cac:InvoiceLine>\n")
 }

@@ -68,6 +68,9 @@ func BuildDebitNoteInvoice(cfg *config.Config, row CreditDebitRow, products []Pr
 			Country:            cfg.Seller.Country,
 		},
 		Customer:            customer,
+		Discount:            nullFloat64OrZero(row.Discount),
+		DiscountTax:         invoice.TaxStandard,
+		DiscountTaxPercent:  discountTaxPercent(products),
 		PreviousInvoiceHash: DefaultPIH,
 		InvoiceCounterValue: 1,
 		PaymentMeans: func() string {

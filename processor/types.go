@@ -47,6 +47,7 @@ type BillRow struct {
 	ID                int64
 	BranchID          int64
 	CompanyID         int64
+	Discount          sql.NullFloat64
 	URL               sql.NullString
 	EffectiveDate     sql.NullString
 	PaymentDue        sql.NullString

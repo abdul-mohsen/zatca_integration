@@ -475,6 +475,13 @@ bill (state=1) ──► Query bill + products from DB
 | Credit Note | 381 | `credit_note` |
 | Debit Note | 383 | `debit_note` |
 
+### Discount Mapping
+
+The generated UBL carries `bill.discount` as a document-level allowance and
+each `bill_product.discount` as an invoice-line allowance. Line extension,
+tax, tax-exclusive, tax-inclusive, and payable amounts are rounded to two
+decimals using the same order as the backend's generated decimal totals.
+
 ---
 
 ## 7. Retry & Error Handling

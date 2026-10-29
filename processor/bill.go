@@ -70,6 +70,9 @@ func BuildBillInvoice(cfg *config.Config, b BillRow, products []ProductRow, issu
 			Country:            cfg.Seller.Country,
 		},
 		Customer:            customer,
+		Discount:            nullFloat64OrZero(b.Discount),
+		DiscountTax:         invoice.TaxStandard,
+		DiscountTaxPercent:  discountTaxPercent(products),
 		PreviousInvoiceHash: DefaultPIH,
 		InvoiceCounterValue: 1,
 		PaymentMeans: func() string {
@@ -280,11 +283,27 @@ func buildLines(products []ProductRow) []invoice.LineItem {
 			Quantity:    p.QuantityOrZero(),
 			UnitCode:    "PCE",
 			UnitPrice:   p.PriceOrZero(),
-			Discount:    0,
+			Discount:    nullFloat64OrZero(p.Discount),
 			TaxCategory: invoice.TaxStandard,
 			TaxPercent:  p.VATOrZero(),
 		}
 		lines = append(lines, li)
 	}
 	return lines
+}
+
+func nullFloat64OrZero(value sql.NullFloat64) float64 {
+	if value.Valid {
+		return value.Float64
+	}
+	return 0
+}
+
+func discountTaxPercent(products []ProductRow) float64 {
+	for _, product := range products {
+		if product.VAT.Valid {
+			return product.VAT.Float64
+		}
+	}
+	return 15
 }
