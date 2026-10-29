@@ -62,6 +62,7 @@ type Config struct {
 	ProductionPassword string
 	XMLDir             string
 	TenantID           string // tenant identifier (e.g. db_name) used to scope XML storage
+	MerchantID         int64  // numeric tenant id used by durable T003 submission persistence
 	CSR                CSRConfig
 	Seller             SellerInfo
 }

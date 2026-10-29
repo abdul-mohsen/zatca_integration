@@ -79,7 +79,7 @@ These tables must exist **inside each tenant's database**. The full schema is in
 | `branch_csr` | CSR configuration inputs used during onboarding (auto-filled) |
 | `branch_zatca` | Credentials returned by ZATCA after onboarding (auto-filled) |
 | `client` | Buyer info — if a bill has a `buyer_id` with a VAT number, it's treated as B2B |
-| `bill` | Invoices. `state=1` = new, `state=3` = submitted to ZATCA |
+| `bill` | Invoices. `state=1` = pending, `state=3` = accepted/submitted to ZATCA |
 | `bill_product` | Line items for each bill |
 | `credit_note` | Credit notes against existing bills |
 | `debit_note` | Debit notes against existing bills |
@@ -365,7 +365,12 @@ The daemon will:
 3. Build UBL 2.1 XML
 4. Sign via SDK (`fatoora`)
 5. Submit to ZATCA (ClearInvoice for B2B, ReportInvoice for B2C)
-6. Update the bill row: `state=3`, `invoice_hash`, `invoice_qr`, `invoice_uuid`, `invoice_xml_path`
+6. Persist the T003 submission, attempt, outcome, provider details, and XML
+   artifact references
+7. Update `invoice_hash`, `invoice_qr`, `invoice_uuid`, and
+   `invoice_xml_path`; set `state=3` only for `accepted` or
+   `accepted_with_warning`. Rejected, pending, ambiguous, terminal, and
+   provider-transport outcomes leave the bill state unissued.
 
 ### Step 6: Issue a credit note
 
@@ -447,9 +452,32 @@ bill (state=1) ──► Query bill + products from DB
                    ──► Build UBL 2.1 XML
                    ──► SDK: sign invoice (fatoora)
                    ──► ZATCA API: ClearInvoice (B2B) or ReportInvoice (B2C)
-                   ──► Update bill: state=3, hash, QR, UUID, XML path
-                   ──► Save signed XML to filesystem
+                   ──► Persist pending/final T003 outcome + attempt
+                   ──► Save request/cleared XML and artifact references
+                   ──► Update bill metadata; state=3 only on accepted outcome
 ```
+
+### Durable submission outcomes
+
+The daemon requires the backend T003 submission-state migration before it can
+process bills. Each bill uses the numeric master tenant ID plus a stable
+document UUID. Processing records `pending`, `accepted`,
+`accepted_with_warning`, `rejected`, `ambiguous`, or `terminal_failure` in
+`zatca_submission`, with linked attempts and artifact references. Provider
+codes, warning codes/messages, retry timestamps, request XML paths, and
+cleared XML paths remain nullable when the provider does not return them.
+
+Only `accepted` and `accepted_with_warning` set the legacy bill state to `3`.
+The daemon does not silently fall back to legacy-only updates if the T003
+tables/columns or required database privileges are missing; it returns an
+actionable persistence error instead. The current T003 contract keys durable
+submissions by `bill_id`, so credit/debit-note outcome persistence requires a
+future document-kind/source-key backend extension. The daemon database user
+must have `SELECT, INSERT, UPDATE` on `zatca_submission`,
+`zatca_submission_attempt`, `zatca_submission_outcome`, and
+`zatca_submission_artifact`, plus `SELECT(merchant_id)` and
+`UPDATE(invoice_hash, qr_code, invoice_uuid, invoice_xml_path, state)` on
+`bill`.
 
 ### B2B vs B2C Detection
 

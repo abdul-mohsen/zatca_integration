@@ -7,8 +7,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/zatca-go/zatca/config"
 	"github.com/zatca-go/zatca/invoice"
 	"github.com/zatca-go/zatca/zatca"
@@ -33,12 +31,16 @@ func ProcessCreditNote(db *sql.DB, svc *zatca.Service, cfg *config.Config, row C
 	creditNoteID := row.NoteID.Int64
 	inv := BuildCreditNoteInvoice(cfg, row, products, issueTime)
 	return signSubmitUpdate(db, svc, inv, creditNoteID, "credit_note", xmlMeta{
-		xmlDir:    cfg.XMLDir,
-		tenantID:  cfg.TenantID,
-		companyID: row.CompanyID,
-		branchID:  row.BranchID,
-		billType:  "credit",
-		qrColumn:  "invoice_qr",
+		xmlDir:       cfg.XMLDir,
+		tenantID:     cfg.TenantID,
+		merchantID:   cfg.MerchantID,
+		sourceBillID: row.ID,
+		companyID:    row.CompanyID,
+		branchID:     row.BranchID,
+		billType:     "credit",
+		documentKind: "credit_note",
+		table:        "credit_note",
+		qrColumn:     "invoice_qr",
 	})
 }
 
@@ -49,7 +51,7 @@ func BuildCreditNoteInvoice(cfg *config.Config, row CreditDebitRow, products []P
 
 	inv := &invoice.Invoice{
 		ID:               fmt.Sprintf("INV-CN-%d", row.ID),
-		UUID:             uuid.New().String(),
+		UUID:             stableInvoiceUUID(cfg, "credit_note", row.NoteID.Int64),
 		IssueDate:        issueTime,
 		IssueTime:        issueTime,
 		TypeCode:         invoice.TypeCreditNote,

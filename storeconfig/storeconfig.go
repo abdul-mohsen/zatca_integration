@@ -110,6 +110,7 @@ func (bz *BranchZATCA) ToConfig(base *config.Config) *config.Config {
 		OTP:                base.OTP,
 		XMLDir:             base.XMLDir,
 		TenantID:           base.TenantID,
+		MerchantID:         base.MerchantID,
 		ProductionUsername: bz.ProductionUsername,
 		ProductionPassword: bz.ProductionPassword,
 		CSR: config.CSRConfig{

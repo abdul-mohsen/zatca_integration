@@ -7,8 +7,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/zatca-go/zatca/config"
 	"github.com/zatca-go/zatca/invoice"
 	"github.com/zatca-go/zatca/zatca"
@@ -32,12 +30,16 @@ func ProcessDebitNote(db *sql.DB, svc *zatca.Service, cfg *config.Config, row Cr
 
 	inv := BuildDebitNoteInvoice(cfg, row, products, issueTime)
 	return signSubmitUpdate(db, svc, inv, row.ID, "bill", xmlMeta{
-		xmlDir:    cfg.XMLDir,
-		tenantID:  cfg.TenantID,
-		companyID: row.CompanyID,
-		branchID:  row.BranchID,
-		billType:  "debit",
-		qrColumn:  "qr_code",
+		xmlDir:       cfg.XMLDir,
+		tenantID:     cfg.TenantID,
+		merchantID:   cfg.MerchantID,
+		sourceBillID: row.ID,
+		companyID:    row.CompanyID,
+		branchID:     row.BranchID,
+		billType:     "debit",
+		documentKind: "debit_note",
+		table:        "debit_note",
+		qrColumn:     "qr_code",
 	})
 }
 
@@ -48,7 +50,7 @@ func BuildDebitNoteInvoice(cfg *config.Config, row CreditDebitRow, products []Pr
 
 	inv := &invoice.Invoice{
 		ID:               fmt.Sprintf("INV-DN-%d", row.ID),
-		UUID:             uuid.New().String(),
+		UUID:             stableInvoiceUUID(cfg, "debit_note", row.NoteID.Int64),
 		IssueDate:        issueTime,
 		IssueTime:        issueTime,
 		TypeCode:         invoice.TypeDebitNote,

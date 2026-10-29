@@ -2,19 +2,13 @@ package processor
 
 import (
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"log"
-	"os"
-	"path/filepath"
 	"strconv"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/zatca-go/zatca/config"
 	"github.com/zatca-go/zatca/invoice"
-	"github.com/zatca-go/zatca/models"
 	"github.com/zatca-go/zatca/zatca"
 )
 
@@ -34,12 +28,16 @@ func ProcessBill(db *sql.DB, svc *zatca.Service, cfg *config.Config, b BillRow) 
 
 	inv := BuildBillInvoice(cfg, b, products, issueTime)
 	return signSubmitUpdate(db, svc, inv, b.ID, "bill", xmlMeta{
-		xmlDir:    cfg.XMLDir,
-		tenantID:  cfg.TenantID,
-		companyID: b.CompanyID,
-		branchID:  b.BranchID,
-		billType:  "invoice",
-		qrColumn:  "qr_code",
+		xmlDir:       cfg.XMLDir,
+		tenantID:     cfg.TenantID,
+		merchantID:   cfg.MerchantID,
+		sourceBillID: b.ID,
+		companyID:    b.CompanyID,
+		branchID:     b.BranchID,
+		billType:     "invoice",
+		documentKind: "bill",
+		table:        "bill",
+		qrColumn:     "qr_code",
 	})
 }
 
@@ -50,7 +48,7 @@ func BuildBillInvoice(cfg *config.Config, b BillRow, products []ProductRow, issu
 
 	inv := &invoice.Invoice{
 		ID:               fmt.Sprintf("INV-%d", b.ID),
-		UUID:             uuid.New().String(),
+		UUID:             stableInvoiceUUID(cfg, "bill", b.ID),
 		IssueDate:        issueTime,
 		IssueTime:        issueTime,
 		TypeCode:         invoice.TypeInvoice,
@@ -96,122 +94,19 @@ func BuildBillInvoice(cfg *config.Config, b BillRow, products []ProductRow, issu
 	return inv
 }
 
-// xmlMeta holds the filesystem path components for saving signed XML.
+// xmlMeta holds the tenant/document context for durable submission and
+// filesystem artifact paths.
 type xmlMeta struct {
-	xmlDir    string // base directory (e.g. /data/zatca-xml)
-	tenantID  string // tenant identifier (db_name) - prevents cross-tenant collisions
-	companyID int64
-	branchID  int64
-	billType  string // "invoice", "credit", "debit"
-	qrColumn  string // DB column name for QR code ("qr_code" for bill, "invoice_qr" for credit_note)
-}
-
-// signSubmitUpdate is the shared sign → submit → QR → save XML → UPDATE pipeline used by all doc types.
-func signSubmitUpdate(db *sql.DB, svc *zatca.Service, inv *invoice.Invoice, rowID int64, table string, meta xmlMeta) (string, error) {
-	xmlStr, err := inv.ToXML()
-	if err != nil {
-		return "", fmt.Errorf("ToXML failed: %w", err)
-	}
-
-	signedXML, hash, err := svc.SDK.SignInvoice(xmlStr)
-	if err != nil {
-		return "", fmt.Errorf("SignInvoice failed: %w", err)
-	}
-
-	// Save signed XML to filesystem:
-	//   {xmlDir}/{tenant}/{company_id}/{branch_id}/{bill_type}/{rowID}.xml
-	// Tenant prefix prevents collisions when multiple tenants share the
-	// same xml-dir mount.
-	var xmlPath string
-	if meta.xmlDir != "" {
-		tenant := meta.tenantID
-		if tenant == "" {
-			tenant = "_default"
-		}
-		dir := filepath.Join(meta.xmlDir, tenant, fmt.Sprintf("%d", meta.companyID), fmt.Sprintf("%d", meta.branchID), meta.billType)
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			log.Printf("WARN: mkdir %s: %v", dir, err)
-		} else {
-			xmlPath = filepath.Join(dir, fmt.Sprintf("%d.xml", rowID))
-			if err := os.WriteFile(xmlPath, []byte(signedXML), 0644); err != nil {
-				log.Printf("WARN: write xml %s: %v", xmlPath, err)
-				xmlPath = "" // don't store path if write failed
-			} else {
-				log.Printf("  Saved signed XML: %s", xmlPath)
-			}
-		}
-	}
-
-	apiJSON, err := svc.SDK.GenerateAPIRequest(signedXML)
-	if err != nil {
-		return "", fmt.Errorf("GenerateAPIRequest failed: %w", err)
-	}
-
-	var apiReq models.InvoiceRequest
-	if err := json.Unmarshal([]byte(apiJSON), &apiReq); err != nil {
-		return "", fmt.Errorf("parse api json failed: %w", err)
-	}
-
-	var resp *models.InvoiceResponse
-	if inv.IsStandard() {
-		log.Printf("DEBUG: ClearInvoice request UUID=%s hash=%s", apiReq.UUID, apiReq.InvoiceHash)
-		resp, err = svc.Client.ClearInvoice(apiReq)
-		if err != nil {
-			return "", fmt.Errorf("ClearInvoice API failed: %v", err)
-		}
-	} else {
-		log.Printf("DEBUG: ReportInvoice request UUID=%s hash=%s", apiReq.UUID, apiReq.InvoiceHash)
-		resp, err = svc.Client.ReportInvoice(apiReq)
-		if err != nil {
-			return "", fmt.Errorf("ReportInvoice API failed: %v", err)
-		}
-	}
-	if resp == nil {
-		return "", fmt.Errorf("invoice API returned nil response")
-	}
-
-	log.Printf("  Result: status=%s, hash=%s", resp.Status, apiReq.InvoiceHash)
-
-	qr := ""
-	if signedXML != "" {
-		if q, qerr := svc.SDK.GenerateQR(signedXML); qerr == nil {
-			qr = q
-		} else {
-			log.Printf("DEBUG: GenerateQR failed: %v", qerr)
-		}
-	}
-
-	finalHash := apiReq.InvoiceHash
-	if finalHash == "" {
-		finalHash = resp.InvoiceHash
-	}
-	if finalHash == "" {
-		finalHash = hash
-	}
-
-	qrCol := meta.qrColumn
-	if qrCol == "" {
-		qrCol = "qr_code"
-	}
-
-	updateQ := fmt.Sprintf(`UPDATE %s SET invoice_hash = ?, %s = ?, invoice_uuid = ?, state = 3 WHERE id = ?`, table, qrCol)
-	if _, uerr := db.Exec(updateQ, finalHash, qr, apiReq.UUID, rowID); uerr != nil {
-		return "", fmt.Errorf("update metadata failed for %s %d: %w", table, rowID, uerr)
-	}
-
-	if len(resp.Warnings) > 0 {
-		for _, w := range resp.Warnings {
-			log.Printf("    WARN [%s] %s", w.Code, w.Message)
-		}
-	}
-
-	if apiReq.InvoiceHash != "" {
-		return apiReq.InvoiceHash, nil
-	}
-	if resp.InvoiceHash != "" {
-		return resp.InvoiceHash, nil
-	}
-	return "", fmt.Errorf("no invoice hash returned for %s %d", table, rowID)
+	xmlDir       string // base directory (e.g. /data/zatca-xml)
+	tenantID     string // tenant identifier (db_name) - prevents cross-tenant collisions
+	merchantID   int64  // numeric master tenant id used by T003 persistence
+	sourceBillID int64  // source bill id for zatca_submission.bill_id
+	companyID    int64
+	branchID     int64
+	billType     string // "invoice", "credit", "debit"
+	documentKind string // "bill", "credit_note", "debit_note"
+	table        string // closed internal legacy table name
+	qrColumn     string // DB column name for QR code ("qr_code" for bill, "invoice_qr" for credit_note)
 }
 
 // buildCustomer builds the Customer party from BillRow.

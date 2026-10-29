@@ -183,9 +183,10 @@ func main() {
 			continue
 		}
 		cfg := &config.Config{
-			Env:      config.Environment(t.ZATCAEnv),
-			XMLDir:   *xmlDir,
-			TenantID: t.DBName,
+			Env:        config.Environment(t.ZATCAEnv),
+			XMLDir:     *xmlDir,
+			TenantID:   t.DBName,
+			MerchantID: t.ID,
 		}
 		tc := &tenantCtx{tenant: t, db: tdb, cfg: cfg, encKey: encKey}
 
