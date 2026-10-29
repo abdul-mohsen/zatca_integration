@@ -1,11 +1,15 @@
 version: "3.8"
 
 # Variables below are interpolated from a `.env` file in this directory.
-# See `.env.example` for the full list. Required: DB_PASS, ENCRYPT_KEY, MONITOR_PASS.
+# See `.env.example` for the full list. Required at runtime: DB_PASS,
+# ENCRYPT_KEY, MONITOR_PASS; ZATCA_SDK_PATH is required when building.
 
 services:
   zatca-daemon:
-    build: .
+    build:
+      context: .
+      additional_contexts:
+        zatca-sdk: ${ZATCA_SDK_PATH:?ZATCA_SDK_PATH must point to the private ZATCA SDK root}
     container_name: zatca-daemon
     restart: unless-stopped
     extra_hosts:

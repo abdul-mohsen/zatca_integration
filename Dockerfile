@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1
+
 ### -------------------------------------------------------
 ### Stage 1: Build the Go daemon binary
 ### -------------------------------------------------------
@@ -16,7 +18,10 @@ FROM eclipse-temurin:21-jre-alpine
 
 RUN apk add --no-cache jq bash
 
-COPY zatca-einvoicing-sdk-238-R4.0.0 /SDK/zatca-einvoicing-sdk-238-R4.0.0
+COPY --from=zatca-sdk . /SDK/zatca-einvoicing-sdk-238-R4.0.0
+
+RUN test -f /SDK/zatca-einvoicing-sdk-238-R4.0.0/Apps/fatoora || \
+    (echo "ERROR: the zatca-sdk build context must point to the SDK root containing Apps/fatoora" >&2 && exit 1)
 
 WORKDIR /SDK/zatca-einvoicing-sdk-238-R4.0.0
 
