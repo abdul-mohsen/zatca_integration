@@ -33,8 +33,6 @@ A production-ready Go daemon for Saudi Arabia's ZATCA (Zakat, Tax and Customs Au
 - Docker
 - MySQL 8.0+
 - Go 1.25+ (for local development only)
-- An authorized ZATCA SDK R4.0.0 directory for Docker builds (private; not
-  included in this repository)
 
 ---
 
@@ -108,37 +106,9 @@ VALUES (1, 'Main Branch', 'King Fahad Road', '1234', 'Al-Olaya', 'Riyadh', '1234
 ### Option A: Docker (recommended)
 
 ```bash
-# Build the image. The SDK root must contain Apps/fatoora, Configuration/, and
-# Data/. Keep this proprietary directory outside the repository.
-docker build \
-  --build-context zatca-sdk=/secure/path/zatca-einvoicing-sdk-238-R4.0.0 \
-  -t zatca-daemon .
-```
+# Build the image
+docker build -t zatca-daemon .
 
-On PowerShell, quote a Windows path when it contains spaces:
-
-```powershell
-docker build `
-  --build-context "zatca-sdk=C:\private\zatca-einvoicing-sdk-238-R4.0.0" `
-  -t zatca-daemon .
-```
-
-The SDK is intentionally not tracked. A direct build that reports a missing
-`zatca-sdk` context must be rerun with the `--build-context` option above. If
-the layout check reports missing `Apps/fatoora`, point the context at the SDK
-root rather than its parent directory. For Compose builds, copy `.env.example`
-to `.env`, set `ZATCA_SDK_PATH` to that same private SDK root, and run:
-
-```bash
-docker compose build
-```
-
-Compose fails before building when `ZATCA_SDK_PATH` is unset, with an
-instruction naming the required private input.
-
-### Run the image
-
-```bash
 # Run (Option 1: individual flags — safe for special characters in passwords)
 docker run -d \
   --name zatca \
