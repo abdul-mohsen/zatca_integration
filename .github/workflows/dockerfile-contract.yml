@@ -1,0 +1,66 @@
+name: Dockerfile contract
+
+on:
+  pull_request:
+    paths:
+      - Dockerfile
+      - docker-compose.yml
+      - docker-compose.test.yml
+      - docker_build_contract_test.go
+      - go.mod
+      - go.sum
+      - .github/workflows/dockerfile-contract.yml
+  push:
+    branches:
+      - main
+
+jobs:
+  dockerfile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+
+      - name: Run Docker contract tests
+        run: go test ./...
+
+      - name: Create synthetic SDK build context
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk="$RUNNER_TEMP/zatca-sdk"
+          mkdir -p "$sdk/Apps" "$sdk/Configuration" "$sdk/Data"
+          printf '#!/bin/sh\nexit 0\n' > "$sdk/Apps/fatoora"
+          chmod +x "$sdk/Apps/fatoora"
+          cat > "$sdk/Configuration/defaults.json" <<'JSON'
+          {
+            "xsdPath": "placeholder.xsd",
+            "enSchematron": "en.sch",
+            "zatcaSchematron": "zatca.sch",
+            "certPath": "cert.pem",
+            "privateKeyPath": "key.pem",
+            "pihPath": "pih.txt",
+            "usagePathFile": "usage.json"
+          }
+          JSON
+
+      - name: Build daemon image with explicit SDK context
+        run: |
+          docker build --progress=plain \
+            --build-context "zatca-sdk=$RUNNER_TEMP/zatca-sdk" \
+            --tag zatca-daemon-contract:${{ github.sha }} .
+
+      - name: Smoke-test daemon image
+        run: docker run --rm zatca-daemon-contract:${{ github.sha }} --help
+
+      - name: Validate Compose interpolation
+        env:
+          ZATCA_SDK_PATH: ${{ runner.temp }}/zatca-sdk
+          DB_PASS: contract-only
+          ENCRYPT_KEY: contract-only
+          MONITOR_PASS: contract-only
+        run: docker compose config --quiet
