@@ -61,6 +61,11 @@ func TestDaemonDockerBuildContract(t *testing.T) {
 		}
 	}
 
+	goWorkflow := readContractFile(t, ".github/workflows/go-test.yml")
+	if !strings.Contains(goWorkflow, "go test ./...") {
+		t.Error("Go workflow does not run the repository unit tests")
+	}
+
 	gitignore := readContractFile(t, ".gitignore")
 	if !strings.Contains(gitignore, "zatca-einvoicing-sdk-*/") {
 		t.Error(".gitignore no longer protects the proprietary SDK directory")
