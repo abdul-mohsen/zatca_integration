@@ -6,9 +6,6 @@ on:
       - Dockerfile
       - docker-compose.yml
       - docker-compose.test.yml
-      - docker_build_contract_test.go
-      - go.mod
-      - go.sum
       - .github/workflows/dockerfile-contract.yml
   push:
     branches:
