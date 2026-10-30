@@ -44,20 +44,21 @@ func TestDaemonDockerBuildContract(t *testing.T) {
 		})
 	}
 
-	readme := readContractFile(t, "README.md")
-	for _, required := range []string{
-		"--build-context " + sdkContext + "=",
-		"ZATCA_SDK_PATH",
-		"Apps/fatoora",
-	} {
-		if !strings.Contains(readme, required) {
-			t.Errorf("README is missing SDK build guidance %q", required)
-		}
-	}
-
 	envExample := readContractFile(t, ".env.example")
 	if !strings.Contains(envExample, "ZATCA_SDK_PATH=") {
 		t.Error(".env.example does not document the required private SDK path")
+	}
+
+	workflow := readContractFile(t, ".github/workflows/dockerfile-contract.yml")
+	for _, required := range []string{
+		"docker build --progress=plain",
+		"--build-context \"zatca-sdk=$RUNNER_TEMP/zatca-sdk\"",
+		"docker run --rm zatca-daemon-contract:${{ github.sha }} --help",
+		"docker compose config --quiet",
+	} {
+		if !strings.Contains(workflow, required) {
+			t.Errorf("Docker workflow is missing required validation %q", required)
+		}
 	}
 
 	gitignore := readContractFile(t, ".gitignore")
