@@ -43,14 +43,72 @@ func ProcessBill(db *sql.DB, svc *zatca.Service, cfg *config.Config, b BillRow) 
 	})
 }
 
+// ProcessBillWithChain is the ordered-stream variant. It uses the reserved
+// UUID/ICV/PIH rather than allocating independent bill-worker state.
+func ProcessBillWithChain(
+	db *sql.DB,
+	svc *zatca.Service,
+	cfg *config.Config,
+	b BillRow,
+	chainState DocumentChainState,
+) (string, error) {
+	log.Printf("Processing ordered bill id=%d icv=%d", b.ID, chainState.ICV)
+
+	issueTime, err := ParseDates(b.EffectiveDate, b.PaymentDue, b.ID)
+	if err != nil {
+		return "", err
+	}
+	products, err := LoadProducts(db, b.ID)
+	if err != nil {
+		return "", fmt.Errorf("load products failed for bill %d: %w", b.ID, err)
+	}
+
+	inv := BuildBillInvoiceWithChain(cfg, b, products, issueTime, chainState)
+	return signSubmitUpdate(db, svc, inv, b.ID, "bill", xmlMeta{
+		xmlDir:    cfg.XMLDir,
+		tenantID:  cfg.TenantID,
+		companyID: b.CompanyID,
+		branchID:  b.BranchID,
+		billType:  "invoice",
+		qrColumn:  "qr_code",
+	})
+}
+
 // BuildBillInvoice constructs an Invoice (type 388) from a BillRow.
 func BuildBillInvoice(cfg *config.Config, b BillRow, products []ProductRow, issueTime time.Time) *invoice.Invoice {
+	chainState := DocumentChainState{
+		DocumentUUID: uuid.New().String(),
+		ICV:          1,
+	}
+	if b.SeqNumber.Valid {
+		if value, err := strconv.ParseUint(b.SeqNumber.String, 10, 64); err == nil {
+			chainState.ICV = value
+		}
+	}
+	return BuildBillInvoiceWithChain(cfg, b, products, issueTime, chainState)
+}
+
+// BuildBillInvoiceWithChain constructs an invoice using an existing EGS
+// reservation. It never replaces the reserved UUID, ICV, or PIH.
+func BuildBillInvoiceWithChain(
+	cfg *config.Config,
+	b BillRow,
+	products []ProductRow,
+	issueTime time.Time,
+	chainState DocumentChainState,
+) *invoice.Invoice {
 	isStandard := b.BuyerVAT.Valid && b.BuyerVAT.String != ""
 	customer := buildCustomer(b, isStandard)
+	if chainState.DocumentUUID == "" {
+		chainState.DocumentUUID = uuid.New().String()
+	}
+	if chainState.ICV == 0 {
+		chainState.ICV = 1
+	}
 
 	inv := &invoice.Invoice{
 		ID:               fmt.Sprintf("INV-%d", b.ID),
-		UUID:             uuid.New().String(),
+		UUID:             chainState.DocumentUUID,
 		IssueDate:        issueTime,
 		IssueTime:        issueTime,
 		TypeCode:         invoice.TypeInvoice,
@@ -70,8 +128,8 @@ func BuildBillInvoice(cfg *config.Config, b BillRow, products []ProductRow, issu
 			Country:            cfg.Seller.Country,
 		},
 		Customer:            customer,
-		PreviousInvoiceHash: DefaultPIH,
-		InvoiceCounterValue: 1,
+		PreviousInvoiceHash: chainState.effectivePIH(),
+		InvoiceCounterValue: int(chainState.ICV),
 		PaymentMeans: func() string {
 			if b.PaymentMethod.Valid && b.PaymentMethod.String != "" {
 				return b.PaymentMethod.String
@@ -86,7 +144,7 @@ func BuildBillInvoice(cfg *config.Config, b BillRow, products []ProductRow, issu
 		inv.SubType = invoice.SubTypeSimplified
 	}
 
-	if b.SeqNumber.Valid {
+	if chainState.ICV == 0 && b.SeqNumber.Valid {
 		if v, err := strconv.Atoi(b.SeqNumber.String); err == nil {
 			inv.InvoiceCounterValue = v
 		}

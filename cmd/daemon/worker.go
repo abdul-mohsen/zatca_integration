@@ -25,11 +25,12 @@ const maxRetries = 10
 
 type tenantCtx struct {
 	tenant  tenant.Tenant
-	db      *sql.DB // runtime: SELECT + column-level UPDATE only
+	db      *sql.DB // source reads/result updates + backend chain contract writes
 	adminDB *sql.DB // admin: also has INSERT/UPDATE on branch_zatca_config
 	cfg     *config.Config
 	encKey  *secutil.Key
 	claims  queue.ClaimStore
+	chain   queue.EGSSequenceStore
 }
 
 // activeBranches tracks which branches already have doc workers running.
@@ -55,18 +56,18 @@ func markBranchActive(dbName string, branchID int64) bool {
 
 type getServiceFunc func(dbName string, branchID int64) (*zatca.Service, *config.Config, error)
 
-// runWorker subscribes to a specific (docType, dbName, branchID) subject and processes messages sequentially.
+// runWorker subscribes to one combined bill/credit/debit stream. The stream
+// is partitioned by canonical tenant_id + egs_sequence_id by OrderedStream.
 func runWorker(
 	js nats.JetStreamContext,
 	tenantMap map[string]*tenantCtx,
 	getService getServiceFunc,
-	docType queue.DocType,
 	dbName string,
 	branchID int64,
 ) {
-	subject := queue.Subject(docType, dbName, branchID)
-	consName := queue.ConsumerName(docType, dbName, branchID)
-	pullAndProcess(js, tenantMap, getService, subject, consName)
+	subject := queue.OrderedSubject(dbName, branchID)
+	consName := queue.OrderedConsumerName(dbName, branchID)
+	pullAndProcessOrdered(js, tenantMap, getService, subject, consName, dbName, branchID)
 }
 
 // runOnboardWorker listens on zatca.onboard.{dbName}.* for branch registration requests.
@@ -204,98 +205,222 @@ func isExpired(msg *nats.Msg) bool {
 	return time.Since(meta.Timestamp) > time.Hour
 }
 
-func pullAndProcess(
+func pullAndProcessOrdered(
 	js nats.JetStreamContext,
 	tenantMap map[string]*tenantCtx,
 	getService getServiceFunc,
 	subject string,
 	consName string,
-	onSuccess ...func(queue.Message),
+	dbName string,
+	branchID int64,
 ) {
 	sub, err := js.PullSubscribe(subject, consName, nats.AckWait(5*time.Minute))
 	if err != nil {
 		log.Printf("ERROR: subscribe %s: %v", subject, err)
 		return
 	}
-	log.Printf("Worker started: %s", subject)
+	tc, ok := tenantMap[dbName]
+	if !ok {
+		log.Printf("ERROR: ordered stream tenant %s is not loaded", dbName)
+		return
+	}
+	ordered := queue.NewOrderedStream(
+		tc.claims,
+		tc.chain,
+		func(ctx context.Context, msg queue.Message, reservation queue.EGSSequenceReservation) (queue.EGSSequenceCommitRequest, error) {
+			return processOrderedMessage(tenantMap, getService, ctx, msg, reservation)
+		},
+	)
+	log.Printf("Ordered worker started: %s", subject)
+	// Fetching remains one-at-a-time so JetStream delivery order is preserved;
+	// OrderedStream still owns the canonical partition lock for callers that
+	// process deliveries concurrently.
+	slots := make(chan struct{}, 1)
 
 	for {
 		msgs, err := sub.Fetch(1, nats.MaxWait(30*time.Second))
 		if err != nil {
 			if err == nats.ErrTimeout {
-				continue // normal, no messages available
+				continue
 			}
 			log.Printf("ERROR: fetch %s: %v", subject, err)
 			time.Sleep(5 * time.Second)
 			continue
 		}
 
-		for _, msg := range msgs {
-			log.Printf("Received message on %s: %s", subject, string(msg.Data))
+		for _, raw := range msgs {
+			slots <- struct{}{}
+			go func(raw *nats.Msg) {
+				defer func() { <-slots }()
 
-			qmsg, err := queue.DecodeEnvelope(msg.Data)
-			if err != nil {
-				log.Printf("ERROR: unmarshal %s: %v", subject, err)
-				continue
-			}
-			if qmsg.Subject() != subject {
-				log.Printf("ERROR: queue envelope subject mismatch: got %s, expected %s", qmsg.Subject(), subject)
-				continue
-			}
+				qmsg, err := queue.DecodeCanonicalEnvelope(raw.Data)
+				if err != nil {
+					log.Printf("ERROR: decode ordered envelope on %s: %v", subject, err)
+					return
+				}
+				if qmsg.DBName != dbName || qmsg.BranchID != branchID {
+					log.Printf("ERROR: ordered envelope scope mismatch: got %s/%d, expected %s/%d",
+						qmsg.DBName, qmsg.BranchID, dbName, branchID)
+					return
+				}
+				if qmsg.TenantID != uint64(tc.tenant.ID) {
+					log.Printf("ERROR: ordered envelope tenant mismatch: envelope=%d registry=%d",
+						qmsg.TenantID, tc.tenant.ID)
+					return
+				}
+				qmsg, err = enrichOrderedIdentity(getService, qmsg)
+				if err != nil {
+					log.Printf("ERROR: ordered envelope identity: %v", err)
+					return
+				}
 
-			tc, ok := tenantMap[qmsg.DBName]
-			if !ok {
-				log.Printf("ERROR: %s tenant %s is not loaded", subject, qmsg.DBName)
-				continue
-			}
-			if qmsg.TenantID != uint64(tc.tenant.ID) {
-				log.Printf("ERROR: %s tenant identity mismatch: envelope=%d registry=%d",
-					subject, qmsg.TenantID, tc.tenant.ID)
-				continue
-			}
-			if tc.claims == nil {
-				log.Printf("ERROR: %s tenant %s has no queue claim store", subject, qmsg.DBName)
-				continue
-			}
+				err = ordered.HandleMessage(
+					context.Background(),
+					qmsg,
+					func() error { return raw.Ack() },
+				)
+				if err == nil {
+					return
+				}
+				if errors.Is(err, queue.ErrFingerprintConflict) {
+					log.Printf("ERROR: ordered message id=%d rejected: %v", qmsg.ID, err)
+					return
+				}
+				if errors.Is(err, queue.ErrClaimInFlight) ||
+					errors.Is(err, queue.ErrEGSSequenceBusy) {
+					log.Printf("Ordered message still in flight: %s id=%d: %v", qmsg.DocType, qmsg.ID, err)
+					return
+				}
 
-			err = queue.HandleMessage(
-				context.Background(),
-				qmsg,
-				tc.claims,
-				func(claimed queue.Message) error {
-					if err := processWithRetry(tenantMap, getService, claimed); err != nil {
-						return err
-					}
-					// Notify success callbacks only after the business effect
-					// has completed and before the final ACK.
-					for _, fn := range onSuccess {
-						fn(claimed)
-					}
-					return nil
-				},
-				func() error { return msg.Ack() },
-			)
-			if err == nil {
-				continue
-			}
-			if errors.Is(err, queue.ErrFingerprintConflict) {
-				log.Printf("ERROR: %s id=%d rejected: %v", subject, qmsg.ID, err)
-				continue
-			}
-			if errors.Is(err, queue.ErrClaimInFlight) {
-				log.Printf("Queue delivery still in flight: %s id=%d", subject, qmsg.ID)
-				continue
-			}
-
-			log.Printf("ERROR: %s id=%d FAILED without ACK: %v", subject, qmsg.ID, err)
-			if tc.tenant.AlertEmail != "" {
-				sendAlert(tc.tenant.AlertEmail, qmsg, err)
-			}
+				log.Printf("ERROR: ordered message %s id=%d FAILED without ACK: %v", qmsg.DocType, qmsg.ID, err)
+				if tc.tenant.AlertEmail != "" {
+					sendAlert(tc.tenant.AlertEmail, qmsg, err)
+				}
+			}(raw)
 		}
 	}
 }
 
-// processWithRetry tries processing up to maxRetries with exponential backoff.
+func enrichOrderedIdentity(getService getServiceFunc, msg queue.Message) (queue.Message, error) {
+	_, branchCfg, err := getService(msg.DBName, msg.BranchID)
+	if err != nil {
+		return queue.Message{}, err
+	}
+	if msg.VATNumber == "" {
+		msg.VATNumber = branchCfg.Seller.VAT
+	}
+	if msg.EGSID == "" {
+		msg.EGSID = branchCfg.CSR.SerialNumber
+		if msg.EGSID == "" {
+			// Older branch rows do not carry the CSR computer number. The
+			// branch-scoped fallback remains stable, while the ordered
+			// partition itself is still tenant_id + egs_sequence_id.
+			msg.EGSID = fmt.Sprintf("branch-%d", msg.BranchID)
+		}
+	}
+	if msg.VATNumber == "" {
+		return queue.Message{}, errors.New("ordered envelope is missing seller VAT number")
+	}
+	return msg, nil
+}
+
+func processOrderedMessage(
+	tenantMap map[string]*tenantCtx,
+	getService getServiceFunc,
+	_ context.Context,
+	msg queue.Message,
+	reservation queue.EGSSequenceReservation,
+) (queue.EGSSequenceCommitRequest, error) {
+	state := processor.DocumentChainState{
+		DocumentUUID:        reservation.DocumentUUID,
+		ICV:                 reservation.ICV,
+		PreviousInvoiceHash: reservation.PIH,
+	}
+	hash, err := processMessageWithChain(tenantMap, getService, msg, state)
+	if err != nil {
+		return queue.EGSSequenceCommitRequest{}, err
+	}
+	snapshot, err := json.Marshal(struct {
+		SourceID      uint64  `json:"source_id"`
+		DocumentType  string  `json:"document_type"`
+		TenantID      uint64  `json:"tenant_id"`
+		EGSSequenceID string  `json:"egs_sequence_id"`
+		DocumentUUID  string  `json:"document_uuid"`
+		ICV           uint64  `json:"icv"`
+		PIH           *string `json:"pih"`
+		DocumentHash  string  `json:"document_hash"`
+		OutboxEventID string  `json:"outbox_event_id"`
+		PosID         string  `json:"pos_id"`
+		BillRequestID string  `json:"bill_request_id"`
+		RequestHash   string  `json:"request_fingerprint,omitempty"`
+	}{
+		SourceID:      uint64(msg.ID),
+		DocumentType:  string(msg.DocType),
+		TenantID:      msg.TenantID,
+		EGSSequenceID: msg.EGSSequenceID,
+		DocumentUUID:  reservation.DocumentUUID,
+		ICV:           reservation.ICV,
+		PIH:           reservation.PIH,
+		DocumentHash:  hash,
+		OutboxEventID: reservation.OutboxEventID,
+		PosID:         msg.PosID,
+		BillRequestID: msg.BillRequestID,
+		RequestHash:   msg.BusinessFingerprint(),
+	})
+	if err != nil {
+		return queue.EGSSequenceCommitRequest{}, fmt.Errorf("marshal immutable EGS snapshot: %w", err)
+	}
+	return queue.EGSSequenceCommitRequest{
+		Reservation:  reservation,
+		DocumentType: string(msg.DocType),
+		SourceID:     uint64(msg.ID),
+		State:        queue.EGSDocumentQueued,
+		Snapshot:     snapshot,
+		DocumentHash: hash,
+	}, nil
+}
+
+func processMessageWithChain(
+	tenantMap map[string]*tenantCtx,
+	getService getServiceFunc,
+	msg queue.Message,
+	chainState processor.DocumentChainState,
+) (string, error) {
+	tc, ok := tenantMap[msg.DBName]
+	if !ok {
+		return "", fmt.Errorf("unknown tenant db: %s (known tenants: %v)", msg.DBName, tenantKeys(tenantMap))
+	}
+
+	svc, branchCfg, err := getService(msg.DBName, msg.BranchID)
+	if err != nil {
+		return "", fmt.Errorf("get service for branch %d: %w", msg.BranchID, err)
+	}
+
+	switch msg.DocType {
+	case queue.DocBill:
+		bill, err := processor.QueryBillByID(tc.db, msg.ID)
+		if err != nil {
+			return "", err
+		}
+		return processor.ProcessBillWithChain(tc.db, svc, branchCfg, *bill, chainState)
+	case queue.DocCredit:
+		row, err := processor.QueryCreditNoteByID(tc.db, msg.ID)
+		if err != nil {
+			return "", err
+		}
+		return processor.ProcessCreditNoteWithChain(tc.db, svc, branchCfg, *row, chainState)
+	case queue.DocDebit:
+		row, err := processor.QueryDebitNoteByID(tc.db, msg.ID)
+		if err != nil {
+			return "", err
+		}
+		return processor.ProcessDebitNoteWithChain(tc.db, svc, branchCfg, *row, chainState)
+	default:
+		return "", fmt.Errorf("unknown ordered doc type: %s", msg.DocType)
+	}
+}
+
+// processWithRetry is retained for compatibility with standalone callers.
 func processWithRetry(
 	tenantMap map[string]*tenantCtx,
 	getService getServiceFunc,
@@ -380,7 +505,8 @@ func processMessage(
 	}
 }
 
-// spawnBranchWorkers starts bill/credit/debit workers for a branch if not already running.
+// spawnBranchWorkers starts one combined ordered worker for a branch if not
+// already running.
 func spawnBranchWorkers(
 	js nats.JetStreamContext,
 	tenantMap map[string]*tenantCtx,
@@ -392,14 +518,12 @@ func spawnBranchWorkers(
 	if !markBranchActive(dbName, branchID) {
 		return // workers already running for this branch
 	}
-	log.Printf("Spawning doc workers for branch %d in %s (post-onboard)", branchID, dbName)
-	for _, dt := range []queue.DocType{queue.DocBill, queue.DocCredit, queue.DocDebit} {
-		wg.Add(1)
-		go func(docType queue.DocType) {
-			defer wg.Done()
-			runWorker(js, tenantMap, getService, docType, dbName, branchID)
-		}(dt)
-	}
+	log.Printf("Spawning ordered worker for branch %d in %s (post-onboard)", branchID, dbName)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runWorker(js, tenantMap, getService, dbName, branchID)
+	}()
 }
 
 func tenantKeys(m map[string]*tenantCtx) []string {
