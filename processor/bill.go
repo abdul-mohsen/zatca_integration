@@ -198,6 +198,14 @@ func signSubmitUpdateOutcome(
 	if err := meta.submission.Validate(); err != nil {
 		return "", SubmissionTerminal, fmt.Errorf("provider submission requires canonical identity: %w", err)
 	}
+	if rowID <= 0 || meta.submission.SourceID != uint64(rowID) {
+		return "", SubmissionTerminal, fmt.Errorf("provider source_id %d does not match %s row %d",
+			meta.submission.SourceID, table, rowID)
+	}
+	if expected := documentTable(meta.submission.DocumentType); expected != table {
+		return "", SubmissionTerminal, fmt.Errorf("provider document_type %q cannot persist to %s",
+			meta.submission.DocumentType, table)
+	}
 
 	ctx := context.Background()
 	store := NewSQLSubmissionStore(db)
@@ -221,7 +229,7 @@ func signSubmitUpdateOutcome(
 		if !result.Attempt.successful() {
 			return "", result.Attempt.State, result.Attempt.outcomeError()
 		}
-		if err := applyAcceptedProjection(db, svc, result.Attempt, rowID, table, meta); err != nil {
+		if err := applyAcceptedProjection(db, svc, result.Attempt, rowID, table, meta, signedXMLPath(meta, rowID)); err != nil {
 			return "", result.Attempt.State, err
 		}
 		return result.Attempt.InvoiceHash, result.Attempt.State, nil
@@ -237,29 +245,7 @@ func signSubmitUpdateOutcome(
 		return "", SubmissionTerminal, fmt.Errorf("SignInvoice failed: %w", err)
 	}
 
-	// Save signed XML to filesystem:
-	//   {xmlDir}/{tenant}/{company_id}/{branch_id}/{bill_type}/{rowID}.xml
-	// Tenant prefix prevents collisions when multiple tenants share the
-	// same xml-dir mount.
-	var xmlPath string
-	if meta.xmlDir != "" {
-		tenant := meta.tenantID
-		if tenant == "" {
-			tenant = "_default"
-		}
-		dir := filepath.Join(meta.xmlDir, tenant, fmt.Sprintf("%d", meta.companyID), fmt.Sprintf("%d", meta.branchID), meta.billType)
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			log.Printf("WARN: mkdir %s: %v", dir, err)
-		} else {
-			xmlPath = filepath.Join(dir, fmt.Sprintf("%d.xml", rowID))
-			if err := os.WriteFile(xmlPath, []byte(signedXML), 0644); err != nil {
-				log.Printf("WARN: write xml %s: %v", xmlPath, err)
-				xmlPath = "" // don't store path if write failed
-			} else {
-				log.Printf("  Saved signed XML: %s", xmlPath)
-			}
-		}
-	}
+	xmlPath := saveSignedXML(meta, rowID, signedXML)
 
 	apiJSON, err := svc.SDK.GenerateAPIRequest(signedXML)
 	if err != nil {
@@ -306,7 +292,7 @@ func signSubmitUpdateOutcome(
 	if result.Attempt.InvoiceHash == "" {
 		return "", SubmissionTerminal, fmt.Errorf("no invoice hash returned for %s %d", table, rowID)
 	}
-	if err := applyAcceptedProjection(db, svc, result.Attempt, rowID, table, meta); err != nil {
+	if err := applyAcceptedProjection(db, svc, result.Attempt, rowID, table, meta, xmlPath); err != nil {
 		return "", result.Attempt.State, err
 	}
 	return result.Attempt.InvoiceHash, result.Attempt.State, nil
@@ -319,12 +305,21 @@ func applyAcceptedProjection(
 	rowID int64,
 	table string,
 	meta xmlMeta,
+	xmlPath string,
 ) error {
 	if !attempt.successful() {
 		return fmt.Errorf("refusing to issue non-successful provider outcome %q", attempt.State)
 	}
 	if attempt.InvoiceHash == "" {
 		return errors.New("accepted provider outcome is missing invoice hash")
+	}
+	if attempt.Identity.SourceID != uint64(rowID) {
+		return fmt.Errorf("accepted provider source_id %d does not match %s row %d",
+			attempt.Identity.SourceID, table, rowID)
+	}
+	if expected := documentTable(attempt.Identity.DocumentType); expected != table {
+		return fmt.Errorf("accepted provider document_type %q cannot persist to %s",
+			attempt.Identity.DocumentType, table)
 	}
 	qr := ""
 	if svc != nil && svc.SDK != nil && len(attempt.SignedRequest) > 0 {
@@ -336,11 +331,53 @@ func applyAcceptedProjection(
 	if qrCol == "" {
 		qrCol = "qr_code"
 	}
-	updateQ := fmt.Sprintf(`UPDATE %s SET invoice_hash = ?, %s = ?, invoice_uuid = ?, state = 3 WHERE id = ?`, table, qrCol)
-	if _, err := db.Exec(updateQ, attempt.InvoiceHash, qr, meta.submission.InvoiceUUID, rowID); err != nil {
+	updateQ := fmt.Sprintf(`UPDATE %s SET invoice_hash = ?, %s = ?, invoice_uuid = ?, invoice_xml_path = COALESCE(NULLIF(?, ''), invoice_xml_path), state = 3 WHERE id = ?`, table, qrCol)
+	if _, err := db.Exec(updateQ, attempt.InvoiceHash, qr, attempt.Identity.InvoiceUUID, xmlPath, rowID); err != nil {
 		return fmt.Errorf("update metadata after provider acceptance failed for %s %d: %w", table, rowID, err)
 	}
 	return nil
+}
+
+func documentTable(documentType string) string {
+	switch documentType {
+	case "bill":
+		return "bill"
+	case "credit":
+		return "credit_note"
+	case "debit":
+		return "debit_note"
+	default:
+		return ""
+	}
+}
+
+func signedXMLPath(meta xmlMeta, rowID int64) string {
+	if meta.xmlDir == "" {
+		return ""
+	}
+	tenant := meta.tenantID
+	if tenant == "" {
+		tenant = "_default"
+	}
+	return filepath.Join(meta.xmlDir, tenant, fmt.Sprintf("%d", meta.companyID),
+		fmt.Sprintf("%d", meta.branchID), meta.billType, fmt.Sprintf("%d.xml", rowID))
+}
+
+func saveSignedXML(meta xmlMeta, rowID int64, signedXML string) string {
+	xmlPath := signedXMLPath(meta, rowID)
+	if xmlPath == "" {
+		return ""
+	}
+	if err := os.MkdirAll(filepath.Dir(xmlPath), 0755); err != nil {
+		log.Printf("WARN: mkdir %s: %v", filepath.Dir(xmlPath), err)
+		return ""
+	}
+	if err := os.WriteFile(xmlPath, []byte(signedXML), 0644); err != nil {
+		log.Printf("WARN: write xml %s: %v", xmlPath, err)
+		return ""
+	}
+	log.Printf("  Saved signed XML: %s", xmlPath)
+	return xmlPath
 }
 
 // buildCustomer builds the Customer party from BillRow.

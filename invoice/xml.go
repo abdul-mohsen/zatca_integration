@@ -68,6 +68,9 @@ func (inv *Invoice) ToXML() (string, error) {
 		b.WriteString("    <cac:BillingReference>\n")
 		b.WriteString("        <cac:InvoiceDocumentReference>\n")
 		writeElementIndent(&b, "            ", "cbc:ID", inv.BillingReferenceID)
+		if inv.BillingReferenceUUID != "" {
+			writeElementIndent(&b, "            ", "cbc:UUID", inv.BillingReferenceUUID)
+		}
 		b.WriteString("        </cac:InvoiceDocumentReference>\n")
 		b.WriteString("    </cac:BillingReference>\n")
 	}

@@ -16,7 +16,8 @@ import (
 
 // ProcessCreditNote processes a single credit note row through the full pipeline.
 func ProcessCreditNote(db *sql.DB, svc *zatca.Service, cfg *config.Config, row CreditDebitRow) (string, error) {
-	log.Printf("Processing credit note for bill id=%d seq=%s", row.ID, row.SeqNumber.String)
+	sourceID := row.noteSourceID()
+	log.Printf("Processing credit note source id=%d original bill id=%d seq=%s", sourceID, row.ID, row.SeqNumber.String)
 
 	issueTime := time.Now()
 	if row.EffectiveDate.Valid {
@@ -31,6 +32,12 @@ func ProcessCreditNote(db *sql.DB, svc *zatca.Service, cfg *config.Config, row C
 	}
 
 	creditNoteID := row.NoteID.Int64
+	if sourceID > 0 {
+		creditNoteID = sourceID
+	}
+	if creditNoteID <= 0 {
+		return "", fmt.Errorf("credit note source id is required")
+	}
 	inv := BuildCreditNoteInvoice(cfg, row, products, issueTime)
 	return signSubmitUpdate(db, svc, inv, creditNoteID, "credit_note", xmlMeta{
 		xmlDir:    cfg.XMLDir,
@@ -64,7 +71,11 @@ func ProcessCreditNoteWithChainOutcome(
 	row CreditDebitRow,
 	chainState DocumentChainState,
 ) (string, SubmissionState, error) {
-	log.Printf("Processing ordered credit note for bill id=%d icv=%d", row.ID, chainState.ICV)
+	log.Printf("Processing ordered credit note source id=%d original bill id=%d icv=%d",
+		row.noteSourceID(), row.ID, chainState.ICV)
+	if err := bindCanonicalNoteIdentity(&chainState.Submission, row, "credit"); err != nil {
+		return "", SubmissionTerminal, err
+	}
 
 	issueTime := time.Now()
 	if row.EffectiveDate.Valid {
@@ -77,7 +88,10 @@ func ProcessCreditNoteWithChainOutcome(
 		return "", SubmissionTerminal, fmt.Errorf("load products for bill %d: %w", row.ID, err)
 	}
 
-	creditNoteID := row.NoteID.Int64
+	creditNoteID := row.noteSourceID()
+	if creditNoteID == 0 {
+		return "", SubmissionTerminal, fmt.Errorf("credit note source id is required")
+	}
 	inv := BuildCreditNoteInvoiceWithChain(cfg, row, products, issueTime, chainState)
 	return signSubmitUpdateOutcome(db, svc, inv, creditNoteID, "credit_note", xmlMeta{
 		xmlDir:     cfg.XMLDir,
@@ -121,9 +135,14 @@ func BuildCreditNoteInvoiceWithChain(
 	if chainState.ICV == 0 {
 		chainState.ICV = 1
 	}
+	noteID := row.noteSourceID()
+	reason := ""
+	if row.NoteText.Valid {
+		reason = row.NoteText.String
+	}
 
 	inv := &invoice.Invoice{
-		ID:               fmt.Sprintf("INV-CN-%d", row.ID),
+		ID:               fmt.Sprintf("INV-CN-%d", noteID),
 		UUID:             chainState.DocumentUUID,
 		IssueDate:        issueTime,
 		IssueTime:        issueTime,
@@ -153,17 +172,11 @@ func BuildCreditNoteInvoiceWithChain(
 			return invoice.PaymentCash
 		}(),
 		InstructionNote: func() string {
-			if row.NoteText.Valid {
-				return row.NoteText.String
-			}
-			return ""
+			return reason
 		}(),
-		BillingReferenceID: func() string {
-			if row.SeqNumber.Valid {
-				return row.SeqNumber.String
-			}
-			return ""
-		}(),
+		Note:                 reason,
+		BillingReferenceID:   row.originalReferenceID(),
+		BillingReferenceUUID: row.originalReferenceUUID(),
 	}
 
 	if isStandard {

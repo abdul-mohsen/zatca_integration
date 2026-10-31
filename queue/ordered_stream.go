@@ -78,31 +78,37 @@ type EGSSequenceReservation struct {
 // EGSSequenceCommitRequest contains the immutable source snapshot and the
 // signed document hash that advance the reserved stream.
 type EGSSequenceCommitRequest struct {
-	Reservation  EGSSequenceReservation
-	DocumentType string
-	SourceID     uint64
-	State        string
-	Snapshot     []byte
-	DocumentHash string
+	Reservation          EGSSequenceReservation
+	DocumentType         string
+	SourceID             uint64
+	OriginalDocumentType string
+	OriginalSourceID     uint64
+	OriginalInvoiceUUID  string
+	State                string
+	Snapshot             []byte
+	DocumentHash         string
 }
 
 // EGSSequenceDocument is the durable state recorded for one source document.
 // It is also the shape used by the in-memory implementation's test harness.
 type EGSSequenceDocument struct {
-	EGSSequenceID string
-	TenantID      uint64
-	BranchID      int64
-	VATNumber     string
-	EGSID         string
-	DocumentUUID  string
-	DocumentType  string
-	SourceID      uint64
-	OutboxEventID string
-	ICV           uint64
-	PIH           *string
-	DocumentHash  string
-	Snapshot      []byte
-	State         string
+	EGSSequenceID        string
+	TenantID             uint64
+	BranchID             int64
+	VATNumber            string
+	EGSID                string
+	DocumentUUID         string
+	DocumentType         string
+	SourceID             uint64
+	OriginalDocumentType string
+	OriginalSourceID     uint64
+	OriginalInvoiceUUID  string
+	OutboxEventID        string
+	ICV                  uint64
+	PIH                  *string
+	DocumentHash         string
+	Snapshot             []byte
+	State                string
 }
 
 // EGSSequenceStore is the backend chain contract consumed by the ordered
@@ -499,6 +505,9 @@ func (s *MemoryEGSSequenceStore) Commit(_ context.Context, request EGSSequenceCo
 		if !exists ||
 			existing.DocumentType != request.DocumentType ||
 			existing.SourceID != request.SourceID ||
+			existing.OriginalDocumentType != request.OriginalDocumentType ||
+			existing.OriginalSourceID != request.OriginalSourceID ||
+			existing.OriginalInvoiceUUID != request.OriginalInvoiceUUID ||
 			existing.OutboxEventID != request.Reservation.OutboxEventID ||
 			existing.ICV != request.Reservation.ICV ||
 			!equalStringPointer(existing.PIH, request.Reservation.PIH) ||
@@ -512,6 +521,9 @@ func (s *MemoryEGSSequenceStore) Commit(_ context.Context, request EGSSequenceCo
 	if existing, ok := s.documents[documentKey]; ok {
 		if existing.DocumentType != request.DocumentType ||
 			existing.SourceID != request.SourceID ||
+			existing.OriginalDocumentType != request.OriginalDocumentType ||
+			existing.OriginalSourceID != request.OriginalSourceID ||
+			existing.OriginalInvoiceUUID != request.OriginalInvoiceUUID ||
 			existing.OutboxEventID != request.Reservation.OutboxEventID ||
 			existing.ICV != request.Reservation.ICV ||
 			!equalStringPointer(existing.PIH, request.Reservation.PIH) ||
@@ -532,20 +544,23 @@ func (s *MemoryEGSSequenceStore) Commit(_ context.Context, request EGSSequenceCo
 		request.State = EGSDocumentQueued
 	}
 	document := EGSSequenceDocument{
-		EGSSequenceID: request.Reservation.EGSSequenceID,
-		TenantID:      request.Reservation.TenantID,
-		BranchID:      request.Reservation.BranchID,
-		VATNumber:     request.Reservation.VATNumber,
-		EGSID:         request.Reservation.EGSID,
-		DocumentUUID:  request.Reservation.DocumentUUID,
-		DocumentType:  request.DocumentType,
-		SourceID:      request.SourceID,
-		OutboxEventID: request.Reservation.OutboxEventID,
-		ICV:           request.Reservation.ICV,
-		PIH:           cloneStringPointer(request.Reservation.PIH),
-		DocumentHash:  request.DocumentHash,
-		Snapshot:      append([]byte(nil), request.Snapshot...),
-		State:         request.State,
+		EGSSequenceID:        request.Reservation.EGSSequenceID,
+		TenantID:             request.Reservation.TenantID,
+		BranchID:             request.Reservation.BranchID,
+		VATNumber:            request.Reservation.VATNumber,
+		EGSID:                request.Reservation.EGSID,
+		DocumentUUID:         request.Reservation.DocumentUUID,
+		DocumentType:         request.DocumentType,
+		SourceID:             request.SourceID,
+		OriginalDocumentType: request.OriginalDocumentType,
+		OriginalSourceID:     request.OriginalSourceID,
+		OriginalInvoiceUUID:  request.OriginalInvoiceUUID,
+		OutboxEventID:        request.Reservation.OutboxEventID,
+		ICV:                  request.Reservation.ICV,
+		PIH:                  cloneStringPointer(request.Reservation.PIH),
+		DocumentHash:         request.DocumentHash,
+		Snapshot:             append([]byte(nil), request.Snapshot...),
+		State:                request.State,
 	}
 	s.documents[documentKey] = document
 	s.order[partitionKey] = append(s.order[partitionKey], documentKey)

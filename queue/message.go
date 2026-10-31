@@ -30,17 +30,21 @@ type Message struct {
 	// Canonical queue identity. These fields are required for document
 	// messages and are the only fields used to decide whether a business
 	// effect has already been claimed.
-	TenantID           uint64 `json:"tenant_id,omitempty"`
-	PosID              string `json:"pos_id,omitempty"`
-	BillRequestID      string `json:"bill_request_id,omitempty"`
-	EventID            string `json:"event_id,omitempty"`
-	EGSSequenceID      string `json:"egs_sequence_id,omitempty"`
-	InvoiceUUID        string `json:"invoice_uuid,omitempty"`
-	VATNumber          string `json:"vat_number,omitempty"`
-	EGSID              string `json:"egs_id,omitempty"`
-	RequestFingerprint string `json:"request_fingerprint,omitempty"`
-	Fingerprint        string `json:"fingerprint,omitempty"`
-	PayloadFingerprint string `json:"payload_fingerprint,omitempty"`
+	TenantID             uint64 `json:"tenant_id,omitempty"`
+	PosID                string `json:"pos_id,omitempty"`
+	RequestID            string `json:"request_id,omitempty"`
+	BillRequestID        string `json:"bill_request_id,omitempty"`
+	EventID              string `json:"event_id,omitempty"`
+	EGSSequenceID        string `json:"egs_sequence_id,omitempty"`
+	InvoiceUUID          string `json:"invoice_uuid,omitempty"`
+	VATNumber            string `json:"vat_number,omitempty"`
+	EGSID                string `json:"egs_id,omitempty"`
+	OriginalDocumentType string `json:"original_document_type,omitempty"`
+	OriginalSourceID     uint64 `json:"original_source_id,omitempty"`
+	OriginalInvoiceUUID  string `json:"original_invoice_uuid,omitempty"`
+	RequestFingerprint   string `json:"request_fingerprint,omitempty"`
+	Fingerprint          string `json:"fingerprint,omitempty"`
+	PayloadFingerprint   string `json:"payload_fingerprint,omitempty"`
 
 	rawFingerprint string
 }
@@ -87,6 +91,7 @@ func DecodeEnvelope(data []byte) (Message, error) {
 		return Message{}, fmt.Errorf("%w: %v", ErrInvalidEnvelope, err)
 	}
 	msg.rawFingerprint = fingerprintRawEnvelope(raw)
+	msg.normalizeRequestIdentity()
 	if err := msg.Validate(); err != nil {
 		return Message{}, err
 	}
@@ -110,8 +115,8 @@ func (m Message) Validate() error {
 		return fmt.Errorf("%w: pos_id is required", ErrInvalidEnvelope)
 	case len(m.PosID) > 64:
 		return fmt.Errorf("%w: pos_id must be at most 64 characters", ErrInvalidEnvelope)
-	case strings.TrimSpace(m.BillRequestID) == "":
-		return fmt.Errorf("%w: bill_request_id is required", ErrInvalidEnvelope)
+	case strings.TrimSpace(m.RequestIdentity()) == "":
+		return fmt.Errorf("%w: request_id is required", ErrInvalidEnvelope)
 	case strings.TrimSpace(m.EventID) == "":
 		return fmt.Errorf("%w: event_id is required", ErrInvalidEnvelope)
 	case strings.TrimSpace(m.EGSSequenceID) == "":
@@ -122,9 +127,28 @@ func (m Message) Validate() error {
 	return nil
 }
 
+func (m *Message) normalizeRequestIdentity() {
+	if m == nil {
+		return
+	}
+	if m.BillRequestID == "" {
+		m.BillRequestID = m.RequestID
+	}
+	if m.RequestID == "" {
+		m.RequestID = m.BillRequestID
+	}
+}
+
+func (m Message) RequestIdentity() string {
+	if strings.TrimSpace(m.BillRequestID) != "" {
+		return m.BillRequestID
+	}
+	return m.RequestID
+}
+
 // RequestKey scopes a business request to the owning tenant and POS.
 func (m Message) RequestKey() string {
-	return fmt.Sprintf("%d\x00%s\x00%s", m.TenantID, m.PosID, m.BillRequestID)
+	return fmt.Sprintf("%d\x00%s\x00%s", m.TenantID, m.PosID, m.RequestIdentity())
 }
 
 // EventKey scopes a delivery event to the owning tenant.
@@ -163,9 +187,11 @@ func (m Message) BusinessFingerprint() string {
 		TenantID      uint64  `json:"tenant_id"`
 		PosID         string  `json:"pos_id"`
 		BillRequestID string  `json:"bill_request_id"`
+		RequestID     string  `json:"request_id"`
 		EGSSequenceID string  `json:"egs_sequence_id"`
 		InvoiceUUID   string  `json:"invoice_uuid"`
 	}
+	requestID := m.RequestIdentity()
 	data, _ := json.Marshal(canonicalMessage{
 		DocType:       m.DocType,
 		ID:            m.ID,
@@ -174,6 +200,7 @@ func (m Message) BusinessFingerprint() string {
 		TenantID:      m.TenantID,
 		PosID:         m.PosID,
 		BillRequestID: m.BillRequestID,
+		RequestID:     requestID,
 		EGSSequenceID: m.EGSSequenceID,
 		InvoiceUUID:   m.InvoiceUUID,
 	})

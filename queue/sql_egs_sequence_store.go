@@ -238,6 +238,9 @@ func (s *SQLSequenceStore) Commit(ctx context.Context, request EGSSequenceCommit
 		}
 		if existing.DocumentType != request.DocumentType ||
 			existing.SourceID != request.SourceID ||
+			existing.OriginalDocumentType != request.OriginalDocumentType ||
+			existing.OriginalSourceID != request.OriginalSourceID ||
+			existing.OriginalInvoiceUUID != request.OriginalInvoiceUUID ||
 			existing.ICV != request.Reservation.ICV ||
 			!equalStringPointer(existing.PIH, request.Reservation.PIH) ||
 			existing.OutboxEventID != request.Reservation.OutboxEventID ||
@@ -257,13 +260,16 @@ func (s *SQLSequenceStore) Commit(ctx context.Context, request EGSSequenceCommit
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO zatca_egs_document (
 			tenant_id, egs_sequence_id, branch_id, vat_number, egs_id,
-			document_uuid, document_type, source_id, outbox_event_id,
-			icv, pih, document_snapshot, state
+			document_uuid, document_type, source_id,
+			original_document_type, original_source_id, original_invoice_uuid,
+			outbox_event_id, icv, pih, document_snapshot, state
 		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, request.Reservation.TenantID, request.Reservation.EGSSequenceID, request.Reservation.BranchID,
 		request.Reservation.VATNumber, request.Reservation.EGSID, request.Reservation.DocumentUUID,
-		request.DocumentType, request.SourceID, request.Reservation.OutboxEventID,
+		request.DocumentType, request.SourceID,
+		optionalString(request.OriginalDocumentType), optionalUint64(request.OriginalSourceID),
+		optionalString(request.OriginalInvoiceUUID), request.Reservation.OutboxEventID,
 		request.Reservation.ICV, request.Reservation.PIH, request.Snapshot, state)
 	if err != nil {
 		return fmt.Errorf("insert immutable EGS document %s: %w", request.Reservation.DocumentUUID, err)
@@ -491,14 +497,19 @@ func loadCommittedDocument(
 	request EGSSequenceReservationRequest,
 ) (*EGSSequenceDocument, error) {
 	var (
-		document EGSSequenceDocument
-		pih      sql.NullString
-		snapshot []byte
+		document             EGSSequenceDocument
+		originalDocumentType sql.NullString
+		originalSourceID     nullableUint64
+		originalInvoiceUUID  sql.NullString
+		pih                  sql.NullString
+		snapshot             []byte
 	)
 	err := tx.QueryRowContext(ctx, `
 		SELECT
 			egs_sequence_id, tenant_id, branch_id, vat_number, egs_id,
-			document_uuid, document_type, source_id, outbox_event_id,
+			document_uuid, document_type, source_id,
+			original_document_type, original_source_id, original_invoice_uuid,
+			outbox_event_id,
 			icv, pih, document_snapshot, state
 		FROM zatca_egs_document
 		WHERE tenant_id = ?
@@ -514,6 +525,9 @@ func loadCommittedDocument(
 		&document.DocumentUUID,
 		&document.DocumentType,
 		&document.SourceID,
+		&originalDocumentType,
+		&originalSourceID,
+		&originalInvoiceUUID,
 		&document.OutboxEventID,
 		&document.ICV,
 		&pih,
@@ -530,6 +544,9 @@ func loadCommittedDocument(
 		return nil, fmt.Errorf("%w: document %s", ErrEGSSequenceReservationConflict, request.DocumentUUID)
 	}
 	document.PIH = nullableStringPointer(pih)
+	document.OriginalDocumentType = originalDocumentType.String
+	document.OriginalSourceID = originalSourceID.Value
+	document.OriginalInvoiceUUID = originalInvoiceUUID.String
 	document.Snapshot = append([]byte(nil), snapshot...)
 	return &document, nil
 }
@@ -578,4 +595,18 @@ func nullableStringPointer(value sql.NullString) *string {
 		return nil
 	}
 	return &value.String
+}
+
+func optionalString(value string) any {
+	if value == "" {
+		return nil
+	}
+	return value
+}
+
+func optionalUint64(value uint64) any {
+	if value == 0 {
+		return nil
+	}
+	return value
 }
