@@ -40,25 +40,14 @@ A production-ready Go daemon for Saudi Arabia's ZATCA (Zakat, Tax and Customs Au
 
 ### 1a. Master Database
 
-The daemon discovers tenants from a central `zatca_master` database. Run this **once**:
+The daemon discovers tenants from a central `zatca_master` database. Its schema is managed with goose in [`migrations/zatca_master`](migrations/zatca_master). Install goose v3.24.3 (`go install github.com/pressly/goose/v3/cmd/goose@v3.24.3`), create the database once, then apply the migrations:
 
-```sql
-CREATE DATABASE IF NOT EXISTS zatca_master
-  CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-
-USE zatca_master;
-
-CREATE TABLE IF NOT EXISTS tenant (
-    id          BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    name        VARCHAR(100)  NOT NULL,
-    db_name     VARCHAR(100)  NOT NULL UNIQUE,
-    zatca_env   VARCHAR(20)   NOT NULL DEFAULT 'production', -- sandbox | simulation | production
-    alert_email VARCHAR(255)  NOT NULL DEFAULT '',
-    enabled     TINYINT(1)    NOT NULL DEFAULT 1,
-    created_at  TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_enabled (enabled)
-) ENGINE=InnoDB;
+```sh
+mysql -h db-host -u root -p -e "CREATE DATABASE IF NOT EXISTS zatca_master CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+goose -dir migrations/zatca_master mysql "root:PASS@tcp(db-host:3306)/zatca_master" up
 ```
+
+Each tenant has a `tenant_key`. It is set from `db_name` when the row is inserted, unless you set it yourself. It cannot change afterwards. `db_name` stays the routing key: the daemon connects to the database named there.
 
 Register each tenant (one row per client company):
 

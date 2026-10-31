@@ -1,0 +1,51 @@
+name: zatca_master migrations
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  migrations:
+    name: MySQL ${{ matrix.mysql }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mysql: ['8.0.28', '8.0.44', '8.4']
+
+    services:
+      mysql:
+        image: mysql:${{ matrix.mysql }}
+        env:
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Install goose
+        run: |
+          CGO_ENABLED=0 go install github.com/pressly/goose/v3/cmd/goose@v3.24.3
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Apply and test the zatca_master migrations
+        env:
+          MYSQL_ADDR: 127.0.0.1:3306
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_CLIENT: docker run --rm -i --network host -e MYSQL_PWD=root mysql:${{ matrix.mysql }} mysql --protocol=TCP -h 127.0.0.1 -P 3306 -u root
+        run: bash scripts/test_zatca_master_migrations.sh
