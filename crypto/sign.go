@@ -14,7 +14,7 @@ import (
 // SignResult holds the result of signing an invoice.
 type SignResult struct {
 	SignedXML    string // Complete signed invoice XML
-	InvoiceHash string // Base64-encoded SHA-256 hash of the invoice
+	InvoiceHash  string // Base64-encoded SHA-256 hash of the invoice
 	SignatureB64 string // Base64-encoded ECDSA signature
 	QRCode       string // Base64-encoded TLV QR data
 }
@@ -79,7 +79,7 @@ func SignInvoice(unsignedXML string, privateKey *ecdsa.PrivateKey, cert *CertInf
 
 	return &SignResult{
 		SignedXML:    signedXML,
-		InvoiceHash: invoiceHash,
+		InvoiceHash:  invoiceHash,
 		SignatureB64: signatureB64,
 		QRCode:       qrCode,
 	}, nil
@@ -145,7 +145,7 @@ func SignInvoiceWithQR(unsignedXML string, privateKey *ecdsa.PrivateKey, cert *C
 
 	return &SignResult{
 		SignedXML:    signedXML,
-		InvoiceHash: invoiceHash,
+		InvoiceHash:  invoiceHash,
 		SignatureB64: signatureB64,
 		QRCode:       qrCode,
 	}, nil
@@ -302,8 +302,8 @@ func encodeECDSASignatureDER(r, s *big.Int) []byte {
 	inner = append(inner, sBytes...)
 
 	result := make([]byte, 0, 2+len(inner))
-	result = append(result, 0x30)                 // SEQUENCE tag
-	result = append(result, byte(len(inner)))      // length
+	result = append(result, 0x30)             // SEQUENCE tag
+	result = append(result, byte(len(inner))) // length
 	result = append(result, inner...)
 	return result
 }
@@ -316,8 +316,8 @@ func intToASN1(n *big.Int) []byte {
 		b = append([]byte{0x00}, b...)
 	}
 	result := make([]byte, 0, 2+len(b))
-	result = append(result, 0x02)          // INTEGER tag
-	result = append(result, byte(len(b)))  // length
+	result = append(result, 0x02)         // INTEGER tag
+	result = append(result, byte(len(b))) // length
 	result = append(result, b...)
 	return result
 }

@@ -9,11 +9,11 @@ type CSIDRequest struct {
 
 // CSIDResponse is the response from Compliance/Production CSID API.
 type CSIDResponse struct {
-	RequestID              json.Number `json:"requestID"`
-	DispositionMessage     string      `json:"dispositionMessage"`
-	BinarySecurityToken    string      `json:"binarySecurityToken"`
-	Secret                 string      `json:"secret"`
-	Errors                 []ErrorDetail `json:"errors,omitempty"`
+	RequestID           json.Number   `json:"requestID"`
+	DispositionMessage  string        `json:"dispositionMessage"`
+	BinarySecurityToken string        `json:"binarySecurityToken"`
+	Secret              string        `json:"secret"`
+	Errors              []ErrorDetail `json:"errors,omitempty"`
 }
 
 // ProductionCSIDRequest is the request for Production CSID onboarding.
@@ -30,12 +30,12 @@ type InvoiceRequest struct {
 
 // InvoiceResponse is the response from Reporting/Clearance/Compliance APIs.
 type InvoiceResponse struct {
-	InvoiceHash     string              `json:"invoiceHash,omitempty"`
-	Status          string              `json:"status,omitempty"`
-	ClearedInvoice  string              `json:"clearedInvoice,omitempty"` // base64 XML returned by clearance
+	InvoiceHash       string             `json:"invoiceHash,omitempty"`
+	Status            string             `json:"status,omitempty"`
+	ClearedInvoice    string             `json:"clearedInvoice,omitempty"` // base64 XML returned by clearance
 	ValidationResults *ValidationResults `json:"validationResults,omitempty"`
-	Warnings        []ErrorDetail       `json:"warnings,omitempty"`
-	Errors          []ErrorDetail       `json:"errors,omitempty"`
+	Warnings          []ErrorDetail      `json:"warnings,omitempty"`
+	Errors            []ErrorDetail      `json:"errors,omitempty"`
 }
 
 // ValidationResults contains the detailed validation output.
@@ -48,11 +48,11 @@ type ValidationResults struct {
 
 // ValidationMessage represents a single validation result.
 type ValidationMessage struct {
-	Type       string `json:"type,omitempty"`
-	Code       string `json:"code,omitempty"`
-	Category   string `json:"category,omitempty"`
-	Message    string `json:"message,omitempty"`
-	Status     string `json:"status,omitempty"`
+	Type     string `json:"type,omitempty"`
+	Code     string `json:"code,omitempty"`
+	Category string `json:"category,omitempty"`
+	Message  string `json:"message,omitempty"`
+	Status   string `json:"status,omitempty"`
 }
 
 // ErrorDetail represents an API error.

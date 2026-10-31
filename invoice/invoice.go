@@ -26,10 +26,10 @@ const (
 type TaxCategory string
 
 const (
-	TaxStandard TaxCategory = "S"  // Standard rated (15% or 5%)
-	TaxZero     TaxCategory = "Z"  // Zero rated
-	TaxExempt   TaxCategory = "E"  // Exempt
-	TaxOutScope TaxCategory = "O"  // Out of scope
+	TaxStandard TaxCategory = "S" // Standard rated (15% or 5%)
+	TaxZero     TaxCategory = "Z" // Zero rated
+	TaxExempt   TaxCategory = "E" // Exempt
+	TaxOutScope TaxCategory = "O" // Out of scope
 )
 
 // PaymentMeans codes.
@@ -44,15 +44,15 @@ const (
 type Party struct {
 	RegistrationName   string
 	RegistrationNameAR string
-	VAT                string  // 15-digit VAT number
-	SchemeID           string  // CRN, MOM, MLS, SAG, OTH, etc.
-	ID                 string  // registration number value
+	VAT                string // 15-digit VAT number
+	SchemeID           string // CRN, MOM, MLS, SAG, OTH, etc.
+	ID                 string // registration number value
 	Street             string
 	Building           string
 	District           string
 	City               string
 	PostalCode         string
-	Country            string  // ISO 3166-1 alpha-2 (SA)
+	Country            string // ISO 3166-1 alpha-2 (SA)
 }
 
 // LineItem represents a single invoice line.
@@ -60,7 +60,7 @@ type LineItem struct {
 	ID          string
 	Name        string
 	Quantity    float64
-	UnitCode    string  // PCE, EA, etc.
+	UnitCode    string // PCE, EA, etc.
 	UnitPrice   float64
 	Discount    float64 // line-level discount
 	TaxCategory TaxCategory
@@ -85,8 +85,8 @@ func (l *LineItem) TotalWithTax() float64 {
 // Invoice holds all data needed to generate a UBL 2.1 XML invoice.
 type Invoice struct {
 	// Metadata
-	ID        string    // Invoice number (e.g., SME00023)
-	UUID      string    // Unique identifier (UUID v4)
+	ID        string // Invoice number (e.g., SME00023)
+	UUID      string // Unique identifier (UUID v4)
 	IssueDate time.Time
 	IssueTime time.Time // only time part used
 
@@ -117,8 +117,8 @@ type Invoice struct {
 	BillingReferenceID string
 
 	// Document level discount
-	Discount     float64
-	DiscountTax  TaxCategory
+	Discount           float64
+	DiscountTax        TaxCategory
 	DiscountTaxPercent float64
 
 	// Line items
