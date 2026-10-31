@@ -47,6 +47,14 @@ mysql -h db-host -u root -p -e "CREATE DATABASE IF NOT EXISTS zatca_master CHARA
 goose -dir migrations/zatca_master mysql "root:PASS@tcp(db-host:3306)/zatca_master" up
 ```
 
+The registry you already run was created before goose. Do not run `up` on it first, because the baseline would fail on the existing table. Record the baseline as applied, then run `up`:
+
+```sh
+goose -dir migrations/zatca_master mysql "root:PASS@tcp(db-host:3306)/zatca_master" version
+mysql -h db-host -u root -p zatca_master -e "INSERT INTO goose_db_version (version_id, is_applied) VALUES (1, 1)"
+goose -dir migrations/zatca_master mysql "root:PASS@tcp(db-host:3306)/zatca_master" up
+```
+
 Each tenant has a `tenant_key`. It is set from `db_name` when the row is inserted, unless you set it yourself. It cannot change afterwards. `db_name` stays the routing key: the daemon connects to the database named there.
 
 Register each tenant (one row per client company):
