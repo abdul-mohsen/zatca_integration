@@ -3,10 +3,27 @@ package processor
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 )
 
 const DefaultPIH = "NWZlY2ViNjZmZmM4NmYzOGQ5NTI3ODZjNmQ2OTZjNzljMmRiYzIzOWRkNGU5MWI0NjcyOWQ3M2EyN2ZiNTdlOQ=="
+
+// DocumentChainState is the immutable identity reserved by the canonical EGS
+// stream before a document is built. The first stream document has a nil PIH
+// in the backend contract and uses the ZATCA genesis PIH in its XML.
+type DocumentChainState struct {
+	DocumentUUID        string
+	ICV                 uint64
+	PreviousInvoiceHash *string
+}
+
+func (s DocumentChainState) effectivePIH() string {
+	if s.PreviousInvoiceHash != nil && strings.TrimSpace(*s.PreviousInvoiceHash) != "" {
+		return *s.PreviousInvoiceHash
+	}
+	return DefaultPIH
+}
 
 // ProductRow represents product columns from the bill_product table.
 type ProductRow struct {
