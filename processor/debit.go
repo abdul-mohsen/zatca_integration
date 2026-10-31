@@ -16,7 +16,11 @@ import (
 
 // ProcessDebitNote processes a single debit note row through the full pipeline.
 func ProcessDebitNote(db *sql.DB, svc *zatca.Service, cfg *config.Config, row CreditDebitRow) (string, error) {
-	log.Printf("Processing debit note for bill id=%d seq=%s", row.ID, row.SeqNumber.String)
+	sourceID := row.noteSourceID()
+	log.Printf("Processing debit note source id=%d original bill id=%d seq=%s", sourceID, row.ID, row.SeqNumber.String)
+	if sourceID <= 0 {
+		return "", fmt.Errorf("debit note source id is required")
+	}
 
 	issueTime := time.Now()
 	if row.EffectiveDate.Valid {
@@ -31,13 +35,13 @@ func ProcessDebitNote(db *sql.DB, svc *zatca.Service, cfg *config.Config, row Cr
 	}
 
 	inv := BuildDebitNoteInvoice(cfg, row, products, issueTime)
-	return signSubmitUpdate(db, svc, inv, row.ID, "bill", xmlMeta{
+	return signSubmitUpdate(db, svc, inv, sourceID, "debit_note", xmlMeta{
 		xmlDir:    cfg.XMLDir,
 		tenantID:  cfg.TenantID,
 		companyID: row.CompanyID,
 		branchID:  row.BranchID,
 		billType:  "debit",
-		qrColumn:  "qr_code",
+		qrColumn:  "invoice_qr",
 	})
 }
 
@@ -63,7 +67,11 @@ func ProcessDebitNoteWithChainOutcome(
 	row CreditDebitRow,
 	chainState DocumentChainState,
 ) (string, SubmissionState, error) {
-	log.Printf("Processing ordered debit note for bill id=%d icv=%d", row.ID, chainState.ICV)
+	log.Printf("Processing ordered debit note source id=%d original bill id=%d icv=%d",
+		row.noteSourceID(), row.ID, chainState.ICV)
+	if err := bindCanonicalNoteIdentity(&chainState.Submission, row, "debit"); err != nil {
+		return "", SubmissionTerminal, err
+	}
 
 	issueTime := time.Now()
 	if row.EffectiveDate.Valid {
@@ -76,14 +84,18 @@ func ProcessDebitNoteWithChainOutcome(
 		return "", SubmissionTerminal, fmt.Errorf("load products for bill %d: %w", row.ID, err)
 	}
 
+	sourceID := row.noteSourceID()
+	if sourceID == 0 {
+		return "", SubmissionTerminal, fmt.Errorf("debit note source id is required")
+	}
 	inv := BuildDebitNoteInvoiceWithChain(cfg, row, products, issueTime, chainState)
-	return signSubmitUpdateOutcome(db, svc, inv, row.ID, "bill", xmlMeta{
+	return signSubmitUpdateOutcome(db, svc, inv, sourceID, "debit_note", xmlMeta{
 		xmlDir:     cfg.XMLDir,
 		tenantID:   cfg.TenantID,
 		companyID:  row.CompanyID,
 		branchID:   row.BranchID,
 		billType:   "debit",
-		qrColumn:   "qr_code",
+		qrColumn:   "invoice_qr",
 		submission: chainState.Submission,
 	})
 }
@@ -119,9 +131,14 @@ func BuildDebitNoteInvoiceWithChain(
 	if chainState.ICV == 0 {
 		chainState.ICV = 1
 	}
+	noteID := row.noteSourceID()
+	reason := ""
+	if row.NoteText.Valid {
+		reason = row.NoteText.String
+	}
 
 	inv := &invoice.Invoice{
-		ID:               fmt.Sprintf("INV-DN-%d", row.ID),
+		ID:               fmt.Sprintf("INV-DN-%d", noteID),
 		UUID:             chainState.DocumentUUID,
 		IssueDate:        issueTime,
 		IssueTime:        issueTime,
@@ -151,17 +168,11 @@ func BuildDebitNoteInvoiceWithChain(
 			return invoice.PaymentCash
 		}(),
 		InstructionNote: func() string {
-			if row.NoteText.Valid {
-				return row.NoteText.String
-			}
-			return ""
+			return reason
 		}(),
-		BillingReferenceID: func() string {
-			if row.SeqNumber.Valid {
-				return row.SeqNumber.String
-			}
-			return ""
-		}(),
+		Note:                 reason,
+		BillingReferenceID:   row.originalReferenceID(),
+		BillingReferenceUUID: row.originalReferenceUUID(),
 	}
 
 	if isStandard {

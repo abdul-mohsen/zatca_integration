@@ -53,14 +53,17 @@ var (
 // SubmissionIdentity is the canonical identity shared by the backend outbox,
 // EGS sequence document, and every provider attempt.
 type SubmissionIdentity struct {
-	TenantID      uint64
-	EGSSequenceID string
-	BillRequestID string
-	EventID       string
-	InvoiceUUID   string
-	PosID         string
-	DocumentType  string
-	SourceID      uint64
+	TenantID             uint64
+	EGSSequenceID        string
+	BillRequestID        string
+	EventID              string
+	InvoiceUUID          string
+	PosID                string
+	DocumentType         string
+	SourceID             uint64
+	OriginalDocumentType string
+	OriginalSourceID     uint64
+	OriginalInvoiceUUID  string
 }
 
 func (i SubmissionIdentity) Validate() error {
@@ -81,14 +84,43 @@ func (i SubmissionIdentity) Validate() error {
 		return errors.New("submission document_type is required")
 	case i.SourceID == 0:
 		return errors.New("submission source_id is required")
-	default:
+	}
+	switch i.DocumentType {
+	case "bill":
 		return nil
+	case "credit", "debit":
+		if strings.TrimSpace(i.OriginalDocumentType) == "" {
+			return errors.New("note submission original_document_type is required")
+		}
+		if i.OriginalSourceID == 0 {
+			return errors.New("note submission original_source_id is required")
+		}
+		if strings.TrimSpace(i.OriginalInvoiceUUID) == "" {
+			return errors.New("note submission original_invoice_uuid is required")
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported submission document_type %q", i.DocumentType)
 	}
 }
 
 func (i SubmissionIdentity) key() string {
-	return fmt.Sprintf("%d\x00%s\x00%s\x00%s\x00%s\x00%d",
-		i.TenantID, i.EGSSequenceID, i.BillRequestID, i.InvoiceUUID, i.DocumentType, i.SourceID)
+	return fmt.Sprintf("%d\x00%s\x00%s\x00%s\x00%s\x00%d\x00%s\x00%d\x00%s",
+		i.TenantID, i.EGSSequenceID, i.BillRequestID, i.InvoiceUUID, i.DocumentType, i.SourceID,
+		i.OriginalDocumentType, i.OriginalSourceID, i.OriginalInvoiceUUID)
+}
+
+func sameSubmissionDocumentIdentity(left, right SubmissionIdentity) bool {
+	return left.TenantID == right.TenantID &&
+		left.EGSSequenceID == right.EGSSequenceID &&
+		left.BillRequestID == right.BillRequestID &&
+		left.InvoiceUUID == right.InvoiceUUID &&
+		left.PosID == right.PosID &&
+		left.DocumentType == right.DocumentType &&
+		left.SourceID == right.SourceID &&
+		left.OriginalDocumentType == right.OriginalDocumentType &&
+		left.OriginalSourceID == right.OriginalSourceID &&
+		left.OriginalInvoiceUUID == right.OriginalInvoiceUUID
 }
 
 // SubmissionRequest contains the already-built, signed provider request. A
@@ -286,6 +318,10 @@ func (e *SubmissionEngine) Submit(ctx context.Context, request SubmissionRequest
 		return SubmissionResult{}, fmt.Errorf("load latest submission attempt: %w", err)
 	}
 	if found {
+		if !sameSubmissionDocumentIdentity(request.Identity, latest.Identity) {
+			return SubmissionResult{Attempt: latest, Duplicate: true},
+				fmt.Errorf("%w: canonical document identity changed", ErrSubmissionAttemptExists)
+		}
 		request = requestFromAttempt(request, latest)
 		if latest.successful() {
 			return SubmissionResult{Attempt: latest, Duplicate: true}, nil
@@ -522,6 +558,7 @@ func (e *SubmissionEngine) reconcile(
 }
 
 func requestFromAttempt(request SubmissionRequest, attempt SubmissionAttempt) SubmissionRequest {
+	request.Identity = attempt.Identity
 	request.Standard = attempt.Standard
 	request.SignedRequest = cloneBytes(attempt.SignedRequest)
 	request.ProviderRequest = cloneBytes(attempt.RequestArtifact)
@@ -776,13 +813,16 @@ func (s *SQLSubmissionStore) Latest(ctx context.Context, identity SubmissionIden
 	}
 	var attempt SubmissionAttempt
 	var (
-		posID, documentType, state, retry, signedRequest, requestArtifact                            string
-		responseArtifact, clearedArtifact, invoiceHash, errorMessage                                 sql.NullString
-		attemptID, attemptNumber, sourceID, providerStatus, deadLetter, manualReview, reconciliation sql.NullInt64
-		nextAttempt, createdAt, finalizedAt                                                          sql.NullTime
+		posID, documentType, state, retry, signedRequest, requestArtifact string
+		responseArtifact, clearedArtifact, invoiceHash, errorMessage      sql.NullString
+		originalDocumentType, originalInvoiceUUID                         sql.NullString
+		attemptID, attemptNumber, sourceID, originalSourceID              sql.NullInt64
+		providerStatus, deadLetter, manualReview, reconciliation          sql.NullInt64
+		nextAttempt, createdAt, finalizedAt                               sql.NullTime
 	)
 	err := s.DB.QueryRowContext(ctx, `
 		SELECT id, pos_id, document_type, source_id, attempt_no, reconciliation,
+		       original_document_type, original_source_id, original_invoice_uuid,
 		       signed_request_xml, request_payload, response_payload, cleared_xml,
 		       invoice_hash, state, retry_class, next_attempt_at,
 		       dead_lettered, manual_review_required, provider_http_status,
@@ -790,10 +830,13 @@ func (s *SQLSubmissionStore) Latest(ctx context.Context, identity SubmissionIden
 		FROM zatca_submission_attempt
 		WHERE tenant_id = ? AND egs_sequence_id = ?
 		  AND bill_request_id = ? AND invoice_uuid = ?
+		  AND document_type = ? AND source_id = ?
 		ORDER BY attempt_no DESC, id DESC
 		LIMIT 1
-	`, identity.TenantID, identity.EGSSequenceID, identity.BillRequestID, identity.InvoiceUUID).Scan(
+	`, identity.TenantID, identity.EGSSequenceID, identity.BillRequestID, identity.InvoiceUUID,
+		identity.DocumentType, identity.SourceID).Scan(
 		&attemptID, &posID, &documentType, &sourceID, &attemptNumber, &reconciliation,
+		&originalDocumentType, &originalSourceID, &originalInvoiceUUID,
 		&signedRequest, &requestArtifact, &responseArtifact, &clearedArtifact,
 		&invoiceHash, &state, &retry, &nextAttempt,
 		&deadLetter, &manualReview, &providerStatus, &errorMessage,
@@ -810,6 +853,9 @@ func (s *SQLSubmissionStore) Latest(ctx context.Context, identity SubmissionIden
 	attempt.Identity.PosID = posID
 	attempt.Identity.DocumentType = documentType
 	attempt.Identity.SourceID = uint64(sourceID.Int64)
+	attempt.Identity.OriginalDocumentType = originalDocumentType.String
+	attempt.Identity.OriginalSourceID = uint64(originalSourceID.Int64)
+	attempt.Identity.OriginalInvoiceUUID = originalInvoiceUUID.String
 	attempt.Attempt = int(attemptNumber.Int64)
 	attempt.Reconciliation = reconciliation.Int64 != 0
 	attempt.SignedRequest = []byte(signedRequest)
@@ -862,13 +908,17 @@ func (s *SQLSubmissionStore) Begin(ctx context.Context, attempt SubmissionAttemp
 	result, err := tx.ExecContext(ctx, `
 		INSERT INTO zatca_submission_attempt (
 			tenant_id, egs_sequence_id, bill_request_id, event_id, pos_id,
-			document_type, source_id, invoice_uuid, attempt_no, reconciliation,
+			document_type, source_id, invoice_uuid,
+			original_document_type, original_source_id, original_invoice_uuid,
+			attempt_no, reconciliation,
 			signed_request_xml, request_payload, invoice_hash, state, retry_class,
 			created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, attempt.Identity.TenantID, attempt.Identity.EGSSequenceID, attempt.Identity.BillRequestID,
 		attempt.Identity.EventID, attempt.Identity.PosID, attempt.Identity.DocumentType,
-		attempt.Identity.SourceID, attempt.Identity.InvoiceUUID, attempt.Attempt,
+		attempt.Identity.SourceID, attempt.Identity.InvoiceUUID,
+		nullableString(attempt.Identity.OriginalDocumentType), nullableUint64(attempt.Identity.OriginalSourceID),
+		nullableString(attempt.Identity.OriginalInvoiceUUID), attempt.Attempt,
 		attempt.Reconciliation, string(attempt.SignedRequest), string(attempt.RequestArtifact),
 		attempt.InvoiceHash, string(attempt.State), string(attempt.Retry), attempt.CreatedAt)
 	if err != nil {
@@ -963,10 +1013,14 @@ func upsertSubmissionProjection(ctx context.Context, tx *sql.Tx, attempt Submiss
 	_, err := tx.ExecContext(ctx, `
 		INSERT INTO zatca_submission (
 			tenant_id, document_type, source_id, pos_id, request_id,
-			invoice_uuid, status, rejection_msg, submitted_at, cleared_at,
+			invoice_uuid, original_document_type, original_source_id, original_invoice_uuid,
+			status, rejection_msg, submitted_at, cleared_at,
 			response_xml, retry_count
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON DUPLICATE KEY UPDATE
+			original_document_type = VALUES(original_document_type),
+			original_source_id = VALUES(original_source_id),
+			original_invoice_uuid = VALUES(original_invoice_uuid),
 			status = VALUES(status),
 			rejection_msg = VALUES(rejection_msg),
 			submitted_at = VALUES(submitted_at),
@@ -976,6 +1030,8 @@ func upsertSubmissionProjection(ctx context.Context, tx *sql.Tx, attempt Submiss
 			updated_at = CURRENT_TIMESTAMP
 	`, attempt.Identity.TenantID, attempt.Identity.DocumentType, attempt.Identity.SourceID,
 		attempt.Identity.PosID, attempt.Identity.BillRequestID, attempt.Identity.InvoiceUUID,
+		nullableString(attempt.Identity.OriginalDocumentType), nullableUint64(attempt.Identity.OriginalSourceID),
+		nullableString(attempt.Identity.OriginalInvoiceUUID),
 		status, nullableString(attempt.ErrorMessage), submittedAt, clearedAt,
 		nullableString(string(response)), attempt.Attempt)
 	if err != nil {
@@ -992,6 +1048,13 @@ func parseAttemptID(value string) (int64, error) {
 
 func nullableString(value string) any {
 	if value == "" {
+		return nil
+	}
+	return value
+}
+
+func nullableUint64(value uint64) any {
+	if value == 0 {
 		return nil
 	}
 	return value

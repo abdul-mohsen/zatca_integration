@@ -336,59 +336,71 @@ func processOrderedMessage(
 		ICV:                 reservation.ICV,
 		PreviousInvoiceHash: reservation.PIH,
 		Submission: processor.SubmissionIdentity{
-			TenantID:      msg.TenantID,
-			EGSSequenceID: msg.EGSSequenceID,
-			BillRequestID: msg.BillRequestID,
-			EventID:       msg.EventID,
-			InvoiceUUID:   reservation.DocumentUUID,
-			PosID:         msg.PosID,
-			DocumentType:  string(msg.DocType),
-			SourceID:      uint64(msg.ID),
+			TenantID:             msg.TenantID,
+			EGSSequenceID:        msg.EGSSequenceID,
+			BillRequestID:        msg.RequestIdentity(),
+			EventID:              msg.EventID,
+			InvoiceUUID:          reservation.DocumentUUID,
+			PosID:                msg.PosID,
+			DocumentType:         string(msg.DocType),
+			SourceID:             uint64(msg.ID),
+			OriginalDocumentType: msg.OriginalDocumentType,
+			OriginalSourceID:     msg.OriginalSourceID,
+			OriginalInvoiceUUID:  msg.OriginalInvoiceUUID,
 		},
 	}
-	hash, outcome, err := processMessageWithChain(tenantMap, getService, msg, state)
+	hash, outcome, err := processMessageWithChain(tenantMap, getService, msg, &state)
 	if err != nil {
 		return queue.EGSSequenceCommitRequest{}, err
 	}
 	snapshot, err := json.Marshal(struct {
-		SourceID      uint64  `json:"source_id"`
-		DocumentType  string  `json:"document_type"`
-		TenantID      uint64  `json:"tenant_id"`
-		EGSSequenceID string  `json:"egs_sequence_id"`
-		DocumentUUID  string  `json:"document_uuid"`
-		ICV           uint64  `json:"icv"`
-		PIH           *string `json:"pih"`
-		DocumentHash  string  `json:"document_hash"`
-		OutcomeState  string  `json:"outcome_state"`
-		OutboxEventID string  `json:"outbox_event_id"`
-		PosID         string  `json:"pos_id"`
-		BillRequestID string  `json:"bill_request_id"`
-		RequestHash   string  `json:"request_fingerprint,omitempty"`
+		SourceID             uint64  `json:"source_id"`
+		DocumentType         string  `json:"document_type"`
+		TenantID             uint64  `json:"tenant_id"`
+		EGSSequenceID        string  `json:"egs_sequence_id"`
+		DocumentUUID         string  `json:"document_uuid"`
+		ICV                  uint64  `json:"icv"`
+		PIH                  *string `json:"pih"`
+		DocumentHash         string  `json:"document_hash"`
+		OutcomeState         string  `json:"outcome_state"`
+		OutboxEventID        string  `json:"outbox_event_id"`
+		PosID                string  `json:"pos_id"`
+		BillRequestID        string  `json:"bill_request_id"`
+		OriginalDocumentType string  `json:"original_document_type,omitempty"`
+		OriginalSourceID     uint64  `json:"original_source_id,omitempty"`
+		OriginalInvoiceUUID  string  `json:"original_invoice_uuid,omitempty"`
+		RequestHash          string  `json:"request_fingerprint,omitempty"`
 	}{
-		SourceID:      uint64(msg.ID),
-		DocumentType:  string(msg.DocType),
-		TenantID:      msg.TenantID,
-		EGSSequenceID: msg.EGSSequenceID,
-		DocumentUUID:  reservation.DocumentUUID,
-		ICV:           reservation.ICV,
-		PIH:           reservation.PIH,
-		DocumentHash:  hash,
-		OutcomeState:  string(outcome),
-		OutboxEventID: reservation.OutboxEventID,
-		PosID:         msg.PosID,
-		BillRequestID: msg.BillRequestID,
-		RequestHash:   msg.BusinessFingerprint(),
+		SourceID:             uint64(msg.ID),
+		DocumentType:         string(msg.DocType),
+		TenantID:             msg.TenantID,
+		EGSSequenceID:        msg.EGSSequenceID,
+		DocumentUUID:         reservation.DocumentUUID,
+		ICV:                  reservation.ICV,
+		PIH:                  reservation.PIH,
+		DocumentHash:         hash,
+		OutcomeState:         string(outcome),
+		OutboxEventID:        reservation.OutboxEventID,
+		PosID:                msg.PosID,
+		BillRequestID:        msg.RequestIdentity(),
+		OriginalDocumentType: state.Submission.OriginalDocumentType,
+		OriginalSourceID:     state.Submission.OriginalSourceID,
+		OriginalInvoiceUUID:  state.Submission.OriginalInvoiceUUID,
+		RequestHash:          msg.BusinessFingerprint(),
 	})
 	if err != nil {
 		return queue.EGSSequenceCommitRequest{}, fmt.Errorf("marshal immutable EGS snapshot: %w", err)
 	}
 	return queue.EGSSequenceCommitRequest{
-		Reservation:  reservation,
-		DocumentType: string(msg.DocType),
-		SourceID:     uint64(msg.ID),
-		State:        submissionStateForEGS(outcome),
-		Snapshot:     snapshot,
-		DocumentHash: hash,
+		Reservation:          reservation,
+		DocumentType:         string(msg.DocType),
+		SourceID:             uint64(msg.ID),
+		OriginalDocumentType: state.Submission.OriginalDocumentType,
+		OriginalSourceID:     state.Submission.OriginalSourceID,
+		OriginalInvoiceUUID:  state.Submission.OriginalInvoiceUUID,
+		State:                submissionStateForEGS(outcome),
+		Snapshot:             snapshot,
+		DocumentHash:         hash,
 	}, nil
 }
 
@@ -407,7 +419,7 @@ func processMessageWithChain(
 	tenantMap map[string]*tenantCtx,
 	getService getServiceFunc,
 	msg queue.Message,
-	chainState processor.DocumentChainState,
+	chainState *processor.DocumentChainState,
 ) (string, processor.SubmissionState, error) {
 	tc, ok := tenantMap[msg.DBName]
 	if !ok {
@@ -425,19 +437,25 @@ func processMessageWithChain(
 		if err != nil {
 			return "", processor.SubmissionTerminal, err
 		}
-		return processor.ProcessBillWithChainOutcome(tc.db, svc, branchCfg, *bill, chainState)
+		return processor.ProcessBillWithChainOutcome(tc.db, svc, branchCfg, *bill, *chainState)
 	case queue.DocCredit:
 		row, err := processor.QueryCreditNoteByID(tc.db, msg.ID)
 		if err != nil {
 			return "", processor.SubmissionTerminal, err
 		}
-		return processor.ProcessCreditNoteWithChainOutcome(tc.db, svc, branchCfg, *row, chainState)
+		if err := processor.BindCanonicalNoteIdentity(chainState, *row, "credit"); err != nil {
+			return "", processor.SubmissionTerminal, err
+		}
+		return processor.ProcessCreditNoteWithChainOutcome(tc.db, svc, branchCfg, *row, *chainState)
 	case queue.DocDebit:
 		row, err := processor.QueryDebitNoteByID(tc.db, msg.ID)
 		if err != nil {
 			return "", processor.SubmissionTerminal, err
 		}
-		return processor.ProcessDebitNoteWithChainOutcome(tc.db, svc, branchCfg, *row, chainState)
+		if err := processor.BindCanonicalNoteIdentity(chainState, *row, "debit"); err != nil {
+			return "", processor.SubmissionTerminal, err
+		}
+		return processor.ProcessDebitNoteWithChainOutcome(tc.db, svc, branchCfg, *row, *chainState)
 	default:
 		return "", processor.SubmissionTerminal, fmt.Errorf("unknown ordered doc type: %s", msg.DocType)
 	}
