@@ -2,6 +2,7 @@ package client
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -111,6 +112,33 @@ func (c *Client) RenewProductionCSID(csr string) (*models.CSIDResponse, error) {
 		return nil, fmt.Errorf("RenewProductionCSID: %w", err)
 	}
 	return &resp, nil
+}
+
+// RevokeProductionCSID revokes the active production CSID through the
+// provider boundary. The daemon calls this only after the canonical lifecycle
+// row has entered revocation_state=pending.
+func (c *Client) RevokeProductionCSID(ctx context.Context, certificateSerial, reason string) error {
+	url := c.cfg.BaseURL() + "/production/csids"
+	body := struct {
+		CertificateSerial string `json:"certificate_serial"`
+		Reason            string `json:"reason,omitempty"`
+	}{
+		CertificateSerial: certificateSerial,
+		Reason:            reason,
+	}
+
+	req, err := c.newJSONRequest(http.MethodDelete, url, body)
+	if err != nil {
+		return err
+	}
+	if ctx != nil {
+		req = req.WithContext(ctx)
+	}
+	c.setProductionAuth(req)
+	if err := c.do(req, nil); err != nil {
+		return fmt.Errorf("RevokeProductionCSID: %w", err)
+	}
+	return nil
 }
 
 // --- Reporting API ---

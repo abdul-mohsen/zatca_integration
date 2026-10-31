@@ -1,6 +1,7 @@
 package processor
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -22,6 +23,20 @@ import (
 // values take precedence over any company/store joins so what the user
 // entered is what gets sent to ZATCA.
 func OnboardBranch(db *sql.DB, baseCfg *config.Config, branchID int64, otp string, encKey *secutil.Key) error {
+	stateStore := &SQLOnboardingStateStore{DB: db}
+	return RunTrackedOnboarding(context.Background(), branchID, stateStore, func(progress func(OnboardingState) error) error {
+		return onboardBranch(db, baseCfg, branchID, otp, encKey, progress)
+	})
+}
+
+func onboardBranch(
+	db *sql.DB,
+	baseCfg *config.Config,
+	branchID int64,
+	otp string,
+	encKey *secutil.Key,
+	progress func(OnboardingState) error,
+) error {
 	branch, err := loadOnboardBranch(db, branchID, encKey)
 	if err != nil {
 		return err
@@ -91,9 +106,18 @@ func OnboardBranch(db *sql.DB, baseCfg *config.Config, branchID int64, otp strin
 
 	// Run the rest of onboarding (compliance CSID → 6 invoices → production CSID)
 	// using the already-generated key.
+	if err := progress(OnboardingStateCompliance); err != nil {
+		return err
+	}
+	if err := progress(OnboardingStateInvoices); err != nil {
+		return err
+	}
 	result, err := svc.OnboardWithCSR(csrPEM, privateKey)
 	if err != nil {
 		return fmt.Errorf("onboarding failed: %w", err)
+	}
+	if err := progress(OnboardingStateProduction); err != nil {
+		return err
 	}
 
 	log.Printf("Branch %d: Onboarding succeeded! Saving credentials...", branchID)

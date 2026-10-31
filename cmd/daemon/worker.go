@@ -54,7 +54,7 @@ func markBranchActive(dbName string, branchID int64) bool {
 	return true
 }
 
-type getServiceFunc func(dbName string, branchID int64) (*zatca.Service, *config.Config, error)
+type getServiceFunc func(dbName string, branchID int64, egsSequenceID string) (*zatca.Service, *config.Config, error)
 
 // runWorker subscribes to one combined bill/credit/debit stream. The stream
 // is partitioned by canonical tenant_id + egs_sequence_id by OrderedStream.
@@ -302,7 +302,7 @@ func pullAndProcessOrdered(
 }
 
 func enrichOrderedIdentity(getService getServiceFunc, msg queue.Message) (queue.Message, error) {
-	_, branchCfg, err := getService(msg.DBName, msg.BranchID)
+	_, branchCfg, err := getService(msg.DBName, msg.BranchID, msg.EGSSequenceID)
 	if err != nil {
 		return queue.Message{}, err
 	}
@@ -426,7 +426,7 @@ func processMessageWithChain(
 		return "", processor.SubmissionTerminal, fmt.Errorf("unknown tenant db: %s (known tenants: %v)", msg.DBName, tenantKeys(tenantMap))
 	}
 
-	svc, branchCfg, err := getService(msg.DBName, msg.BranchID)
+	svc, branchCfg, err := getService(msg.DBName, msg.BranchID, msg.EGSSequenceID)
 	if err != nil {
 		return "", processor.SubmissionTerminal, fmt.Errorf("get service for branch %d: %w", msg.BranchID, err)
 	}
@@ -518,7 +518,7 @@ func processMessage(
 		return processor.OnboardBranch(db, tc.cfg, msg.BranchID, msg.OTP, tc.encKey)
 	}
 
-	svc, branchCfg, err := getService(msg.DBName, msg.BranchID)
+	svc, branchCfg, err := getService(msg.DBName, msg.BranchID, msg.EGSSequenceID)
 	if err != nil {
 		return fmt.Errorf("get service for branch %d: %w", msg.BranchID, err)
 	}
