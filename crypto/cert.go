@@ -98,7 +98,7 @@ type subjectPublicKeyInfo struct {
 }
 
 type algorithmIdentifier struct {
-	Algorithm asn1.ObjectIdentifier
+	Algorithm  asn1.ObjectIdentifier
 	Parameters asn1.RawValue `asn1:"optional"`
 }
 
