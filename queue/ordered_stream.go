@@ -27,12 +27,16 @@ var (
 const defaultEGSSequenceLease = 5 * time.Minute
 
 const (
-	EGSDocumentQueued    = "queued"
-	EGSDocumentSubmitted = "submitted"
-	EGSDocumentAccepted  = "accepted"
-	EGSDocumentWarning   = "warning"
+	EGSDocumentQueued              = "queued"
+	EGSDocumentSubmitted           = "submitted"
+	EGSDocumentAccepted            = "accepted"
+	EGSDocumentAcceptedWithWarning = "accepted_with_warning"
+	// EGSDocumentWarning is retained as a source-compatible alias. New
+	// records use the explicit accepted_with_warning state.
+	EGSDocumentWarning   = EGSDocumentAcceptedWithWarning
 	EGSDocumentRejected  = "rejected"
 	EGSDocumentAmbiguous = "ambiguous"
+	EGSDocumentTerminal  = "terminal"
 )
 
 // EGSSequenceIdentity is the canonical owner of one ordered invoice hash
@@ -356,7 +360,8 @@ func validateEGSCommitRequest(request EGSSequenceCommitRequest) error {
 	if request.State != "" {
 		switch request.State {
 		case EGSDocumentQueued, EGSDocumentSubmitted, EGSDocumentAccepted,
-			EGSDocumentWarning, EGSDocumentRejected, EGSDocumentAmbiguous:
+			EGSDocumentAcceptedWithWarning, EGSDocumentRejected,
+			EGSDocumentAmbiguous, EGSDocumentTerminal:
 		default:
 			return fmt.Errorf("invalid EGS document state %q", request.State)
 		}

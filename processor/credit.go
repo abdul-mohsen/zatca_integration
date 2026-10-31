@@ -51,6 +51,19 @@ func ProcessCreditNoteWithChain(
 	row CreditDebitRow,
 	chainState DocumentChainState,
 ) (string, error) {
+	hash, _, err := ProcessCreditNoteWithChainOutcome(db, svc, cfg, row, chainState)
+	return hash, err
+}
+
+// ProcessCreditNoteWithChainOutcome returns the provider outcome alongside the
+// hash used by the canonical EGS sequence commit.
+func ProcessCreditNoteWithChainOutcome(
+	db *sql.DB,
+	svc *zatca.Service,
+	cfg *config.Config,
+	row CreditDebitRow,
+	chainState DocumentChainState,
+) (string, SubmissionState, error) {
 	log.Printf("Processing ordered credit note for bill id=%d icv=%d", row.ID, chainState.ICV)
 
 	issueTime := time.Now()
@@ -61,18 +74,19 @@ func ProcessCreditNoteWithChain(
 	}
 	products, err := LoadProducts(db, row.ID)
 	if err != nil {
-		return "", fmt.Errorf("load products for bill %d: %w", row.ID, err)
+		return "", SubmissionTerminal, fmt.Errorf("load products for bill %d: %w", row.ID, err)
 	}
 
 	creditNoteID := row.NoteID.Int64
 	inv := BuildCreditNoteInvoiceWithChain(cfg, row, products, issueTime, chainState)
-	return signSubmitUpdate(db, svc, inv, creditNoteID, "credit_note", xmlMeta{
-		xmlDir:    cfg.XMLDir,
-		tenantID:  cfg.TenantID,
-		companyID: row.CompanyID,
-		branchID:  row.BranchID,
-		billType:  "credit",
-		qrColumn:  "invoice_qr",
+	return signSubmitUpdateOutcome(db, svc, inv, creditNoteID, "credit_note", xmlMeta{
+		xmlDir:     cfg.XMLDir,
+		tenantID:   cfg.TenantID,
+		companyID:  row.CompanyID,
+		branchID:   row.BranchID,
+		billType:   "credit",
+		qrColumn:   "invoice_qr",
+		submission: chainState.Submission,
 	})
 }
 

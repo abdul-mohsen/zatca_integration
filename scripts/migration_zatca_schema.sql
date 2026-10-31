@@ -100,3 +100,70 @@ CREATE TABLE IF NOT EXISTS `zatca_consumer_claim` (
     UNIQUE KEY `uq_zatca_claim_event` (`tenant_id`, `event_id`),
     KEY `idx_zatca_claim_lease` (`state`, `lease_expires_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 7. Provider submission attempts ------------------------------------------
+-- The attempt table is append-only audit data. Request/response/cleared
+-- artifacts are retained per attempt so an uncertain provider result can be
+-- reconciled without rebuilding the invoice from mutable business rows.
+CREATE TABLE IF NOT EXISTS `zatca_submission` (
+    `id`                    BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    `tenant_id`             BIGINT UNSIGNED NOT NULL,
+    `document_type`         VARCHAR(32)     NOT NULL,
+    `source_id`             BIGINT UNSIGNED NOT NULL,
+    `pos_id`                VARCHAR(64)     NOT NULL,
+    `request_id`            VARCHAR(128)    NOT NULL,
+    `invoice_uuid`          CHAR(36)        NOT NULL,
+    `status`                TINYINT         NOT NULL DEFAULT 0
+        COMMENT '0=pending,1=submitted,2=accepted,3=rejected,4=accepted_with_warning',
+    `rejection_msg`         VARCHAR(512)    DEFAULT NULL,
+    `submitted_at`          DATETIME        DEFAULT NULL,
+    `cleared_at`            DATETIME        DEFAULT NULL,
+    `response_xml`           MEDIUMTEXT      DEFAULT NULL,
+    `retry_count`           INT             NOT NULL DEFAULT 0,
+    `created_at`             DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `updated_at`             DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP
+        ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uq_zatca_submission_document`
+        (`tenant_id`, `document_type`, `source_id`),
+    UNIQUE KEY `uq_zatca_submission_request`
+        (`tenant_id`, `pos_id`, `request_id`),
+    UNIQUE KEY `uq_zatca_submission_invoice`
+        (`tenant_id`, `invoice_uuid`),
+    KEY `idx_zatca_submission_status` (`status`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `zatca_submission_attempt` (
+    `id`                    BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    `tenant_id`             BIGINT UNSIGNED NOT NULL,
+    `egs_sequence_id`       VARCHAR(128)    NOT NULL,
+    `bill_request_id`       VARCHAR(128)    NOT NULL,
+    `event_id`              VARCHAR(128)    NOT NULL,
+    `pos_id`                VARCHAR(64)     NOT NULL,
+    `document_type`         VARCHAR(32)     NOT NULL,
+    `source_id`             BIGINT UNSIGNED NOT NULL,
+    `invoice_uuid`          CHAR(36)        NOT NULL,
+    `attempt_no`            INT UNSIGNED    NOT NULL,
+    `reconciliation`        TINYINT(1)      NOT NULL DEFAULT 0,
+    `signed_request_xml`    MEDIUMTEXT      NOT NULL,
+    `request_payload`       MEDIUMTEXT      NOT NULL,
+    `response_payload`      MEDIUMTEXT      DEFAULT NULL,
+    `cleared_xml`           MEDIUMTEXT      DEFAULT NULL,
+    `invoice_hash`          VARCHAR(128)    DEFAULT NULL,
+    `state`                 VARCHAR(32)     NOT NULL DEFAULT 'pending',
+    `retry_class`           VARCHAR(32)     NOT NULL DEFAULT 'none',
+    `next_attempt_at`       DATETIME        DEFAULT NULL,
+    `dead_lettered`         TINYINT(1)      NOT NULL DEFAULT 0,
+    `manual_review_required` TINYINT(1)     NOT NULL DEFAULT 0,
+    `provider_http_status`  SMALLINT        DEFAULT NULL,
+    `error_message`         TEXT            DEFAULT NULL,
+    `finalized_at`          DATETIME        DEFAULT NULL,
+    `created_at`            DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uq_zatca_attempt_event_no`
+        (`tenant_id`, `event_id`, `attempt_no`),
+    KEY `idx_zatca_attempt_latest`
+        (`tenant_id`, `egs_sequence_id`, `bill_request_id`, `invoice_uuid`, `attempt_no`),
+    KEY `idx_zatca_attempt_retry`
+        (`state`, `next_attempt_at`, `dead_lettered`, `manual_review_required`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

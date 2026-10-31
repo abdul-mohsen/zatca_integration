@@ -347,7 +347,7 @@ func (s *SQLSequenceStore) Commit(ctx context.Context, request EGSSequenceCommit
 		      AND d.document_uuid = s.reserved_document_uuid
 		      AND d.outbox_event_id = s.reserved_outbox_event_id
 		      AND d.icv = s.reserved_icv
-		      AND d.state NOT IN ('rejected', 'ambiguous')
+		      AND d.state NOT IN ('rejected', 'ambiguous', 'terminal')
 		  )
 	`, request.DocumentHash, request.Reservation.EGSSequenceID, request.Reservation.TenantID,
 		request.Reservation.BranchID, request.Reservation.VATNumber, request.Reservation.EGSID,
