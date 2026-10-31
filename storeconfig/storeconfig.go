@@ -107,6 +107,7 @@ func (bz *BranchZATCA) IsRegistered() bool {
 func (bz *BranchZATCA) ToConfig(base *config.Config) *config.Config {
 	return &config.Config{
 		Env:                base.Env,
+		Endpoint:           base.Endpoint,
 		OTP:                base.OTP,
 		XMLDir:             base.XMLDir,
 		TenantID:           base.TenantID,

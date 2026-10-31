@@ -12,13 +12,14 @@ import (
 type OnboardingState string
 
 const (
-	OnboardingStateNotStarted OnboardingState = "not_started"
-	OnboardingStateCSR        OnboardingState = "csr"
-	OnboardingStateCompliance OnboardingState = "compliance"
-	OnboardingStateInvoices   OnboardingState = "invoices"
-	OnboardingStateProduction OnboardingState = "production"
-	OnboardingStateDone       OnboardingState = "done"
-	OnboardingStateFailed     OnboardingState = "failed"
+	OnboardingStateNotStarted        OnboardingState = "not_started"
+	OnboardingStateCSR               OnboardingState = "csr"
+	OnboardingStateCompliance        OnboardingState = "compliance"
+	OnboardingStateInvoices          OnboardingState = "invoices"
+	OnboardingStateProduction        OnboardingState = "production"
+	OnboardingStateDone              OnboardingState = "done"
+	OnboardingStateFailed            OnboardingState = "failed"
+	OnboardingStateCredentialFailure OnboardingState = "credential_failure"
 )
 
 type OnboardingStateStore interface {
@@ -81,7 +82,8 @@ func validOnboardingState(state OnboardingState) bool {
 		OnboardingStateInvoices,
 		OnboardingStateProduction,
 		OnboardingStateDone,
-		OnboardingStateFailed:
+		OnboardingStateFailed,
+		OnboardingStateCredentialFailure:
 		return true
 	default:
 		return false

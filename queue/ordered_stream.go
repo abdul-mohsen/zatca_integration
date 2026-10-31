@@ -125,13 +125,19 @@ type EGSSequenceStore interface {
 // the effect succeeds.
 type OrderedEffect func(context.Context, Message, EGSSequenceReservation) (EGSSequenceCommitRequest, error)
 
+// OrderedPreflight validates a delivery after it is claimed but before the
+// EGS sequence store can reserve the next ICV. It may attach a validated,
+// immutable service snapshot to the context passed to OrderedEffect.
+type OrderedPreflight func(context.Context, Message) (context.Context, error)
+
 // OrderedStream serializes all document types in one canonical
 // (tenant_id, egs_sequence_id) partition while allowing different EGS
 // partitions to make progress concurrently.
 type OrderedStream struct {
-	claims EGSSequenceStoreClaims
-	chain  EGSSequenceStore
-	effect OrderedEffect
+	claims    EGSSequenceStoreClaims
+	chain     EGSSequenceStore
+	effect    OrderedEffect
+	preflight OrderedPreflight
 
 	mu        sync.Mutex
 	partition map[string]*sync.Mutex
@@ -147,10 +153,22 @@ type EGSSequenceStoreClaims interface {
 
 // NewOrderedStream creates a combined bill/credit/debit consumer.
 func NewOrderedStream(claims EGSSequenceStoreClaims, chain EGSSequenceStore, effect OrderedEffect) *OrderedStream {
+	return NewOrderedStreamWithPreflight(claims, chain, nil, effect)
+}
+
+// NewOrderedStreamWithPreflight creates an ordered stream with an explicit
+// credential/runtime gate before sequence reservation.
+func NewOrderedStreamWithPreflight(
+	claims EGSSequenceStoreClaims,
+	chain EGSSequenceStore,
+	preflight OrderedPreflight,
+	effect OrderedEffect,
+) *OrderedStream {
 	return &OrderedStream{
 		claims:    claims,
 		chain:     chain,
 		effect:    effect,
+		preflight: preflight,
 		partition: make(map[string]*sync.Mutex),
 	}
 }
@@ -227,7 +245,18 @@ func (s *OrderedStream) HandleMessage(
 		return fmt.Errorf("unknown queue claim decision %d", decision)
 	}
 
-	reservation, err := s.chain.Reserve(ctx, reservationRequestForMessage(msg))
+	preflightCtx := ctx
+	if s.preflight != nil {
+		preflightCtx, err = s.preflight(ctx, msg)
+		if err != nil {
+			return err
+		}
+		if preflightCtx == nil {
+			return errors.New("ordered stream preflight returned nil context")
+		}
+	}
+
+	reservation, err := s.chain.Reserve(preflightCtx, reservationRequestForMessage(msg))
 	if err != nil {
 		return err
 	}
@@ -235,7 +264,7 @@ func (s *OrderedStream) HandleMessage(
 	// A completed chain commit can be observed after a crash between Commit
 	// and ClaimStore.Complete. Do not invoke the provider effect a second time.
 	if !reservation.Committed {
-		commit, effectErr := s.effect(ctx, msg, reservation)
+		commit, effectErr := s.effect(preflightCtx, msg, reservation)
 		if effectErr != nil {
 			return effectErr
 		}
@@ -247,7 +276,7 @@ func (s *OrderedStream) HandleMessage(
 		}
 	}
 
-	if err := s.claims.Complete(ctx, msg); err != nil {
+	if err := s.claims.Complete(preflightCtx, msg); err != nil {
 		return fmt.Errorf("complete ordered stream claim: %w", err)
 	}
 	return ack()

@@ -1,6 +1,9 @@
 package config
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // Environment represents a ZATCA API environment.
 type Environment string
@@ -55,6 +58,7 @@ type SellerInfo struct {
 // Config holds all configuration values.
 type Config struct {
 	Env                Environment
+	Endpoint           string // optional explicit ZATCA endpoint; empty uses the environment endpoint
 	OTP                string
 	ComplianceUsername string
 	CompliancePassword string
@@ -68,6 +72,9 @@ type Config struct {
 
 // BaseURL returns the base URL for the configured environment.
 func (c *Config) BaseURL() string {
+	if c != nil && strings.TrimSpace(c.Endpoint) != "" {
+		return strings.TrimRight(strings.TrimSpace(c.Endpoint), "/")
+	}
 	return c.Env.BaseURL()
 }
 
