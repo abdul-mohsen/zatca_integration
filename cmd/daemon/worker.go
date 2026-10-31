@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -27,6 +29,7 @@ type tenantCtx struct {
 	adminDB *sql.DB // admin: also has INSERT/UPDATE on branch_zatca_config
 	cfg     *config.Config
 	encKey  *secutil.Key
+	claims  queue.ClaimStore
 }
 
 // activeBranches tracks which branches already have doc workers running.
@@ -230,31 +233,64 @@ func pullAndProcess(
 		for _, msg := range msgs {
 			log.Printf("Received message on %s: %s", subject, string(msg.Data))
 
-			var qmsg queue.Message
-			if err := json.Unmarshal(msg.Data, &qmsg); err != nil {
+			qmsg, err := queue.DecodeEnvelope(msg.Data)
+			if err != nil {
 				log.Printf("ERROR: unmarshal %s: %v", subject, err)
-				msg.Ack()
+				continue
+			}
+			if qmsg.Subject() != subject {
+				log.Printf("ERROR: queue envelope subject mismatch: got %s, expected %s", qmsg.Subject(), subject)
 				continue
 			}
 
-			if err := processWithRetry(tenantMap, getService, qmsg); err != nil {
-				log.Printf("ERROR: %s id=%d FAILED after %d retries: %v", subject, qmsg.ID, maxRetries, err)
-				// Send alert email
-				tc, ok := tenantMap[qmsg.DBName]
-				if ok && tc.tenant.AlertEmail != "" {
-					sendAlert(tc.tenant.AlertEmail, qmsg, err)
-				}
-				// Ack to move on — the row stays in DB with state < 3 for manual handling
-				msg.Ack()
+			tc, ok := tenantMap[qmsg.DBName]
+			if !ok {
+				log.Printf("ERROR: %s tenant %s is not loaded", subject, qmsg.DBName)
+				continue
+			}
+			if qmsg.TenantID != uint64(tc.tenant.ID) {
+				log.Printf("ERROR: %s tenant identity mismatch: envelope=%d registry=%d",
+					subject, qmsg.TenantID, tc.tenant.ID)
+				continue
+			}
+			if tc.claims == nil {
+				log.Printf("ERROR: %s tenant %s has no queue claim store", subject, qmsg.DBName)
 				continue
 			}
 
-			// Notify success callback (e.g., spawn doc workers after onboard)
-			for _, fn := range onSuccess {
-				fn(qmsg)
+			err = queue.HandleMessage(
+				context.Background(),
+				qmsg,
+				tc.claims,
+				func(claimed queue.Message) error {
+					if err := processWithRetry(tenantMap, getService, claimed); err != nil {
+						return err
+					}
+					// Notify success callbacks only after the business effect
+					// has completed and before the final ACK.
+					for _, fn := range onSuccess {
+						fn(claimed)
+					}
+					return nil
+				},
+				func() error { return msg.Ack() },
+			)
+			if err == nil {
+				continue
+			}
+			if errors.Is(err, queue.ErrFingerprintConflict) {
+				log.Printf("ERROR: %s id=%d rejected: %v", subject, qmsg.ID, err)
+				continue
+			}
+			if errors.Is(err, queue.ErrClaimInFlight) {
+				log.Printf("Queue delivery still in flight: %s id=%d", subject, qmsg.ID)
+				continue
 			}
 
-			msg.Ack()
+			log.Printf("ERROR: %s id=%d FAILED without ACK: %v", subject, qmsg.ID, err)
+			if tc.tenant.AlertEmail != "" {
+				sendAlert(tc.tenant.AlertEmail, qmsg, err)
+			}
 		}
 	}
 }
