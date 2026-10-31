@@ -268,6 +268,7 @@ func canonicalTestMessage(tenantID uint64, posID, requestID, eventID, egsID, fin
 		BillRequestID:      requestID,
 		EventID:            eventID,
 		EGSSequenceID:      egsID,
+		InvoiceUUID:        "invoice-" + requestID,
 		RequestFingerprint: fingerprint,
 	}
 }

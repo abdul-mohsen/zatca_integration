@@ -41,14 +41,74 @@ func ProcessDebitNote(db *sql.DB, svc *zatca.Service, cfg *config.Config, row Cr
 	})
 }
 
+// ProcessDebitNoteWithChain is the ordered-stream variant. It uses the
+// reservation supplied by the combined EGS worker.
+func ProcessDebitNoteWithChain(
+	db *sql.DB,
+	svc *zatca.Service,
+	cfg *config.Config,
+	row CreditDebitRow,
+	chainState DocumentChainState,
+) (string, error) {
+	log.Printf("Processing ordered debit note for bill id=%d icv=%d", row.ID, chainState.ICV)
+
+	issueTime := time.Now()
+	if row.EffectiveDate.Valid {
+		if t, err := ParseFlexible(row.EffectiveDate.String); err == nil {
+			issueTime = t
+		}
+	}
+	products, err := LoadProducts(db, row.ID)
+	if err != nil {
+		return "", fmt.Errorf("load products for bill %d: %w", row.ID, err)
+	}
+
+	inv := BuildDebitNoteInvoiceWithChain(cfg, row, products, issueTime, chainState)
+	return signSubmitUpdate(db, svc, inv, row.ID, "bill", xmlMeta{
+		xmlDir:    cfg.XMLDir,
+		tenantID:  cfg.TenantID,
+		companyID: row.CompanyID,
+		branchID:  row.BranchID,
+		billType:  "debit",
+		qrColumn:  "qr_code",
+	})
+}
+
 // BuildDebitNoteInvoice constructs an Invoice (type 383) from a CreditDebitRow.
 func BuildDebitNoteInvoice(cfg *config.Config, row CreditDebitRow, products []ProductRow, issueTime time.Time) *invoice.Invoice {
+	chainState := DocumentChainState{
+		DocumentUUID: uuid.New().String(),
+		ICV:          1,
+	}
+	if row.SeqNumber.Valid {
+		if value, err := strconv.ParseUint(row.SeqNumber.String, 10, 64); err == nil {
+			chainState.ICV = value
+		}
+	}
+	return BuildDebitNoteInvoiceWithChain(cfg, row, products, issueTime, chainState)
+}
+
+// BuildDebitNoteInvoiceWithChain constructs a debit note from one EGS
+// reservation without generating independent chain state.
+func BuildDebitNoteInvoiceWithChain(
+	cfg *config.Config,
+	row CreditDebitRow,
+	products []ProductRow,
+	issueTime time.Time,
+	chainState DocumentChainState,
+) *invoice.Invoice {
 	isStandard := row.BuyerVAT.Valid && row.BuyerVAT.String != ""
 	customer := buildCustomer(row.BillRow, isStandard)
+	if chainState.DocumentUUID == "" {
+		chainState.DocumentUUID = uuid.New().String()
+	}
+	if chainState.ICV == 0 {
+		chainState.ICV = 1
+	}
 
 	inv := &invoice.Invoice{
 		ID:               fmt.Sprintf("INV-DN-%d", row.ID),
-		UUID:             uuid.New().String(),
+		UUID:             chainState.DocumentUUID,
 		IssueDate:        issueTime,
 		IssueTime:        issueTime,
 		TypeCode:         invoice.TypeDebitNote,
@@ -68,8 +128,8 @@ func BuildDebitNoteInvoice(cfg *config.Config, row CreditDebitRow, products []Pr
 			Country:            cfg.Seller.Country,
 		},
 		Customer:            customer,
-		PreviousInvoiceHash: DefaultPIH,
-		InvoiceCounterValue: 1,
+		PreviousInvoiceHash: chainState.effectivePIH(),
+		InvoiceCounterValue: int(chainState.ICV),
 		PaymentMeans: func() string {
 			if row.PaymentMethod.Valid && row.PaymentMethod.String != "" {
 				return row.PaymentMethod.String
@@ -96,7 +156,7 @@ func BuildDebitNoteInvoice(cfg *config.Config, row CreditDebitRow, products []Pr
 		inv.SubType = invoice.SubTypeSimplified
 	}
 
-	if row.SeqNumber.Valid {
+	if chainState.ICV == 0 && row.SeqNumber.Valid {
 		if v, err := strconv.Atoi(row.SeqNumber.String); err == nil {
 			inv.InvoiceCounterValue = v
 		}
