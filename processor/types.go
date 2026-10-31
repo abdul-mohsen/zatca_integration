@@ -16,6 +16,7 @@ type DocumentChainState struct {
 	DocumentUUID        string
 	ICV                 uint64
 	PreviousInvoiceHash *string
+	Submission          SubmissionIdentity
 }
 
 func (s DocumentChainState) effectivePIH() string {

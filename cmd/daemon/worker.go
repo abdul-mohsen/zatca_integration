@@ -335,8 +335,18 @@ func processOrderedMessage(
 		DocumentUUID:        reservation.DocumentUUID,
 		ICV:                 reservation.ICV,
 		PreviousInvoiceHash: reservation.PIH,
+		Submission: processor.SubmissionIdentity{
+			TenantID:      msg.TenantID,
+			EGSSequenceID: msg.EGSSequenceID,
+			BillRequestID: msg.BillRequestID,
+			EventID:       msg.EventID,
+			InvoiceUUID:   reservation.DocumentUUID,
+			PosID:         msg.PosID,
+			DocumentType:  string(msg.DocType),
+			SourceID:      uint64(msg.ID),
+		},
 	}
-	hash, err := processMessageWithChain(tenantMap, getService, msg, state)
+	hash, outcome, err := processMessageWithChain(tenantMap, getService, msg, state)
 	if err != nil {
 		return queue.EGSSequenceCommitRequest{}, err
 	}
@@ -349,6 +359,7 @@ func processOrderedMessage(
 		ICV           uint64  `json:"icv"`
 		PIH           *string `json:"pih"`
 		DocumentHash  string  `json:"document_hash"`
+		OutcomeState  string  `json:"outcome_state"`
 		OutboxEventID string  `json:"outbox_event_id"`
 		PosID         string  `json:"pos_id"`
 		BillRequestID string  `json:"bill_request_id"`
@@ -362,6 +373,7 @@ func processOrderedMessage(
 		ICV:           reservation.ICV,
 		PIH:           reservation.PIH,
 		DocumentHash:  hash,
+		OutcomeState:  string(outcome),
 		OutboxEventID: reservation.OutboxEventID,
 		PosID:         msg.PosID,
 		BillRequestID: msg.BillRequestID,
@@ -374,10 +386,21 @@ func processOrderedMessage(
 		Reservation:  reservation,
 		DocumentType: string(msg.DocType),
 		SourceID:     uint64(msg.ID),
-		State:        queue.EGSDocumentQueued,
+		State:        submissionStateForEGS(outcome),
 		Snapshot:     snapshot,
 		DocumentHash: hash,
 	}, nil
+}
+
+func submissionStateForEGS(outcome processor.SubmissionState) string {
+	switch outcome {
+	case processor.SubmissionAccepted:
+		return queue.EGSDocumentAccepted
+	case processor.SubmissionAcceptedWithWarn:
+		return queue.EGSDocumentAcceptedWithWarning
+	default:
+		return queue.EGSDocumentTerminal
+	}
 }
 
 func processMessageWithChain(
@@ -385,38 +408,38 @@ func processMessageWithChain(
 	getService getServiceFunc,
 	msg queue.Message,
 	chainState processor.DocumentChainState,
-) (string, error) {
+) (string, processor.SubmissionState, error) {
 	tc, ok := tenantMap[msg.DBName]
 	if !ok {
-		return "", fmt.Errorf("unknown tenant db: %s (known tenants: %v)", msg.DBName, tenantKeys(tenantMap))
+		return "", processor.SubmissionTerminal, fmt.Errorf("unknown tenant db: %s (known tenants: %v)", msg.DBName, tenantKeys(tenantMap))
 	}
 
 	svc, branchCfg, err := getService(msg.DBName, msg.BranchID)
 	if err != nil {
-		return "", fmt.Errorf("get service for branch %d: %w", msg.BranchID, err)
+		return "", processor.SubmissionTerminal, fmt.Errorf("get service for branch %d: %w", msg.BranchID, err)
 	}
 
 	switch msg.DocType {
 	case queue.DocBill:
 		bill, err := processor.QueryBillByID(tc.db, msg.ID)
 		if err != nil {
-			return "", err
+			return "", processor.SubmissionTerminal, err
 		}
-		return processor.ProcessBillWithChain(tc.db, svc, branchCfg, *bill, chainState)
+		return processor.ProcessBillWithChainOutcome(tc.db, svc, branchCfg, *bill, chainState)
 	case queue.DocCredit:
 		row, err := processor.QueryCreditNoteByID(tc.db, msg.ID)
 		if err != nil {
-			return "", err
+			return "", processor.SubmissionTerminal, err
 		}
-		return processor.ProcessCreditNoteWithChain(tc.db, svc, branchCfg, *row, chainState)
+		return processor.ProcessCreditNoteWithChainOutcome(tc.db, svc, branchCfg, *row, chainState)
 	case queue.DocDebit:
 		row, err := processor.QueryDebitNoteByID(tc.db, msg.ID)
 		if err != nil {
-			return "", err
+			return "", processor.SubmissionTerminal, err
 		}
-		return processor.ProcessDebitNoteWithChain(tc.db, svc, branchCfg, *row, chainState)
+		return processor.ProcessDebitNoteWithChainOutcome(tc.db, svc, branchCfg, *row, chainState)
 	default:
-		return "", fmt.Errorf("unknown ordered doc type: %s", msg.DocType)
+		return "", processor.SubmissionTerminal, fmt.Errorf("unknown ordered doc type: %s", msg.DocType)
 	}
 }
 
@@ -440,6 +463,13 @@ func processWithRetry(
 		err := processMessage(tenantMap, getService, msg)
 		if err == nil {
 			return nil
+		}
+		var outcomeErr *processor.SubmissionOutcomeError
+		if errors.As(err, &outcomeErr) {
+			// Provider outcomes are durably classified by the submission
+			// engine. Retrying here would bypass reconciliation/backoff and
+			// could submit an accepted invoice a second time.
+			return err
 		}
 		lastErr = err
 		log.Printf("  Attempt %d failed for %s id=%d: %v", attempt+1, msg.DocType, msg.ID, err)

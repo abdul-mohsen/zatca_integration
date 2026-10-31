@@ -1,8 +1,10 @@
 package processor
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -52,25 +54,39 @@ func ProcessBillWithChain(
 	b BillRow,
 	chainState DocumentChainState,
 ) (string, error) {
+	hash, _, err := ProcessBillWithChainOutcome(db, svc, cfg, b, chainState)
+	return hash, err
+}
+
+// ProcessBillWithChainOutcome is the ordered-stream variant with the durable
+// provider outcome returned to the EGS sequence commit.
+func ProcessBillWithChainOutcome(
+	db *sql.DB,
+	svc *zatca.Service,
+	cfg *config.Config,
+	b BillRow,
+	chainState DocumentChainState,
+) (string, SubmissionState, error) {
 	log.Printf("Processing ordered bill id=%d icv=%d", b.ID, chainState.ICV)
 
 	issueTime, err := ParseDates(b.EffectiveDate, b.PaymentDue, b.ID)
 	if err != nil {
-		return "", err
+		return "", SubmissionTerminal, err
 	}
 	products, err := LoadProducts(db, b.ID)
 	if err != nil {
-		return "", fmt.Errorf("load products failed for bill %d: %w", b.ID, err)
+		return "", SubmissionTerminal, fmt.Errorf("load products failed for bill %d: %w", b.ID, err)
 	}
 
 	inv := BuildBillInvoiceWithChain(cfg, b, products, issueTime, chainState)
-	return signSubmitUpdate(db, svc, inv, b.ID, "bill", xmlMeta{
-		xmlDir:    cfg.XMLDir,
-		tenantID:  cfg.TenantID,
-		companyID: b.CompanyID,
-		branchID:  b.BranchID,
-		billType:  "invoice",
-		qrColumn:  "qr_code",
+	return signSubmitUpdateOutcome(db, svc, inv, b.ID, "bill", xmlMeta{
+		xmlDir:     cfg.XMLDir,
+		tenantID:   cfg.TenantID,
+		companyID:  b.CompanyID,
+		branchID:   b.BranchID,
+		billType:   "invoice",
+		qrColumn:   "qr_code",
+		submission: chainState.Submission,
 	})
 }
 
@@ -156,24 +172,69 @@ func BuildBillInvoiceWithChain(
 
 // xmlMeta holds the filesystem path components for saving signed XML.
 type xmlMeta struct {
-	xmlDir    string // base directory (e.g. /data/zatca-xml)
-	tenantID  string // tenant identifier (db_name) - prevents cross-tenant collisions
-	companyID int64
-	branchID  int64
-	billType  string // "invoice", "credit", "debit"
-	qrColumn  string // DB column name for QR code ("qr_code" for bill, "invoice_qr" for credit_note)
+	xmlDir     string // base directory (e.g. /data/zatca-xml)
+	tenantID   string // tenant identifier (db_name) - prevents cross-tenant collisions
+	companyID  int64
+	branchID   int64
+	billType   string // "invoice", "credit", "debit"
+	qrColumn   string // DB column name for QR code ("qr_code" for bill, "invoice_qr" for credit_note)
+	submission SubmissionIdentity
 }
 
 // signSubmitUpdate is the shared sign → submit → QR → save XML → UPDATE pipeline used by all doc types.
 func signSubmitUpdate(db *sql.DB, svc *zatca.Service, inv *invoice.Invoice, rowID int64, table string, meta xmlMeta) (string, error) {
+	hash, _, err := signSubmitUpdateOutcome(db, svc, inv, rowID, table, meta)
+	return hash, err
+}
+
+func signSubmitUpdateOutcome(
+	db *sql.DB,
+	svc *zatca.Service,
+	inv *invoice.Invoice,
+	rowID int64,
+	table string,
+	meta xmlMeta,
+) (string, SubmissionState, error) {
+	if err := meta.submission.Validate(); err != nil {
+		return "", SubmissionTerminal, fmt.Errorf("provider submission requires canonical identity: %w", err)
+	}
+
+	ctx := context.Background()
+	store := NewSQLSubmissionStore(db)
+	latest, found, err := store.Latest(ctx, meta.submission)
+	if err != nil {
+		return "", SubmissionTerminal, fmt.Errorf("load provider submission state: %w", err)
+	}
+	engine := NewSubmissionEngine(newServiceSubmissionProvider(svc), store)
+	if found {
+		request := SubmissionRequest{
+			Identity:        meta.submission,
+			Standard:        inv.IsStandard(),
+			SignedRequest:   latest.SignedRequest,
+			ProviderRequest: latest.RequestArtifact,
+			InvoiceHash:     latest.InvoiceHash,
+		}
+		result, submitErr := engine.Submit(ctx, request)
+		if submitErr != nil {
+			return "", result.Attempt.State, submitErr
+		}
+		if !result.Attempt.successful() {
+			return "", result.Attempt.State, result.Attempt.outcomeError()
+		}
+		if err := applyAcceptedProjection(db, svc, result.Attempt, rowID, table, meta); err != nil {
+			return "", result.Attempt.State, err
+		}
+		return result.Attempt.InvoiceHash, result.Attempt.State, nil
+	}
+
 	xmlStr, err := inv.ToXML()
 	if err != nil {
-		return "", fmt.Errorf("ToXML failed: %w", err)
+		return "", SubmissionTerminal, fmt.Errorf("ToXML failed: %w", err)
 	}
 
 	signedXML, hash, err := svc.SDK.SignInvoice(xmlStr)
 	if err != nil {
-		return "", fmt.Errorf("SignInvoice failed: %w", err)
+		return "", SubmissionTerminal, fmt.Errorf("SignInvoice failed: %w", err)
 	}
 
 	// Save signed XML to filesystem:
@@ -202,33 +263,16 @@ func signSubmitUpdate(db *sql.DB, svc *zatca.Service, inv *invoice.Invoice, rowI
 
 	apiJSON, err := svc.SDK.GenerateAPIRequest(signedXML)
 	if err != nil {
-		return "", fmt.Errorf("GenerateAPIRequest failed: %w", err)
+		return "", SubmissionTerminal, fmt.Errorf("GenerateAPIRequest failed: %w", err)
 	}
 
 	var apiReq models.InvoiceRequest
 	if err := json.Unmarshal([]byte(apiJSON), &apiReq); err != nil {
-		return "", fmt.Errorf("parse api json failed: %w", err)
+		return "", SubmissionTerminal, fmt.Errorf("parse api json failed: %w", err)
 	}
-
-	var resp *models.InvoiceResponse
-	if inv.IsStandard() {
-		log.Printf("DEBUG: ClearInvoice request UUID=%s hash=%s", apiReq.UUID, apiReq.InvoiceHash)
-		resp, err = svc.Client.ClearInvoice(apiReq)
-		if err != nil {
-			return "", fmt.Errorf("ClearInvoice API failed: %v", err)
-		}
-	} else {
-		log.Printf("DEBUG: ReportInvoice request UUID=%s hash=%s", apiReq.UUID, apiReq.InvoiceHash)
-		resp, err = svc.Client.ReportInvoice(apiReq)
-		if err != nil {
-			return "", fmt.Errorf("ReportInvoice API failed: %v", err)
-		}
+	if apiReq.UUID != "" && apiReq.UUID != meta.submission.InvoiceUUID {
+		return "", SubmissionTerminal, fmt.Errorf("provider request UUID %q does not match canonical invoice_uuid %q", apiReq.UUID, meta.submission.InvoiceUUID)
 	}
-	if resp == nil {
-		return "", fmt.Errorf("invoice API returned nil response")
-	}
-
-	log.Printf("  Result: status=%s, hash=%s", resp.Status, apiReq.InvoiceHash)
 
 	qr := ""
 	if signedXML != "" {
@@ -241,35 +285,62 @@ func signSubmitUpdate(db *sql.DB, svc *zatca.Service, inv *invoice.Invoice, rowI
 
 	finalHash := apiReq.InvoiceHash
 	if finalHash == "" {
-		finalHash = resp.InvoiceHash
-	}
-	if finalHash == "" {
 		finalHash = hash
 	}
 
+	log.Printf("DEBUG: provider submit request UUID=%s hash=%s", apiReq.UUID, finalHash)
+	result, submitErr := engine.Submit(ctx, SubmissionRequest{
+		Identity:        meta.submission,
+		Standard:        inv.IsStandard(),
+		SignedRequest:   []byte(signedXML),
+		ProviderRequest: []byte(apiJSON),
+		InvoiceHash:     finalHash,
+		QRCode:          []byte(qr),
+	})
+	if submitErr != nil {
+		return "", result.Attempt.State, submitErr
+	}
+	if !result.Attempt.successful() {
+		return "", result.Attempt.State, result.Attempt.outcomeError()
+	}
+	if result.Attempt.InvoiceHash == "" {
+		return "", SubmissionTerminal, fmt.Errorf("no invoice hash returned for %s %d", table, rowID)
+	}
+	if err := applyAcceptedProjection(db, svc, result.Attempt, rowID, table, meta); err != nil {
+		return "", result.Attempt.State, err
+	}
+	return result.Attempt.InvoiceHash, result.Attempt.State, nil
+}
+
+func applyAcceptedProjection(
+	db *sql.DB,
+	svc *zatca.Service,
+	attempt SubmissionAttempt,
+	rowID int64,
+	table string,
+	meta xmlMeta,
+) error {
+	if !attempt.successful() {
+		return fmt.Errorf("refusing to issue non-successful provider outcome %q", attempt.State)
+	}
+	if attempt.InvoiceHash == "" {
+		return errors.New("accepted provider outcome is missing invoice hash")
+	}
+	qr := ""
+	if svc != nil && svc.SDK != nil && len(attempt.SignedRequest) > 0 {
+		if value, err := svc.SDK.GenerateQR(string(attempt.SignedRequest)); err == nil {
+			qr = value
+		}
+	}
 	qrCol := meta.qrColumn
 	if qrCol == "" {
 		qrCol = "qr_code"
 	}
-
 	updateQ := fmt.Sprintf(`UPDATE %s SET invoice_hash = ?, %s = ?, invoice_uuid = ?, state = 3 WHERE id = ?`, table, qrCol)
-	if _, uerr := db.Exec(updateQ, finalHash, qr, apiReq.UUID, rowID); uerr != nil {
-		return "", fmt.Errorf("update metadata failed for %s %d: %w", table, rowID, uerr)
+	if _, err := db.Exec(updateQ, attempt.InvoiceHash, qr, meta.submission.InvoiceUUID, rowID); err != nil {
+		return fmt.Errorf("update metadata after provider acceptance failed for %s %d: %w", table, rowID, err)
 	}
-
-	if len(resp.Warnings) > 0 {
-		for _, w := range resp.Warnings {
-			log.Printf("    WARN [%s] %s", w.Code, w.Message)
-		}
-	}
-
-	if apiReq.InvoiceHash != "" {
-		return apiReq.InvoiceHash, nil
-	}
-	if resp.InvoiceHash != "" {
-		return resp.InvoiceHash, nil
-	}
-	return "", fmt.Errorf("no invoice hash returned for %s %d", table, rowID)
+	return nil
 }
 
 // buildCustomer builds the Customer party from BillRow.
