@@ -187,7 +187,13 @@ func main() {
 			XMLDir:   *xmlDir,
 			TenantID: t.DBName,
 		}
-		tc := &tenantCtx{tenant: t, db: tdb, cfg: cfg, encKey: encKey}
+		tc := &tenantCtx{
+			tenant: t,
+			db:     tdb,
+			cfg:    cfg,
+			encKey: encKey,
+			claims: queue.NewSQLClaimStore(tdb),
+		}
 
 		// Open separate admin connection for onboarding if admin-dsn is set
 		if *adminDSN != "" {
