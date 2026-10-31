@@ -75,3 +75,28 @@ ALTER TABLE `bill`
 -- 5. zatca_otp should be cleared after successful onboard. No schema change
 --    needed; do it from the daemon: UPDATE branch_zatca_config SET zatca_otp=''
 --    WHERE branch_id = ? after step 4 succeeds. Documented here as a TODO.
+
+-- 6. Queue-consumer business-effect claims -------------------------------
+-- The request key and event key are both scoped by the canonical master
+-- tenant. A processing lease allows a redelivery after a consumer crash;
+-- completed claims make replay and duplicate delivery safe.
+CREATE TABLE IF NOT EXISTS `zatca_consumer_claim` (
+    `id`               BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    `tenant_id`        BIGINT UNSIGNED NOT NULL,
+    `pos_id`           VARCHAR(64)     NOT NULL,
+    `bill_request_id`  VARCHAR(128)    NOT NULL,
+    `event_id`         VARCHAR(128)    NOT NULL,
+    `egs_sequence_id`  VARCHAR(128)    NOT NULL,
+    `fingerprint`      VARCHAR(128)    NOT NULL,
+    `state`            VARCHAR(16)     NOT NULL DEFAULT 'processing',
+    `lease_expires_at` DATETIME        DEFAULT NULL,
+    `completed_at`     DATETIME        DEFAULT NULL,
+    `created_at`       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `updated_at`       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP
+        ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uq_zatca_claim_request`
+        (`tenant_id`, `pos_id`, `bill_request_id`),
+    UNIQUE KEY `uq_zatca_claim_event` (`tenant_id`, `event_id`),
+    KEY `idx_zatca_claim_lease` (`state`, `lease_expires_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
