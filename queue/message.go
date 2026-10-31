@@ -35,6 +35,9 @@ type Message struct {
 	BillRequestID      string `json:"bill_request_id,omitempty"`
 	EventID            string `json:"event_id,omitempty"`
 	EGSSequenceID      string `json:"egs_sequence_id,omitempty"`
+	InvoiceUUID        string `json:"invoice_uuid,omitempty"`
+	VATNumber          string `json:"vat_number,omitempty"`
+	EGSID              string `json:"egs_id,omitempty"`
 	RequestFingerprint string `json:"request_fingerprint,omitempty"`
 	Fingerprint        string `json:"fingerprint,omitempty"`
 	PayloadFingerprint string `json:"payload_fingerprint,omitempty"`
@@ -113,6 +116,8 @@ func (m Message) Validate() error {
 		return fmt.Errorf("%w: event_id is required", ErrInvalidEnvelope)
 	case strings.TrimSpace(m.EGSSequenceID) == "":
 		return fmt.Errorf("%w: egs_sequence_id is required", ErrInvalidEnvelope)
+	case strings.TrimSpace(m.InvoiceUUID) == "":
+		return fmt.Errorf("%w: invoice_uuid is required", ErrInvalidEnvelope)
 	}
 	return nil
 }
@@ -125,6 +130,13 @@ func (m Message) RequestKey() string {
 // EventKey scopes a delivery event to the owning tenant.
 func (m Message) EventKey() string {
 	return fmt.Sprintf("%d\x00%s", m.TenantID, m.EventID)
+}
+
+// PartitionKey identifies the one ordered fiscal stream that owns a message.
+// Document type is intentionally absent: bills, credit notes, and debit notes
+// must advance the same EGS chain.
+func (m Message) PartitionKey() string {
+	return fmt.Sprintf("%d\x00%s", m.TenantID, m.EGSSequenceID)
 }
 
 // BusinessFingerprint returns the stable content identity used to compare
@@ -152,6 +164,7 @@ func (m Message) BusinessFingerprint() string {
 		PosID         string  `json:"pos_id"`
 		BillRequestID string  `json:"bill_request_id"`
 		EGSSequenceID string  `json:"egs_sequence_id"`
+		InvoiceUUID   string  `json:"invoice_uuid"`
 	}
 	data, _ := json.Marshal(canonicalMessage{
 		DocType:       m.DocType,
@@ -162,6 +175,7 @@ func (m Message) BusinessFingerprint() string {
 		PosID:         m.PosID,
 		BillRequestID: m.BillRequestID,
 		EGSSequenceID: m.EGSSequenceID,
+		InvoiceUUID:   m.InvoiceUUID,
 	})
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
@@ -196,6 +210,13 @@ func Subject(docType DocType, dbName string, branchID int64) string {
 	return fmt.Sprintf("zatca.%s.%s.%d", docType, dbName, branchID)
 }
 
+// OrderedSubject matches all fiscal document types for one tenant branch.
+// The ordered worker partitions the decoded messages by tenant_id and
+// egs_sequence_id after consuming this combined subject.
+func OrderedSubject(dbName string, branchID int64) string {
+	return fmt.Sprintf("zatca.*.%s.%d", dbName, branchID)
+}
+
 // StreamName is the JetStream stream that captures all ZATCA subjects.
 const StreamName = "ZATCA"
 
@@ -205,4 +226,10 @@ const SubjectAll = "zatca.>"
 // ConsumerName builds a durable consumer name for a specific (tenant, branch, doc) combination.
 func ConsumerName(docType DocType, dbName string, branchID int64) string {
 	return fmt.Sprintf("zatca_%s_%s_%d", docType, dbName, branchID)
+}
+
+// OrderedConsumerName builds the durable consumer name for the combined
+// bill/credit/debit stream of a tenant branch.
+func OrderedConsumerName(dbName string, branchID int64) string {
+	return fmt.Sprintf("zatca_ordered_%s_%d", dbName, branchID)
 }

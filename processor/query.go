@@ -2,7 +2,10 @@ package processor
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
+
+	"github.com/zatca-go/zatca/queue"
 )
 
 // QueryBillByID loads a single bill row by ID (for daemon consumption).
@@ -273,6 +276,45 @@ func QueryPendingCreditNotes(db *sql.DB, branchID int64) ([]int64, error) {
 // QueryPendingDebitNotes is a no-op: debit_note table does not exist in the current backend schema.
 func QueryPendingDebitNotes(db *sql.DB, branchID int64) ([]int64, error) {
 	return nil, nil
+}
+
+// QueryPendingOrderedMessages returns canonical queue envelopes from the
+// backend outbox. Replay must not reconstruct document-type messages from
+// source tables because that would lose the immutable UUID/EGS identity.
+func QueryPendingOrderedMessages(db *sql.DB, tenantID uint64, branchID int64) ([]queue.Message, error) {
+	rows, err := db.Query(`
+		SELECT payload
+		FROM outbox
+		WHERE tenant_id = ?
+		  AND egs_sequence_id IS NOT NULL
+		  AND invoice_uuid IS NOT NULL
+		  AND status IN ('pending', 'retryable', 'in_flight', 'published')
+		ORDER BY id
+	`, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var messages []queue.Message
+	for rows.Next() {
+		var payload []byte
+		if err := rows.Scan(&payload); err != nil {
+			return nil, err
+		}
+		var msg queue.Message
+		if err := json.Unmarshal(payload, &msg); err != nil {
+			return nil, fmt.Errorf("decode ordered replay payload: %w", err)
+		}
+		if msg.BranchID != branchID {
+			continue
+		}
+		if err := msg.Validate(); err != nil {
+			return nil, fmt.Errorf("validate ordered replay payload: %w", err)
+		}
+		messages = append(messages, msg)
+	}
+	return messages, rows.Err()
 }
 
 // QueryActiveBranches returns all active branch IDs for a given tenant database.
