@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/subtle"
 	"database/sql"
 	"flag"
@@ -11,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -20,6 +22,7 @@ import (
 	"github.com/nats-io/nats.go"
 
 	"github.com/zatca-go/zatca/config"
+	"github.com/zatca-go/zatca/credential"
 	"github.com/zatca-go/zatca/dbutil"
 	"github.com/zatca-go/zatca/processor"
 	"github.com/zatca-go/zatca/queue"
@@ -28,6 +31,20 @@ import (
 	"github.com/zatca-go/zatca/tenant"
 	"github.com/zatca-go/zatca/zatca"
 )
+
+type branchServiceEntry struct {
+	svc               *zatca.Service
+	cfg               *config.Config
+	certificateSerial string
+}
+
+type cacheInvalidatorFunc func(credential.Identity)
+
+func (f cacheInvalidatorFunc) Invalidate(identity credential.Identity) {
+	if f != nil {
+		f(identity)
+	}
+}
 
 func main() {
 	masterDSN := flag.String("master-dsn", "", "Full DSN for zatca_master DB (alternative to individual flags)")
@@ -219,44 +236,88 @@ func main() {
 	}()
 
 	// ── 5. Per-branch service caches (tenant × branch → zatca.Service) ─
-	type branchEntry struct {
-		svc *zatca.Service
-		cfg *config.Config
-	}
-	branchCaches := map[string]map[int64]*branchEntry{} // dbName → branchID → entry
+	branchCaches := map[string]map[int64]*branchServiceEntry{} // dbName → branchID → entry
 	var cacheMu sync.RWMutex
 
-	getService := func(dbName string, branchID int64) (*zatca.Service, *config.Config, error) {
+	getService := func(dbName string, branchID int64, egsSequenceID string) (*zatca.Service, *config.Config, error) {
+		tc, ok := tenantMap[dbName]
+		if !ok {
+			return nil, nil, fmt.Errorf("unknown tenant db: %s", dbName)
+		}
+
+		identity := credential.Identity{
+			TenantID:       uint64(tc.tenant.ID),
+			BranchID:       branchID,
+			EGSSequenceID:  egsSequenceID,
+			CredentialType: credential.CredentialTypeProduction,
+		}
+		canonicalStore := &credential.SQLStore{DB: tc.db}
+		materialStore := storeconfig.NewCredentialMaterialStore(tc.db, encKey)
+		lifecycle := &credential.Lifecycle{
+			Store:     canonicalStore,
+			Materials: materialStore,
+			Cache: cacheInvalidatorFunc(func(credential.Identity) {
+				cacheMu.Lock()
+				if cache := branchCaches[dbName]; cache != nil {
+					delete(cache, branchID)
+				}
+				cacheMu.Unlock()
+			}),
+		}
+
+		state, err := canonicalStore.Load(context.Background(), identity)
+		if err != nil {
+			return nil, nil, fmt.Errorf("load canonical credentials for branch %d/%s: %w", branchID, egsSequenceID, err)
+		}
+
+		if state.RenewalState == credential.RenewalPending ||
+			state.RevocationState == credential.RevocationPending {
+			bz, loadErr := storeconfig.LoadBranchZATCA(tc.db, branchID, encKey)
+			if loadErr != nil {
+				return nil, nil, fmt.Errorf("load branch %d credentials for lifecycle: %w", branchID, loadErr)
+			}
+			if !bz.IsRegistered() || strings.TrimSpace(bz.PrivateKey) == "" || strings.TrimSpace(bz.Certificate) == "" {
+				return nil, nil, fmt.Errorf("%w: branch %d provider material is incomplete", credential.ErrCredentialInvalid, branchID)
+			}
+			lifecycleProvider := &processor.ServiceCSIDProvider{Service: bz.NewService(tc.cfg)}
+			lifecycle.Renewal = lifecycleProvider
+			lifecycle.Revocation = lifecycleProvider
+			state, err = lifecycle.ReconcileAndEnsure(context.Background(), identity)
+		} else {
+			state, err = lifecycle.EnsureUsable(context.Background(), identity)
+		}
+		if err != nil {
+			return nil, nil, fmt.Errorf("credential lifecycle for branch %d/%s: %w", branchID, egsSequenceID, err)
+		}
+
 		cacheMu.RLock()
 		if cache, ok := branchCaches[dbName]; ok {
-			if entry, ok := cache[branchID]; ok {
+			if entry, ok := cache[branchID]; ok && entry.certificateSerial == state.CertificateSerial {
 				cacheMu.RUnlock()
 				return entry.svc, entry.cfg, nil
 			}
 		}
 		cacheMu.RUnlock()
 
-		tc, ok := tenantMap[dbName]
-		if !ok {
-			return nil, nil, fmt.Errorf("unknown tenant db: %s", dbName)
-		}
-
 		bz, err := storeconfig.LoadBranchZATCA(tc.db, branchID, encKey)
 		if err != nil {
 			return nil, nil, fmt.Errorf("load branch %d ZATCA config: %w", branchID, err)
 		}
-		if !bz.IsRegistered() {
-			return nil, nil, fmt.Errorf("branch %d not registered with ZATCA", branchID)
+		if !bz.IsRegistered() || strings.TrimSpace(bz.PrivateKey) == "" || strings.TrimSpace(bz.Certificate) == "" {
+			return nil, nil, fmt.Errorf("%w: branch %d provider material is incomplete", credential.ErrCredentialInvalid, branchID)
 		}
-
 		branchCfg := bz.ToConfig(tc.cfg)
 		svc := bz.NewService(tc.cfg)
 
 		cacheMu.Lock()
 		if branchCaches[dbName] == nil {
-			branchCaches[dbName] = map[int64]*branchEntry{}
+			branchCaches[dbName] = map[int64]*branchServiceEntry{}
 		}
-		branchCaches[dbName][branchID] = &branchEntry{svc: svc, cfg: branchCfg}
+		branchCaches[dbName][branchID] = &branchServiceEntry{
+			svc:               svc,
+			cfg:               branchCfg,
+			certificateSerial: state.CertificateSerial,
+		}
 		cacheMu.Unlock()
 
 		return svc, branchCfg, nil

@@ -10,6 +10,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"math/big"
+	"time"
 
 	dcrsecp256k1 "github.com/decred/dcrd/dcrec/secp256k1/v4"
 )
@@ -21,6 +22,8 @@ type CertInfo struct {
 	PublicKey   *ecdsa.PublicKey
 	IssuerName  string
 	SerialNum   *big.Int
+	NotBefore   time.Time
+	NotAfter    time.Time
 }
 
 // ParseCertificate parses a base64-encoded X.509 certificate.
@@ -69,6 +72,8 @@ func parseCertDER(derBytes []byte) (*CertInfo, error) {
 			PublicKey:   pubKey,
 			IssuerName:  cert.Issuer.String(),
 			SerialNum:   cert.SerialNumber,
+			NotBefore:   cert.NotBefore,
+			NotAfter:    cert.NotAfter,
 		}, nil
 	}
 
@@ -98,7 +103,7 @@ type subjectPublicKeyInfo struct {
 }
 
 type algorithmIdentifier struct {
-	Algorithm asn1.ObjectIdentifier
+	Algorithm  asn1.ObjectIdentifier
 	Parameters asn1.RawValue `asn1:"optional"`
 }
 
@@ -106,6 +111,11 @@ type certificate struct {
 	TBSCertificate tbsCertificate
 	SignatureAlgo  asn1.RawValue
 	Signature      asn1.BitString
+}
+
+type validity struct {
+	NotBefore time.Time
+	NotAfter  time.Time
 }
 
 func parseCertDERManual(derBytes []byte) (*CertInfo, error) {
@@ -132,13 +142,49 @@ func parseCertDERManual(derBytes []byte) (*CertInfo, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse secp256k1 public key: %w", err)
 	}
+	certValidity, err := parseValidity(tbs.Validity.FullBytes)
+	if err != nil {
+		return nil, fmt.Errorf("parse certificate validity: %w", err)
+	}
 
 	return &CertInfo{
 		Raw:        derBytes,
 		PublicKey:  pubKey,
 		IssuerName: issuerName,
 		SerialNum:  tbs.SerialNumber,
+		NotBefore:  certValidity.NotBefore,
+		NotAfter:   certValidity.NotAfter,
 	}, nil
+}
+
+func parseValidity(raw []byte) (validity, error) {
+	var values []asn1.RawValue
+	rest, err := asn1.Unmarshal(raw, &values)
+	if err != nil {
+		return validity{}, err
+	}
+	if len(rest) != 0 || len(values) != 2 {
+		return validity{}, fmt.Errorf("expected two validity values")
+	}
+	parseTime := func(value asn1.RawValue) (time.Time, error) {
+		switch value.Tag {
+		case 23:
+			return time.Parse("060102150405Z", string(value.Bytes))
+		case 24:
+			return time.Parse("20060102150405Z0700", string(value.Bytes))
+		default:
+			return time.Time{}, fmt.Errorf("unsupported validity tag %d", value.Tag)
+		}
+	}
+	notBefore, err := parseTime(values[0])
+	if err != nil {
+		return validity{}, err
+	}
+	notAfter, err := parseTime(values[1])
+	if err != nil {
+		return validity{}, err
+	}
+	return validity{NotBefore: notBefore, NotAfter: notAfter}, nil
 }
 
 func parseSecp256k1PublicKey(data []byte) (*ecdsa.PublicKey, error) {
