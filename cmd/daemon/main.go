@@ -12,7 +12,6 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -253,6 +252,7 @@ func main() {
 		}
 		canonicalStore := &credential.SQLStore{DB: tc.db}
 		materialStore := storeconfig.NewCredentialMaterialStore(tc.db, encKey)
+		failureRecorder := &processor.SQLCredentialFailureRecorder{DB: tc.db}
 		lifecycle := &credential.Lifecycle{
 			Store:     canonicalStore,
 			Materials: materialStore,
@@ -265,29 +265,49 @@ func main() {
 			}),
 		}
 
-		state, err := canonicalStore.Load(context.Background(), identity)
-		if err != nil {
-			return nil, nil, fmt.Errorf("load canonical credentials for branch %d/%s: %w", branchID, egsSequenceID, err)
+		ctx := context.Background()
+		fail := func(cause error) error {
+			return processor.RecordCredentialFailure(ctx, identity, cause, failureRecorder)
 		}
 
-		if state.RenewalState == credential.RenewalPending ||
-			state.RevocationState == credential.RevocationPending {
-			bz, loadErr := storeconfig.LoadBranchZATCA(tc.db, branchID, encKey)
-			if loadErr != nil {
-				return nil, nil, fmt.Errorf("load branch %d credentials for lifecycle: %w", branchID, loadErr)
-			}
-			if !bz.IsRegistered() || strings.TrimSpace(bz.PrivateKey) == "" || strings.TrimSpace(bz.Certificate) == "" {
-				return nil, nil, fmt.Errorf("%w: branch %d provider material is incomplete", credential.ErrCredentialInvalid, branchID)
-			}
-			lifecycleProvider := &processor.ServiceCSIDProvider{Service: bz.NewService(tc.cfg)}
-			lifecycle.Renewal = lifecycleProvider
-			lifecycle.Revocation = lifecycleProvider
-			state, err = lifecycle.ReconcileAndEnsure(context.Background(), identity)
-		} else {
-			state, err = lifecycle.EnsureUsable(context.Background(), identity)
-		}
+		state, err := lifecycle.EnsureUsable(ctx, identity)
 		if err != nil {
-			return nil, nil, fmt.Errorf("credential lifecycle for branch %d/%s: %w", branchID, egsSequenceID, err)
+			return nil, nil, fail(fmt.Errorf("credential lifecycle for branch %d/%s: %w", branchID, egsSequenceID, err))
+		}
+
+		bz, err := storeconfig.LoadBranchZATCA(tc.db, branchID, encKey)
+		if err != nil {
+			return nil, nil, fail(fmt.Errorf("load branch %d ZATCA config: %w", branchID, err))
+		}
+
+		material, err := materialStore.Load(ctx, identity)
+		if err != nil {
+			return nil, nil, fail(fmt.Errorf("load branch %d credential material: %w", branchID, err))
+		}
+
+		branchCfg := bz.ToConfig(tc.cfg)
+		svc := bz.NewService(tc.cfg)
+		workingPaths, err := processor.EGSWorkingPaths(branchCfg, branchID, egsSequenceID)
+		if err != nil {
+			return nil, nil, fail(fmt.Errorf("build EGS working paths for branch %d: %w", branchID, err))
+		}
+		if err := processor.EnsureEGSWorkingPaths(workingPaths); err != nil {
+			return nil, nil, fail(fmt.Errorf("prepare EGS working paths for branch %d: %w", branchID, err))
+		}
+
+		gate := &credential.PreflightGate{
+			SDKReady: func() error {
+				return processor.CheckSDKReadiness(svc)
+			},
+		}
+		if err := processor.RunCredentialPreflight(ctx, gate, credential.PreflightInput{
+			Identity:     identity,
+			State:        state,
+			Material:     material,
+			Config:       branchCfg,
+			WorkingPaths: workingPaths,
+		}, failureRecorder); err != nil {
+			return nil, nil, err
 		}
 
 		cacheMu.RLock()
@@ -298,16 +318,6 @@ func main() {
 			}
 		}
 		cacheMu.RUnlock()
-
-		bz, err := storeconfig.LoadBranchZATCA(tc.db, branchID, encKey)
-		if err != nil {
-			return nil, nil, fmt.Errorf("load branch %d ZATCA config: %w", branchID, err)
-		}
-		if !bz.IsRegistered() || strings.TrimSpace(bz.PrivateKey) == "" || strings.TrimSpace(bz.Certificate) == "" {
-			return nil, nil, fmt.Errorf("%w: branch %d provider material is incomplete", credential.ErrCredentialInvalid, branchID)
-		}
-		branchCfg := bz.ToConfig(tc.cfg)
-		svc := bz.NewService(tc.cfg)
 
 		cacheMu.Lock()
 		if branchCaches[dbName] == nil {

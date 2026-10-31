@@ -56,6 +56,13 @@ func markBranchActive(dbName string, branchID int64) bool {
 
 type getServiceFunc func(dbName string, branchID int64, egsSequenceID string) (*zatca.Service, *config.Config, error)
 
+type orderedServicePreflight struct {
+	svc *zatca.Service
+	cfg *config.Config
+}
+
+type orderedServicePreflightKey struct{}
+
 // runWorker subscribes to one combined bill/credit/debit stream. The stream
 // is partitioned by canonical tenant_id + egs_sequence_id by OrderedStream.
 func runWorker(
@@ -224,9 +231,19 @@ func pullAndProcessOrdered(
 		log.Printf("ERROR: ordered stream tenant %s is not loaded", dbName)
 		return
 	}
-	ordered := queue.NewOrderedStream(
+	ordered := queue.NewOrderedStreamWithPreflight(
 		tc.claims,
 		tc.chain,
+		func(ctx context.Context, msg queue.Message) (context.Context, error) {
+			svc, branchCfg, err := getService(msg.DBName, msg.BranchID, msg.EGSSequenceID)
+			if err != nil {
+				return ctx, fmt.Errorf("credential preflight for branch %d: %w", msg.BranchID, err)
+			}
+			return context.WithValue(ctx, orderedServicePreflightKey{}, orderedServicePreflight{
+				svc: svc,
+				cfg: branchCfg,
+			}), nil
+		},
 		func(ctx context.Context, msg queue.Message, reservation queue.EGSSequenceReservation) (queue.EGSSequenceCommitRequest, error) {
 			return processOrderedMessage(tenantMap, getService, ctx, msg, reservation)
 		},
@@ -327,7 +344,7 @@ func enrichOrderedIdentity(getService getServiceFunc, msg queue.Message) (queue.
 func processOrderedMessage(
 	tenantMap map[string]*tenantCtx,
 	getService getServiceFunc,
-	_ context.Context,
+	ctx context.Context,
 	msg queue.Message,
 	reservation queue.EGSSequenceReservation,
 ) (queue.EGSSequenceCommitRequest, error) {
@@ -349,7 +366,7 @@ func processOrderedMessage(
 			OriginalInvoiceUUID:  msg.OriginalInvoiceUUID,
 		},
 	}
-	hash, outcome, err := processMessageWithChain(tenantMap, getService, msg, &state)
+	hash, outcome, err := processMessageWithChain(tenantMap, getService, ctx, msg, &state)
 	if err != nil {
 		return queue.EGSSequenceCommitRequest{}, err
 	}
@@ -418,6 +435,7 @@ func submissionStateForEGS(outcome processor.SubmissionState) string {
 func processMessageWithChain(
 	tenantMap map[string]*tenantCtx,
 	getService getServiceFunc,
+	ctx context.Context,
 	msg queue.Message,
 	chainState *processor.DocumentChainState,
 ) (string, processor.SubmissionState, error) {
@@ -426,9 +444,22 @@ func processMessageWithChain(
 		return "", processor.SubmissionTerminal, fmt.Errorf("unknown tenant db: %s (known tenants: %v)", msg.DBName, tenantKeys(tenantMap))
 	}
 
-	svc, branchCfg, err := getService(msg.DBName, msg.BranchID, msg.EGSSequenceID)
-	if err != nil {
-		return "", processor.SubmissionTerminal, fmt.Errorf("get service for branch %d: %w", msg.BranchID, err)
+	var (
+		svc         *zatca.Service
+		branchCfg   *config.Config
+		preflightOK bool
+	)
+	if snapshot, ok := ctx.Value(orderedServicePreflightKey{}).(orderedServicePreflight); ok {
+		svc = snapshot.svc
+		branchCfg = snapshot.cfg
+		preflightOK = svc != nil && branchCfg != nil
+	}
+	if !preflightOK {
+		var err error
+		svc, branchCfg, err = getService(msg.DBName, msg.BranchID, msg.EGSSequenceID)
+		if err != nil {
+			return "", processor.SubmissionTerminal, fmt.Errorf("get service for branch %d: %w", msg.BranchID, err)
+		}
 	}
 
 	switch msg.DocType {

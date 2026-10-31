@@ -32,3 +32,10 @@ func TestEnvironmentBaseURL(t *testing.T) {
 		}
 	}
 }
+
+func TestConfigEndpointOverrideTrimsTrailingSlash(t *testing.T) {
+	cfg := &Config{Env: Sandbox, Endpoint: "https://example.test/zatca///"}
+	if got, want := cfg.BaseURL(), "https://example.test/zatca"; got != want {
+		t.Fatalf("BaseURL() = %q, want %q", got, want)
+	}
+}
