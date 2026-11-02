@@ -41,7 +41,6 @@ func main() {
 	natsPort := flag.Int("nats-port", 4222, "Port for embedded NATS server")
 	natsMonPort := flag.Int("nats-monitor", 8222, "Port for NATS HTTP monitoring (0 to disable)")
 	natsDataDir := flag.String("nats-data", "./nats-data", "JetStream data directory")
-	xmlDir := flag.String("xml-dir", "/data/zatca-xml", "Base directory for storing signed XML files")
 	flag.Parse()
 
 	// Env var fallbacks (for Docker / docker-compose)
@@ -177,15 +176,17 @@ func main() {
 	tenantMap := map[string]*tenantCtx{} // dbName → context
 
 	for _, t := range tenants {
+		if t.TenantKey == "" {
+			log.Printf("ERROR: skip tenant %s: zatca_master has no tenant_key", t.Name)
+			continue
+		}
 		tdb, err := tenant.OpenDB(t, *baseDSN)
 		if err != nil {
 			log.Printf("WARN: skip tenant %s: %v", t.Name, err)
 			continue
 		}
 		cfg := &config.Config{
-			Env:      config.Environment(t.ZATCAEnv),
-			XMLDir:   *xmlDir,
-			TenantID: t.DBName,
+			Env: config.Environment(t.ZATCAEnv),
 		}
 		tc := &tenantCtx{
 			tenant: t,
@@ -193,7 +194,7 @@ func main() {
 			cfg:    cfg,
 			encKey: encKey,
 			claims: queue.NewSQLClaimStore(tdb),
-			chain:  queue.NewSQLSequenceStore(tdb),
+			chain:  queue.NewSQLChain(tdb),
 		}
 
 		// Open separate admin connection for onboarding if admin-dsn is set
@@ -278,7 +279,7 @@ func main() {
 			wg.Add(1)
 			go func(db string, bid int64) {
 				defer wg.Done()
-				runWorker(js, tenantMap, getService, db, bid)
+				runWorker(js, tc, getService, db, bid)
 			}(dbName, branchID)
 		}
 		log.Printf("  Started %d ordered workers for tenant %s (%d branches)", len(branches), tc.tenant.Name, len(branches))
@@ -287,25 +288,14 @@ func main() {
 		}
 	}
 
-	// Start a single onboard worker per tenant (handles all branches for that tenant)
-	for dbName := range tenantMap {
-		wg.Add(1)
-		go func(db string) {
-			defer wg.Done()
-			runOnboardWorker(js, tenantMap, getService, &wg, db)
-		}(dbName)
-	}
-
-	// ── 7. Startup replay ──────────────────────────────────────────────
-	for dbName, tc := range tenantMap {
-		branches, err := processor.QueryActiveBranches(tc.db)
-		if err != nil {
-			continue
+	// Each tenant answers its onboarding requests on its control subjects.
+	for _, tc := range tenantMap {
+		if err := runOnboardResponder(nc, js, tc, getService, &wg); err != nil {
+			log.Fatalf("subscribe onboarding for %s: %v", tc.tenant.DBName, err)
 		}
-		replayPending(js, tc.db, uint64(tc.tenant.ID), dbName, branches)
 	}
 
-	// ── 8. Wait for shutdown ───────────────────────────────────────────
+	// ── 7. Wait for shutdown ───────────────────────────────────────────
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig

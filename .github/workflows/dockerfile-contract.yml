@@ -5,7 +5,6 @@ on:
     paths:
       - Dockerfile
       - docker-compose.yml
-      - docker-compose.test.yml
       - .github/workflows/dockerfile-contract.yml
   push:
     branches:
