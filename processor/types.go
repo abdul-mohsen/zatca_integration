@@ -3,27 +3,8 @@ package processor
 import (
 	"database/sql"
 	"fmt"
-	"strings"
 	"time"
 )
-
-const DefaultPIH = "NWZlY2ViNjZmZmM4NmYzOGQ5NTI3ODZjNmQ2OTZjNzljMmRiYzIzOWRkNGU5MWI0NjcyOWQ3M2EyN2ZiNTdlOQ=="
-
-// DocumentChainState is the immutable identity reserved by the canonical EGS
-// stream before a document is built. The first stream document has a nil PIH
-// in the backend contract and uses the ZATCA genesis PIH in its XML.
-type DocumentChainState struct {
-	DocumentUUID        string
-	ICV                 uint64
-	PreviousInvoiceHash *string
-}
-
-func (s DocumentChainState) effectivePIH() string {
-	if s.PreviousInvoiceHash != nil && strings.TrimSpace(*s.PreviousInvoiceHash) != "" {
-		return *s.PreviousInvoiceHash
-	}
-	return DefaultPIH
-}
 
 // ProductRow represents product columns from the bill_product table.
 type ProductRow struct {
@@ -85,13 +66,6 @@ type BillRow struct {
 	BuyerCountry      sql.NullString
 	BuyerSchemeID     sql.NullString
 	BuyerRegistration sql.NullString
-}
-
-// CreditDebitRow extends BillRow with credit/debit note fields.
-type CreditDebitRow struct {
-	BillRow
-	NoteText sql.NullString // credit_note.note or debit_note.note
-	NoteID   sql.NullInt64  // credit_note.id or debit_note.id
 }
 
 // LoadProducts loads products for a given bill from the bill_product table.

@@ -4,259 +4,358 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
+	"os"
+	"reflect"
 	"testing"
-	"time"
 )
 
-func TestOrderedStreamPreservesInterleavedDocumentTypeOrder(t *testing.T) {
-	claims := NewMemoryClaimStore()
-	chain := NewMemoryEGSSequenceStore()
-	var (
-		mu    sync.Mutex
-		order []DocType
-	)
-	stream := NewOrderedStream(claims, chain, func(_ context.Context, msg Message, reservation EGSSequenceReservation) (EGSSequenceCommitRequest, error) {
-		mu.Lock()
-		order = append(order, msg.DocType)
-		mu.Unlock()
-		return testChainCommit(msg, reservation, fmt.Sprintf("hash-%d", reservation.ICV)), nil
-	})
+// calls records the steps of the protocol in the order the fakes saw them.
+type calls []string
 
-	messages := []Message{
-		orderedTestMessage(DocBill, 7, "egs-a", "request-bill", "event-bill", "uuid-bill"),
-		orderedTestMessage(DocCredit, 7, "egs-a", "request-credit", "event-credit", "uuid-credit"),
-		orderedTestMessage(DocDebit, 7, "egs-a", "request-debit", "event-debit", "uuid-debit"),
-	}
-	for _, msg := range messages {
-		if err := stream.HandleMessage(context.Background(), msg, func() error { return nil }); err != nil {
-			t.Fatalf("handle %s: %v", msg.DocType, err)
-		}
-	}
-
-	if got, want := fmt.Sprint(order), "[bill credit debit]"; got != want {
-		t.Fatalf("document order = %s, want %s", got, want)
-	}
-	documents := chain.Documents(msgPartition(messages[0]))
-	if got, want := len(documents), 3; got != want {
-		t.Fatalf("committed documents = %d, want %d", got, want)
-	}
-	for i, document := range documents {
-		if got, want := document.ICV, uint64(i+1); got != want {
-			t.Fatalf("document %d ICV = %d, want %d", i, got, want)
-		}
-		if got, want := document.PIH, fmt.Sprintf("hash-%d", i); i == 0 {
-			if got != nil {
-				t.Fatalf("first document PIH = %q, want nil", *got)
-			}
-		} else if got == nil || *got != want {
-			t.Fatalf("document %d PIH = %v, want %q", i, got, want)
-		}
-	}
+func (c *calls) add(step string) {
+	*c = append(*c, step)
 }
 
-func TestOrderedStreamPartitionsConcurrentEGSSequences(t *testing.T) {
-	claims := NewMemoryClaimStore()
-	chain := NewMemoryEGSSequenceStore()
-	started := make(chan string, 2)
-	release := make(chan struct{})
-	stream := NewOrderedStream(claims, chain, func(_ context.Context, msg Message, reservation EGSSequenceReservation) (EGSSequenceCommitRequest, error) {
-		started <- msg.EGSSequenceID
-		<-release
-		return testChainCommit(msg, reservation, "hash-"+msg.EGSSequenceID), nil
-	})
-
-	var group sync.WaitGroup
-	errs := make(chan error, 2)
-	for _, sequenceID := range []string{"egs-a", "egs-b"} {
-		group.Add(1)
-		go func(sequenceID string) {
-			defer group.Done()
-			msg := orderedTestMessage(DocBill, 7, sequenceID, "request-"+sequenceID, "event-"+sequenceID, "uuid-"+sequenceID)
-			errs <- stream.HandleMessage(context.Background(), msg, func() error { return nil })
-		}(sequenceID)
-	}
-
-	select {
-	case first := <-started:
-		select {
-		case second := <-started:
-			if first == second {
-				t.Fatalf("same EGS sequence started twice: %s", first)
-			}
-		case <-time.After(time.Second):
-			t.Fatal("second EGS sequence did not run concurrently")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("first EGS sequence did not start")
-	}
-	close(release)
-	group.Wait()
-	close(errs)
-	for err := range errs {
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	for _, sequenceID := range []string{"egs-a", "egs-b"} {
-		documents := chain.Documents(orderedTestMessage(DocBill, 7, sequenceID, "request-"+sequenceID, "event-"+sequenceID, "uuid-"+sequenceID).PartitionKey())
-		if len(documents) != 1 || documents[0].ICV != 1 {
-			t.Fatalf("%s documents = %#v, want one document with ICV 1", sequenceID, documents)
-		}
-	}
+// fakeClaims answers the claim with a fixed decision.
+type fakeClaims struct {
+	calls       *calls
+	decision    ClaimDecision
+	completeErr error
 }
 
-func TestOrderedStreamDuplicateDeliveryDoesNotAdvanceChain(t *testing.T) {
-	claims := NewMemoryClaimStore()
-	chain := NewMemoryEGSSequenceStore()
-	var effects, acks int
-	var mu sync.Mutex
-	stream := NewOrderedStream(claims, chain, func(_ context.Context, msg Message, reservation EGSSequenceReservation) (EGSSequenceCommitRequest, error) {
-		mu.Lock()
-		effects++
-		mu.Unlock()
-		return testChainCommit(msg, reservation, "hash-duplicate"), nil
-	})
-	msg := orderedTestMessage(DocBill, 7, "egs-a", "request-1", "event-1", "uuid-1")
-
-	var group sync.WaitGroup
-	for i := 0; i < 2; i++ {
-		group.Add(1)
-		go func() {
-			defer group.Done()
-			if err := stream.HandleMessage(context.Background(), msg, func() error {
-				mu.Lock()
-				acks++
-				mu.Unlock()
-				return nil
-			}); err != nil {
-				t.Errorf("duplicate delivery: %v", err)
-			}
-		}()
-	}
-	group.Wait()
-
-	if effects != 1 {
-		t.Fatalf("business effects = %d, want 1", effects)
-	}
-	if acks != 2 {
-		t.Fatalf("acks = %d, want 2", acks)
-	}
-	if documents := chain.Documents(msg.PartitionKey()); len(documents) != 1 || documents[0].ICV != 1 {
-		t.Fatalf("committed documents = %#v, want one document with ICV 1", documents)
-	}
+func (f *fakeClaims) Claim(context.Context, Message) (ClaimDecision, error) {
+	f.calls.add("claim")
+	return f.decision, nil
 }
 
-func TestOrderedStreamRetriesAfterCrashBeforeChainCommit(t *testing.T) {
-	now := time.Unix(100, 0)
-	claims := NewMemoryClaimStore()
-	claims.LeaseDuration = time.Second
-	claims.Now = func() time.Time { return now }
-	chain := NewMemoryEGSSequenceStore()
-	chain.LeaseDuration = time.Second
-	chain.Now = func() time.Time { return now }
-	var attempts int
-	stream := NewOrderedStream(claims, chain, func(_ context.Context, msg Message, reservation EGSSequenceReservation) (EGSSequenceCommitRequest, error) {
-		attempts++
-		if attempts == 1 {
-			return EGSSequenceCommitRequest{}, errors.New("crash before chain commit")
-		}
-		return testChainCommit(msg, reservation, "hash-retry"), nil
-	})
-	msg := orderedTestMessage(DocCredit, 7, "egs-a", "request-1", "event-1", "uuid-1")
-
-	if err := stream.HandleMessage(context.Background(), msg, func() error { t.Fatal("crashed delivery was ACKed"); return nil }); err == nil {
-		t.Fatal("first delivery succeeded despite crash")
-	}
-	now = now.Add(2 * time.Second)
-	if err := stream.HandleMessage(context.Background(), msg, func() error { return nil }); err != nil {
-		t.Fatalf("redelivery after crash: %v", err)
-	}
-	if attempts != 2 {
-		t.Fatalf("effect attempts = %d, want 2", attempts)
-	}
-	if documents := chain.Documents(msg.PartitionKey()); len(documents) != 1 || documents[0].ICV != 1 {
-		t.Fatalf("committed documents = %#v, want one retried document with ICV 1", documents)
-	}
+func (f *fakeClaims) Complete(context.Context, Message) error {
+	f.calls.add("complete")
+	return f.completeErr
 }
 
-func TestOrderedStreamCrashAfterChainCommitIsIdempotent(t *testing.T) {
-	now := time.Unix(100, 0)
-	claims := NewMemoryClaimStore()
-	claims.LeaseDuration = time.Second
-	claims.Now = func() time.Time { return now }
-	chain := NewMemoryEGSSequenceStore()
-	chain.Now = func() time.Time { return now }
-	var attempts int
-	stream := NewOrderedStream(claims, chain, func(_ context.Context, msg Message, reservation EGSSequenceReservation) (EGSSequenceCommitRequest, error) {
-		attempts++
-		return testChainCommit(msg, reservation, "hash-after-commit"), nil
-	})
-	msg := orderedTestMessage(DocDebit, 7, "egs-a", "request-1", "event-1", "uuid-1")
-	ackCalls := 0
-	ack := func() error {
-		ackCalls++
-		if ackCalls == 1 {
-			return errors.New("crash after chain commit")
-		}
+// fakeChain keeps one committed invoice, as the database would.
+type fakeChain struct {
+	calls     *calls
+	stored    *SignedInvoice
+	bookErr   error
+	commitErr error
+	recorded  []Outcome
+}
+
+func (c *fakeChain) Stored(context.Context, Message) (*SignedInvoice, error) {
+	c.calls.add("stored")
+	if c.stored == nil {
+		return nil, nil
+	}
+	copied := *c.stored
+	return &copied, nil
+}
+
+func (c *fakeChain) Book(_ context.Context, msg Message) (Booking, error) {
+	c.calls.add("book")
+	if c.bookErr != nil {
+		return Booking{}, c.bookErr
+	}
+	return Booking{
+		BranchID:   msg.BranchID,
+		RequestKey: msg.RequestKey(),
+		EventID:    msg.EventID,
+		UUID:       msg.InvoiceUUID,
+		ICV:        1,
+		PIH:        GenesisPIH,
+	}, nil
+}
+
+func (c *fakeChain) Release(context.Context, Booking) error {
+	c.calls.add("release")
+	return nil
+}
+
+func (c *fakeChain) Commit(_ context.Context, _ Booking, invoice SignedInvoice) error {
+	c.calls.add("commit")
+	if c.commitErr != nil {
+		return c.commitErr
+	}
+	c.stored = &invoice
+	return nil
+}
+
+func (c *fakeChain) Record(_ context.Context, _ SignedInvoice, outcome Outcome) error {
+	c.calls.add("record")
+	c.recorded = append(c.recorded, outcome)
+	return nil
+}
+
+// fakePipeline verifies, builds, and submits with fixed results.
+type fakePipeline struct {
+	calls      *calls
+	prepareErr error
+	buildErr   error
+	submitErr  error
+	outcome    Outcome
+	built      []Booking
+	submitted  []SignedInvoice
+}
+
+func (p *fakePipeline) Prepare(context.Context, Message) (Prepared, error) {
+	p.calls.add("prepare")
+	if p.prepareErr != nil {
+		return nil, p.prepareErr
+	}
+	return &fakePrepared{pipeline: p}, nil
+}
+
+func (p *fakePipeline) Submit(_ context.Context, invoice SignedInvoice) (Outcome, error) {
+	p.calls.add("submit")
+	p.submitted = append(p.submitted, invoice)
+	if p.submitErr != nil {
+		return Outcome{}, p.submitErr
+	}
+	return p.outcome, nil
+}
+
+type fakePrepared struct {
+	pipeline *fakePipeline
+}
+
+func (f *fakePrepared) Build(_ context.Context, booking Booking) (SignedInvoice, error) {
+	f.pipeline.calls.add("build")
+	f.pipeline.built = append(f.pipeline.built, booking)
+	if f.pipeline.buildErr != nil {
+		return SignedInvoice{}, f.pipeline.buildErr
+	}
+	return SignedInvoice{
+		SourceID:  42,
+		BranchID:  booking.BranchID,
+		UUID:      booking.UUID,
+		ICV:       booking.ICV,
+		PIH:       booking.PIH,
+		Hash:      "hash-of-bill-42",
+		Kind:      InvoiceStandard,
+		SignedXML: "<Invoice/>",
+		QR:        "qr",
+	}, nil
+}
+
+type harness struct {
+	calls    calls
+	claims   *fakeClaims
+	chain    *fakeChain
+	pipeline *fakePipeline
+	acks     int
+	stream   *OrderedStream
+	msg      Message
+}
+
+func newHarness(t *testing.T) *harness {
+	t.Helper()
+	h := &harness{}
+	h.claims = &fakeClaims{calls: &h.calls, decision: ClaimProcess}
+	h.chain = &fakeChain{calls: &h.calls}
+	h.pipeline = &fakePipeline{calls: &h.calls, outcome: Outcome{State: OutcomeAccepted}}
+	h.stream = NewOrderedStream(h.claims, h.chain, h.pipeline)
+	msg, err := DecodeEnvelope(readFixture(t, "bill_envelope.json"))
+	if err != nil {
+		t.Fatalf("decode the backend envelope: %v", err)
+	}
+	h.msg = msg
+	return h
+}
+
+func (h *harness) deliver() error {
+	return h.stream.HandleMessage(context.Background(), h.msg, func() error {
+		h.acks++
 		return nil
-	}
+	})
+}
 
-	if err := stream.HandleMessage(context.Background(), msg, ack); err == nil {
-		t.Fatal("first delivery succeeded despite ACK crash")
+func readFixture(t *testing.T, name string) []byte {
+	t.Helper()
+	data, err := os.ReadFile("testdata/" + name)
+	if err != nil {
+		t.Fatal(err)
 	}
-	now = now.Add(2 * time.Second)
-	if err := stream.HandleMessage(context.Background(), msg, ack); err != nil {
-		t.Fatalf("redelivery after ACK crash: %v", err)
-	}
-	if attempts != 1 {
-		t.Fatalf("effect attempts = %d, want 1 after committed-chain recovery", attempts)
-	}
-	if documents := chain.Documents(msg.PartitionKey()); len(documents) != 1 || documents[0].ICV != 1 {
-		t.Fatalf("committed documents = %#v, want one idempotent document", documents)
+	return data
+}
+
+func expectSteps(t *testing.T, got calls, want ...string) {
+	t.Helper()
+	if !reflect.DeepEqual(got, calls(want)) {
+		t.Fatalf("steps = %v; want %v", got, want)
 	}
 }
 
-func orderedTestMessage(docType DocType, tenantID uint64, sequenceID, requestID, eventID, documentUUID string) Message {
-	return Message{
-		DocType:       docType,
-		ID:            42,
-		BranchID:      7,
-		DBName:        fmt.Sprintf("tenant_%d", tenantID),
-		TenantID:      tenantID,
-		PosID:         "pos-1",
-		BillRequestID: requestID,
-		EventID:       eventID,
-		EGSSequenceID: sequenceID,
-		InvoiceUUID:   documentUUID,
-		EGSID:         "egs-1",
-		VATNumber:     "310000000000003",
+func TestBillIsVerifiedBookedBuiltCommittedSubmittedAndCompleted(t *testing.T) {
+	h := newHarness(t)
+	if err := h.deliver(); err != nil {
+		t.Fatalf("deliver: %v", err)
+	}
+	expectSteps(t, h.calls, "claim", "stored", "prepare", "book", "build", "commit", "submit", "record", "complete")
+	if h.acks != 1 {
+		t.Fatalf("acks = %d; want 1", h.acks)
+	}
+	if got := h.pipeline.built[0].UUID; got != h.msg.InvoiceUUID {
+		t.Fatalf("built with UUID %s; want the envelope's %s", got, h.msg.InvoiceUUID)
 	}
 }
 
-func msgPartition(msg Message) string {
-	return msg.PartitionKey()
+func TestRejectedInputBooksNothingAndEndsTheRequest(t *testing.T) {
+	h := newHarness(t)
+	h.pipeline.prepareErr = fmt.Errorf("%w: the bill has no lines", ErrRejectedInput)
+	err := h.deliver()
+	if !errors.Is(err, ErrRejectedInput) {
+		t.Fatalf("deliver = %v; want ErrRejectedInput", err)
+	}
+	expectSteps(t, h.calls, "claim", "stored", "prepare", "complete")
+	if h.acks != 1 {
+		t.Fatalf("acks = %d; want 1", h.acks)
+	}
 }
 
-func testChainCommit(msg Message, reservation EGSSequenceReservation, hash string) EGSSequenceCommitRequest {
-	pih := ""
-	if reservation.PIH != nil {
-		pih = *reservation.PIH
+func TestBuildFailureReleasesTheBookingAndKeepsTheDelivery(t *testing.T) {
+	h := newHarness(t)
+	h.pipeline.buildErr = errors.New("signer unavailable")
+	if err := h.deliver(); err == nil || errors.Is(err, ErrRejectedInput) {
+		t.Fatalf("deliver = %v; want a technical error", err)
 	}
-	return EGSSequenceCommitRequest{
-		Reservation:  reservation,
-		DocumentType: string(msg.DocType),
-		SourceID:     uint64(msg.ID),
-		State:        EGSDocumentQueued,
-		Snapshot: []byte(fmt.Sprintf(
-			`{"source_id":%d,"uuid":%q,"icv":%d,"pih":%q,"hash":%q}`,
-			msg.ID,
-			reservation.DocumentUUID,
-			reservation.ICV,
-			pih,
-			hash,
-		)),
-		DocumentHash: hash,
+	expectSteps(t, h.calls, "claim", "stored", "prepare", "book", "build", "release")
+	if h.acks != 0 || h.chain.stored != nil {
+		t.Fatalf("acks = %d, stored = %v; want no ACK and nothing committed", h.acks, h.chain.stored)
+	}
+}
+
+func TestCommitFailureReleasesTheBookingAndKeepsTheDelivery(t *testing.T) {
+	h := newHarness(t)
+	h.chain.commitErr = errors.New("connection lost")
+	if err := h.deliver(); err == nil {
+		t.Fatal("deliver succeeded; want the commit error")
+	}
+	expectSteps(t, h.calls, "claim", "stored", "prepare", "book", "build", "commit", "release")
+	if h.acks != 0 || len(h.pipeline.submitted) != 0 {
+		t.Fatalf("acks = %d, submitted = %d; want no ACK and no submission", h.acks, len(h.pipeline.submitted))
+	}
+}
+
+func TestBusyChainLeavesTheDeliveryForLater(t *testing.T) {
+	h := newHarness(t)
+	h.chain.bookErr = ErrChainBusy
+	if err := h.deliver(); !errors.Is(err, ErrChainBusy) {
+		t.Fatalf("deliver = %v; want ErrChainBusy", err)
+	}
+	expectSteps(t, h.calls, "claim", "stored", "prepare", "book")
+	if h.acks != 0 {
+		t.Fatalf("acks = %d; want 0", h.acks)
+	}
+}
+
+func TestRedeliveryAfterASubmitFailureSubmitsTheStoredXMLAgain(t *testing.T) {
+	h := newHarness(t)
+	h.pipeline.submitErr = errors.New("ZATCA unreachable")
+	if err := h.deliver(); err == nil {
+		t.Fatal("first delivery succeeded; want the submit error")
+	}
+	if h.chain.stored == nil {
+		t.Fatal("the invoice was not committed before the submit failed")
+	}
+
+	h.pipeline.submitErr = nil
+	h.calls = nil
+	if err := h.deliver(); err != nil {
+		t.Fatalf("redelivery: %v", err)
+	}
+	expectSteps(t, h.calls, "claim", "stored", "submit", "record", "complete")
+	if len(h.pipeline.built) != 1 {
+		t.Fatalf("built %d times; want once, the stored XML is never rebuilt", len(h.pipeline.built))
+	}
+	first, second := h.pipeline.submitted[0], h.pipeline.submitted[1]
+	if first.SignedXML != second.SignedXML || first.Hash != second.Hash || first.ICV != second.ICV {
+		t.Fatalf("the redelivery submitted %+v; want the stored invoice %+v", second, first)
+	}
+	if h.acks != 1 {
+		t.Fatalf("acks = %d; want 1", h.acks)
+	}
+}
+
+func TestRejectedOutcomeIsRecordedAndEndsTheRequest(t *testing.T) {
+	h := newHarness(t)
+	h.pipeline.outcome = Outcome{State: OutcomeRejected, ProviderCode: "400", Message: "NOT_VALID"}
+	if err := h.deliver(); err != nil {
+		t.Fatalf("deliver: %v", err)
+	}
+	expectSteps(t, h.calls, "claim", "stored", "prepare", "book", "build", "commit", "submit", "record", "complete")
+	if len(h.chain.recorded) != 1 || h.chain.recorded[0].State != OutcomeRejected {
+		t.Fatalf("recorded = %+v; want one rejection", h.chain.recorded)
+	}
+	if h.acks != 1 {
+		t.Fatalf("acks = %d; want 1", h.acks)
+	}
+}
+
+func TestDuplicateIsAcknowledgedWithoutWork(t *testing.T) {
+	h := newHarness(t)
+	h.claims.decision = ClaimDuplicate
+	if err := h.deliver(); err != nil {
+		t.Fatalf("deliver: %v", err)
+	}
+	expectSteps(t, h.calls, "claim")
+	if h.acks != 1 {
+		t.Fatalf("acks = %d; want 1", h.acks)
+	}
+}
+
+func TestConflictIsAcknowledgedAndReported(t *testing.T) {
+	h := newHarness(t)
+	h.claims.decision = ClaimConflict
+	if err := h.deliver(); !errors.Is(err, ErrFingerprintConflict) {
+		t.Fatalf("deliver = %v; want ErrFingerprintConflict", err)
+	}
+	expectSteps(t, h.calls, "claim")
+	if h.acks != 1 {
+		t.Fatalf("acks = %d; want 1", h.acks)
+	}
+}
+
+func TestInFlightDeliveryIsLeftForLater(t *testing.T) {
+	h := newHarness(t)
+	h.claims.decision = ClaimInFlight
+	if err := h.deliver(); !errors.Is(err, ErrClaimInFlight) {
+		t.Fatalf("deliver = %v; want ErrClaimInFlight", err)
+	}
+	expectSteps(t, h.calls, "claim")
+	if h.acks != 0 {
+		t.Fatalf("acks = %d; want 0", h.acks)
+	}
+}
+
+func TestStoredInvoiceOfAnotherUUIDIsRejected(t *testing.T) {
+	h := newHarness(t)
+	h.chain.stored = &SignedInvoice{
+		SourceID:  42,
+		BranchID:  7,
+		UUID:      "11111111-2222-4333-8444-555555555555",
+		ICV:       1,
+		PIH:       GenesisPIH,
+		Hash:      "hash-of-bill-42",
+		Kind:      InvoiceStandard,
+		SignedXML: "<Invoice/>",
+	}
+	if err := h.deliver(); !errors.Is(err, ErrRejectedInput) {
+		t.Fatalf("deliver = %v; want ErrRejectedInput", err)
+	}
+	expectSteps(t, h.calls, "claim", "stored", "complete")
+	if len(h.pipeline.submitted) != 0 {
+		t.Fatal("a mismatched invoice was submitted")
+	}
+}
+
+func TestEnvelopeWithoutItsInvoiceUUIDIsRefusedBeforeAnyWork(t *testing.T) {
+	h := newHarness(t)
+	h.msg.InvoiceUUID = ""
+	if err := h.deliver(); !errors.Is(err, ErrInvalidEnvelope) {
+		t.Fatalf("deliver = %v; want ErrInvalidEnvelope", err)
+	}
+	expectSteps(t, h.calls)
+	if h.acks != 0 {
+		t.Fatalf("acks = %d; want 0", h.acks)
 	}
 }
