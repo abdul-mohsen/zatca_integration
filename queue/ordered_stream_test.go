@@ -33,12 +33,18 @@ func (f *fakeClaims) Complete(context.Context, Message) error {
 	return f.completeErr
 }
 
-// fakeChain keeps one committed invoice, as the database would.
+func (f *fakeClaims) Release(context.Context, Message) error {
+	f.calls.add("unclaim")
+	return nil
+}
+
+// fakeChain keeps one committed invoice, as the database would, and records ZATCA's answer on it.
 type fakeChain struct {
 	calls     *calls
 	stored    *SignedInvoice
 	bookErr   error
 	commitErr error
+	recordErr error
 	recorded  []Outcome
 }
 
@@ -82,7 +88,13 @@ func (c *fakeChain) Commit(_ context.Context, _ Booking, invoice SignedInvoice) 
 
 func (c *fakeChain) Record(_ context.Context, _ SignedInvoice, outcome Outcome) error {
 	c.calls.add("record")
+	if c.recordErr != nil {
+		return c.recordErr
+	}
 	c.recorded = append(c.recorded, outcome)
+	if c.stored != nil {
+		c.stored.Outcome = outcome.State
+	}
 	return nil
 }
 
@@ -212,37 +224,37 @@ func TestRejectedInputBooksNothingAndEndsTheRequest(t *testing.T) {
 	}
 }
 
-func TestBuildFailureReleasesTheBookingAndKeepsTheDelivery(t *testing.T) {
+func TestBuildFailureReleasesTheBookingAndTheClaim(t *testing.T) {
 	h := newHarness(t)
 	h.pipeline.buildErr = errors.New("signer unavailable")
 	if err := h.deliver(); err == nil || errors.Is(err, ErrRejectedInput) {
 		t.Fatalf("deliver = %v; want a technical error", err)
 	}
-	expectSteps(t, h.calls, "claim", "stored", "prepare", "book", "build", "release")
+	expectSteps(t, h.calls, "claim", "stored", "prepare", "book", "build", "release", "unclaim")
 	if h.acks != 0 || h.chain.stored != nil {
 		t.Fatalf("acks = %d, stored = %v; want no ACK and nothing committed", h.acks, h.chain.stored)
 	}
 }
 
-func TestCommitFailureReleasesTheBookingAndKeepsTheDelivery(t *testing.T) {
+func TestCommitFailureReleasesTheBookingAndTheClaim(t *testing.T) {
 	h := newHarness(t)
 	h.chain.commitErr = errors.New("connection lost")
 	if err := h.deliver(); err == nil {
 		t.Fatal("deliver succeeded; want the commit error")
 	}
-	expectSteps(t, h.calls, "claim", "stored", "prepare", "book", "build", "commit", "release")
+	expectSteps(t, h.calls, "claim", "stored", "prepare", "book", "build", "commit", "release", "unclaim")
 	if h.acks != 0 || len(h.pipeline.submitted) != 0 {
 		t.Fatalf("acks = %d, submitted = %d; want no ACK and no submission", h.acks, len(h.pipeline.submitted))
 	}
 }
 
-func TestBusyChainLeavesTheDeliveryForLater(t *testing.T) {
+func TestBusyChainReleasesTheClaimAndLeavesTheDelivery(t *testing.T) {
 	h := newHarness(t)
 	h.chain.bookErr = ErrChainBusy
 	if err := h.deliver(); !errors.Is(err, ErrChainBusy) {
 		t.Fatalf("deliver = %v; want ErrChainBusy", err)
 	}
-	expectSteps(t, h.calls, "claim", "stored", "prepare", "book")
+	expectSteps(t, h.calls, "claim", "stored", "prepare", "book", "unclaim")
 	if h.acks != 0 {
 		t.Fatalf("acks = %d; want 0", h.acks)
 	}
@@ -276,11 +288,44 @@ func TestRedeliveryAfterASubmitFailureSubmitsTheStoredXMLAgain(t *testing.T) {
 	}
 }
 
-func TestRejectedOutcomeIsRecordedAndEndsTheRequest(t *testing.T) {
+func TestRecordFailureAfterAnAnswerKeepsTheDeliveryAndReleasesTheClaim(t *testing.T) {
+	h := newHarness(t)
+	h.chain.recordErr = errors.New("connection lost")
+	if err := h.deliver(); err == nil {
+		t.Fatal("deliver succeeded; want the record error")
+	}
+	expectSteps(t, h.calls, "claim", "stored", "prepare", "book", "build", "commit", "submit", "record", "unclaim")
+	if h.acks != 0 {
+		t.Fatalf("acks = %d; want 0", h.acks)
+	}
+}
+
+// Once ZATCA's answer is recorded, the invoice is final. A redelivery that has to finish the request must not send it again.
+func TestRecordedAnswerIsNeverSubmittedAgain(t *testing.T) {
+	h := newHarness(t)
+	h.claims.completeErr = errors.New("connection lost")
+	if err := h.deliver(); err == nil {
+		t.Fatal("first delivery succeeded; want the complete error")
+	}
+	h.claims.completeErr = nil
+	h.calls = nil
+	if err := h.deliver(); err != nil {
+		t.Fatalf("redelivery: %v", err)
+	}
+	expectSteps(t, h.calls, "claim", "stored", "complete")
+	if len(h.pipeline.submitted) != 1 {
+		t.Fatalf("submitted %d times; want once", len(h.pipeline.submitted))
+	}
+	if h.acks != 1 {
+		t.Fatalf("acks = %d; want 1", h.acks)
+	}
+}
+
+func TestRejectedOutcomeIsRecordedAndReportedAfterTheAck(t *testing.T) {
 	h := newHarness(t)
 	h.pipeline.outcome = Outcome{State: OutcomeRejected, ProviderCode: "400", Message: "NOT_VALID"}
-	if err := h.deliver(); err != nil {
-		t.Fatalf("deliver: %v", err)
+	if err := h.deliver(); !errors.Is(err, ErrInvoiceRejected) {
+		t.Fatalf("deliver = %v; want ErrInvoiceRejected", err)
 	}
 	expectSteps(t, h.calls, "claim", "stored", "prepare", "book", "build", "commit", "submit", "record", "complete")
 	if len(h.chain.recorded) != 1 || h.chain.recorded[0].State != OutcomeRejected {
@@ -327,7 +372,9 @@ func TestInFlightDeliveryIsLeftForLater(t *testing.T) {
 	}
 }
 
-func TestStoredInvoiceOfAnotherUUIDIsRejected(t *testing.T) {
+// A stored invoice of another UUID was committed earlier, so the mismatch is a technical failure for an operator. It is not
+// an input error, and nothing is submitted.
+func TestStoredInvoiceOfAnotherUUIDIsATechnicalFailure(t *testing.T) {
 	h := newHarness(t)
 	h.chain.stored = &SignedInvoice{
 		SourceID:  42,
@@ -339,12 +386,13 @@ func TestStoredInvoiceOfAnotherUUIDIsRejected(t *testing.T) {
 		Kind:      InvoiceStandard,
 		SignedXML: "<Invoice/>",
 	}
-	if err := h.deliver(); !errors.Is(err, ErrRejectedInput) {
-		t.Fatalf("deliver = %v; want ErrRejectedInput", err)
+	err := h.deliver()
+	if err == nil || errors.Is(err, ErrRejectedInput) {
+		t.Fatalf("deliver = %v; want a technical error, not a rejected input", err)
 	}
-	expectSteps(t, h.calls, "claim", "stored", "complete")
-	if len(h.pipeline.submitted) != 0 {
-		t.Fatal("a mismatched invoice was submitted")
+	expectSteps(t, h.calls, "claim", "stored", "unclaim")
+	if len(h.pipeline.submitted) != 0 || h.acks != 0 {
+		t.Fatal("a mismatched invoice was submitted or acknowledged")
 	}
 }
 

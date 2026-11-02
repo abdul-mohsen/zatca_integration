@@ -35,6 +35,9 @@ func (p *BillPipeline) Prepare(_ context.Context, msg queue.Message) (queue.Prep
 		return nil, err
 	}
 	bill, err := QueryBillByID(p.DB, msg.ID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("%w: bill %d does not exist", queue.ErrRejectedInput, msg.ID)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -42,7 +45,7 @@ func (p *BillPipeline) Prepare(_ context.Context, msg queue.Message) (queue.Prep
 	if err != nil {
 		return nil, fmt.Errorf("load products failed for bill %d: %w", msg.ID, err)
 	}
-	if err := verifyBill(cfg, products); err != nil {
+	if err := verifyBill(cfg, msg, *bill, products); err != nil {
 		return nil, fmt.Errorf("%w: bill %d: %v", queue.ErrRejectedInput, msg.ID, err)
 	}
 	issueTime, err := ParseDates(bill.EffectiveDate, bill.PaymentDue, bill.ID)
@@ -161,10 +164,17 @@ func (d *billDocument) Build(_ context.Context, booking queue.Booking) (queue.Si
 	}, nil
 }
 
-// verifyBill refuses a bill that cannot be reported. The seller's VAT and EGS id come from the branch configuration, and
-// the bill needs at least one line with a positive quantity and a price that is not negative.
-func verifyBill(cfg *config.Config, products []ProductRow) error {
+// verifyBill refuses a bill that cannot be reported, before any number is booked. The bill must belong to the envelope's branch,
+// be a final sale, and carry the envelope's invoice UUID when it has one. The seller's VAT and EGS id come from the branch
+// configuration, and the bill needs at least one line with a positive quantity and a price that is not negative.
+func verifyBill(cfg *config.Config, msg queue.Message, bill BillRow, products []ProductRow) error {
 	switch {
+	case bill.BranchID != msg.BranchID:
+		return fmt.Errorf("the bill belongs to branch %d, not %d", bill.BranchID, msg.BranchID)
+	case bill.State < 1:
+		return fmt.Errorf("the bill is not a final sale (state %d)", bill.State)
+	case bill.InvoiceUUID.Valid && bill.InvoiceUUID.String != msg.InvoiceUUID:
+		return errors.New("the bill carries another invoice UUID")
 	case cfg.Seller.VAT == "":
 		return errors.New("the branch has no seller VAT number")
 	case cfg.EGSID == "":
