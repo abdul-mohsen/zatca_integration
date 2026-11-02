@@ -12,22 +12,28 @@ type Prepared interface {
 	Build(ctx context.Context, booking Booking) (SignedInvoice, error)
 }
 
-// Pipeline is the fiscal work of one document type. Prepare verifies a document and loads what Build needs, before any
-// number is booked. Submit sends a committed invoice to ZATCA. It returns an error only for a technical failure. A rejection
-// by ZATCA is an Outcome.
+// Pipeline is the fiscal work of one document type. Prepare verifies a document and loads what Build needs, before any number
+// is booked. Submit sends a committed invoice to ZATCA. It returns an error only for a technical failure. A rejection by ZATCA
+// is an Outcome.
 type Pipeline interface {
 	Prepare(ctx context.Context, msg Message) (Prepared, error)
 	Submit(ctx context.Context, invoice SignedInvoice) (Outcome, error)
 }
 
-// OrderedStream runs the deliveries of a tenant's branches through the chain protocol. Deliveries of one tenant and EGS run
-// one at a time, in order.
+// ErrInvoiceRejected means ZATCA rejected an invoice that passed verification. The rejection is recorded and the request ends.
+// Verification let it through, so it is a defect to fix on this side. It is reported, and it is never retried.
+var ErrInvoiceRejected = errors.New("ZATCA rejected a verified invoice")
+
+// OrderedStream runs the deliveries of a tenant's branches through the chain protocol. Deliveries of one tenant and EGS run one
+// at a time, in order.
 //
-// A delivery is claimed first. A bill that already has a committed invoice skips to submission, so a redelivery never signs
-// twice. Otherwise the bill is verified before any number is booked, then built and signed under its booking, then committed
-// together with the chain update. A failure before the commit releases the booking, and nothing is committed. A failure after
-// it leaves the delivery unacknowledged: the next delivery submits the stored XML again and never rebuilds it. The delivery is
-// acknowledged once ZATCA's outcome is recorded and the claim is complete.
+// The delivery claims its request first. A bill that already has a committed invoice skips to submission, and an invoice whose
+// answer is recorded is never sent again. Otherwise the bill is verified before any number is booked, built and signed under its
+// booking, and committed together with the chain update.
+//
+// Locks are released on every path. A failure before the commit releases the booking, and nothing is committed. A failure that is
+// not a rejected input releases the claim too, so the redelivery runs at once. A committed invoice is never rebuilt: the
+// redelivery submits the stored XML again, unless ZATCA's answer is already recorded.
 type OrderedStream struct {
 	claims   ClaimStore
 	chain    Chain
@@ -86,25 +92,45 @@ func (s *OrderedStream) HandleMessage(ctx context.Context, msg Message, ack func
 	case ClaimInFlight:
 		return ErrClaimInFlight
 	case ClaimProcess:
+		return s.process(ctx, msg, ack)
 	default:
 		return fmt.Errorf("unknown queue claim decision %d", decision)
 	}
+}
 
+// process runs a request whose claim this delivery holds.
+func (s *OrderedStream) process(ctx context.Context, msg Message, ack func() error) error {
 	invoice, err := s.invoiceFor(ctx, msg)
 	if err != nil {
-		return s.endOnFailure(ctx, msg, err, ack)
+		return s.failed(ctx, msg, err, ack)
+	}
+	if invoice.Outcome != "" {
+		// ZATCA's answer is already recorded, so the invoice is final and nothing is sent again.
+		return s.finish(ctx, msg, ack, nil)
 	}
 	outcome, err := s.pipeline.Submit(ctx, invoice)
 	if err != nil {
-		return err
+		return s.failed(ctx, msg, err, ack)
 	}
 	if err := s.chain.Record(ctx, invoice, outcome); err != nil {
-		return err
+		return s.failed(ctx, msg, err, ack)
 	}
+	var rejected error
+	if outcome.State == OutcomeRejected {
+		rejected = fmt.Errorf("%w: bill %d: %s", ErrInvoiceRejected, msg.ID, outcome.Message)
+	}
+	return s.finish(ctx, msg, ack, rejected)
+}
+
+// finish completes the claim and acknowledges the delivery. The result, if any, is returned after that.
+func (s *OrderedStream) finish(ctx context.Context, msg Message, ack func() error, result error) error {
 	if err := s.claims.Complete(ctx, msg); err != nil {
-		return fmt.Errorf("complete ordered stream claim: %w", err)
+		return s.failed(ctx, msg, fmt.Errorf("complete ordered stream claim: %w", err), ack)
 	}
-	return ack()
+	if err := ack(); err != nil {
+		return errors.Join(result, fmt.Errorf("ACK failed: %w", err))
+	}
+	return result
 }
 
 // invoiceFor returns the bill's committed invoice. It builds and commits one only when the bill has none yet.
@@ -135,12 +161,12 @@ func (s *OrderedStream) invoiceFor(ctx context.Context, msg Message) (SignedInvo
 	return invoice, nil
 }
 
-// checkStored refuses a committed invoice that belongs to another UUID or branch. That cannot happen unless the data was
-// changed outside the daemon.
+// checkStored refuses a stored invoice that belongs to another UUID or branch. The invoice was committed earlier, so a mismatch
+// is a technical failure for an operator to look at. It is not an input error.
 func checkStored(invoice SignedInvoice, msg Message) (SignedInvoice, error) {
 	if invoice.UUID != msg.InvoiceUUID || invoice.BranchID != msg.BranchID {
-		return SignedInvoice{}, fmt.Errorf("%w: bill %d is invoiced as %s, not %s",
-			ErrRejectedInput, msg.ID, invoice.UUID, msg.InvoiceUUID)
+		return SignedInvoice{}, fmt.Errorf("bill %d is stored as invoice %s of branch %d, not %s of branch %d",
+			msg.ID, invoice.UUID, invoice.BranchID, msg.InvoiceUUID, msg.BranchID)
 	}
 	return invoice, nil
 }
@@ -153,10 +179,14 @@ func (s *OrderedStream) release(ctx context.Context, booking Booking, cause erro
 	return cause
 }
 
-// endOnFailure separates the two kinds of failure. A rejected input ends the request: it is completed and acknowledged, and
-// the error is still returned so it can be reported. Any other failure is technical, so the delivery stays unacknowledged.
-func (s *OrderedStream) endOnFailure(ctx context.Context, msg Message, cause error, ack func() error) error {
+// failed handles a failure of a claimed request. A rejected input ends the request: it is completed and acknowledged, and the
+// error is returned for the report. Any other failure is technical. The claim is released, so the redelivery can run at once,
+// and the delivery stays unacknowledged.
+func (s *OrderedStream) failed(ctx context.Context, msg Message, cause error, ack func() error) error {
 	if !errors.Is(cause, ErrRejectedInput) {
+		if err := s.claims.Release(ctx, msg); err != nil {
+			return errors.Join(cause, err)
+		}
 		return cause
 	}
 	if err := s.claims.Complete(ctx, msg); err != nil {
