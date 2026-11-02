@@ -24,6 +24,9 @@ const (
 	InvoiceSimplified = "simplified"
 )
 
+// outcomePending is the outcome_state of an invoice that ZATCA has not answered yet.
+const outcomePending = "pending"
+
 var (
 	// ErrChainBusy means another request holds the branch's chain, and its lease has not expired.
 	ErrChainBusy = errors.New("branch invoice chain is busy")
@@ -57,6 +60,8 @@ type SignedInvoice struct {
 	Kind      string
 	SignedXML string
 	QR        string
+	// Outcome is the answer ZATCA recorded for this invoice, empty while none is recorded.
+	Outcome string
 }
 
 // Outcome is ZATCA's final answer for one invoice.
@@ -238,8 +243,8 @@ func (c *SQLChain) Commit(ctx context.Context, booking Booking, invoice SignedIn
 		INSERT INTO zatca_submission
 			(bill_id, branch_id, status, outcome_state, invoice_icv, previous_invoice_hash,
 			 invoice_uuid, invoice_hash, invoice_kind, signed_xml)
-		VALUES (?, ?, 0, 'pending', ?, ?, ?, ?, ?, ?)
-	`, invoice.SourceID, invoice.BranchID, invoice.ICV, invoice.PIH,
+		VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
+	`, invoice.SourceID, invoice.BranchID, outcomePending, invoice.ICV, invoice.PIH,
 		invoice.UUID, invoice.Hash, invoice.Kind, invoice.SignedXML); err != nil {
 		return fmt.Errorf("store invoice of bill %d: %w", invoice.SourceID, err)
 	}
@@ -268,16 +273,17 @@ func (c *SQLChain) Stored(ctx context.Context, msg Message) (*SignedInvoice, err
 	var (
 		invoice SignedInvoice
 		qr      sql.NullString
+		outcome string
 	)
 	err := c.DB.QueryRowContext(ctx, `
 		SELECT s.bill_id, s.branch_id, s.invoice_icv, s.previous_invoice_hash, s.invoice_uuid, s.invoice_hash,
-		       s.invoice_kind, s.signed_xml, b.qr_code
+		       s.invoice_kind, s.signed_xml, b.qr_code, s.outcome_state
 		FROM zatca_submission s
 		JOIN bill b ON b.id = s.bill_id
 		WHERE s.bill_id = ?
 	`, msg.ID).Scan(
 		&invoice.SourceID, &invoice.BranchID, &invoice.ICV, &invoice.PIH,
-		&invoice.UUID, &invoice.Hash, &invoice.Kind, &invoice.SignedXML, &qr,
+		&invoice.UUID, &invoice.Hash, &invoice.Kind, &invoice.SignedXML, &qr, &outcome,
 	)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
@@ -286,6 +292,9 @@ func (c *SQLChain) Stored(ctx context.Context, msg Message) (*SignedInvoice, err
 		return nil, fmt.Errorf("lookup invoice of bill %d: %w", msg.ID, err)
 	}
 	invoice.QR = qr.String
+	if outcome != outcomePending {
+		invoice.Outcome = outcome
+	}
 	return &invoice, nil
 }
 
@@ -317,13 +326,25 @@ func (c *SQLChain) Record(ctx context.Context, invoice SignedInvoice, outcome Ou
 	} else {
 		warningMsg = nullString(outcome.Message, 1024)
 	}
-	if _, err := tx.ExecContext(ctx, `
+	result, err := tx.ExecContext(ctx, `
 		UPDATE zatca_submission
 		SET status = ?, outcome_state = ?, provider_code = ?, rejection_code = ?, rejection_msg = ?,
 		    provider_warning_message = ?, submitted_at = CURRENT_TIMESTAMP, outcome_at = CURRENT_TIMESTAMP
-		WHERE id = ?
-	`, status, outcome.State, providerCode, rejectionCode, rejectionMsg, warningMsg, submissionID); err != nil {
+		WHERE id = ? AND outcome_state = ?
+	`, status, outcome.State, providerCode, rejectionCode, rejectionMsg, warningMsg, submissionID, outcomePending)
+	if err != nil {
 		return fmt.Errorf("record outcome of bill %d: %w", invoice.SourceID, err)
+	}
+	recorded, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("inspect outcome of bill %d: %w", invoice.SourceID, err)
+	}
+	if recorded == 0 {
+		// The first answer stands. A later record never changes an answer, the invoice, or its hash.
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit repeated outcome of bill %d: %w", invoice.SourceID, err)
+		}
+		return nil
 	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO zatca_submission_outcome

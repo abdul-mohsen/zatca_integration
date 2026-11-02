@@ -131,6 +131,25 @@ func sqlClaimDecision(state string, lease nullableTime, now time.Time) ClaimDeci
 	}
 }
 
+// Release gives a claim back after a technical failure, so the redelivery can process the request at once. It only touches a
+// claim that is still being processed.
+func (s *SQLClaimStore) Release(ctx context.Context, msg Message) error {
+	if err := msg.Validate(); err != nil {
+		return err
+	}
+	if s == nil || s.DB == nil {
+		return errors.New("queue SQL claim store is not configured")
+	}
+	if _, err := s.DB.ExecContext(ctx, `
+		UPDATE zatca_consumer_claim
+		SET lease_expires_at = NULL
+		WHERE pos_id = ? AND bill_request_id = ? AND fingerprint = ? AND state = ?
+	`, msg.PosID, msg.BillRequestID, msg.RequestFingerprint, claimProcessing); err != nil {
+		return fmt.Errorf("release queue claim %s: %w", msg.BillRequestID, err)
+	}
+	return nil
+}
+
 // Complete marks the request done. It is safe to repeat.
 func (s *SQLClaimStore) Complete(ctx context.Context, msg Message) error {
 	if err := msg.Validate(); err != nil {

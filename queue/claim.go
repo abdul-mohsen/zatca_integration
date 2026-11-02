@@ -28,8 +28,10 @@ var (
 	ErrClaimNotFound = errors.New("queue claim not found")
 )
 
-// ClaimStore records which requests were processed, so a redelivery never repeats the business effect.
+// ClaimStore records which requests were processed, so a redelivery never repeats the business effect. A claim whose
+// delivery failed technically is released, so the redelivery can take it at once.
 type ClaimStore interface {
 	Claim(context.Context, Message) (ClaimDecision, error)
 	Complete(context.Context, Message) error
+	Release(context.Context, Message) error
 }

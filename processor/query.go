@@ -39,7 +39,8 @@ func QueryBillByID(db *sql.DB, billID int64) (*BillRow, error) {
 		cl.postal_code as buyer_postal_code,
 		cl.country as buyer_country,
 		cl.scheme_id as buyer_scheme_id,
-		cl.registration_id as buyer_registration_id
+		cl.registration_id as buyer_registration_id,
+		b.invoice_uuid as invoice_uuid
 	FROM bill b
 	JOIN store on store.id = b.store_id
 	JOIN company on company.id = store.company_id
@@ -58,6 +59,7 @@ func QueryBillByID(db *sql.DB, billID int64) (*BillRow, error) {
 		note        sql.NullString
 		userPhone   sql.NullString
 		vatReg      sql.NullString
+		invoiceUUID sql.NullString
 	)
 	err := db.QueryRow(q, billID).Scan(
 		&b.ID, &url, &b.EffectiveDate, &b.PaymentDue, &state, &discount, &b.BranchID, &b.CompanyID,
@@ -68,11 +70,14 @@ func QueryBillByID(db *sql.DB, billID int64) (*BillRow, error) {
 		&b.BuyerAddress, &b.BuyerStreet, &b.BuyerBuilding, &b.BuyerDistrict,
 		&b.BuyerCity, &b.BuyerPostalCode, &b.BuyerCountry,
 		&b.BuyerSchemeID, &b.BuyerRegistration,
+		&invoiceUUID,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("query bill %d: %w", billID, err)
 	}
 	b.URL = url
+	b.State = state.Int64
+	b.InvoiceUUID = invoiceUUID
 	return &b, nil
 }
 
