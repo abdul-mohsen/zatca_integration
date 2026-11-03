@@ -38,8 +38,8 @@ var (
 
 const defaultBookingLease = 5 * time.Minute
 
-// Booking is the number a bill is built with: its ICV, the hash it chains from, and the UUID from its envelope. A booking
-// holds the branch's chain until it is committed or released.
+// Booking is the number a document is built with: its ICV, the hash it chains from, and the UUID from its envelope. A booking
+// holds the branch's chain until it is committed or released. A bill and a credit or debit note of one branch book from the same chain.
 type Booking struct {
 	BranchID   int64
 	RequestKey string
@@ -49,9 +49,13 @@ type Booking struct {
 	PIH        string
 }
 
-// SignedInvoice is one built and signed bill. Commit stores it once, and its XML, hash, and ICV never change afterwards.
+// SignedInvoice is one built and signed document. Commit stores it once, and its XML, hash, and ICV never change afterwards.
+// SourceID is the document's own id: a bill's id, or a note's id. BillID is the bill the document belongs to. For a bill the two are
+// the same id.
 type SignedInvoice struct {
+	DocType   DocType
 	SourceID  int64
+	BillID    int64
 	BranchID  int64
 	UUID      string
 	ICV       uint64
@@ -71,8 +75,8 @@ type Outcome struct {
 	Message      string
 }
 
-// Chain is the invoice chain of each branch. The daemon books the next number, commits the signed invoice and advances the
-// chain in one transaction, and records what ZATCA answered.
+// Chain is the invoice chain of each branch. The daemon books the next number, commits the signed invoice and advances the chain in
+// one transaction, and records what ZATCA answered.
 type Chain interface {
 	Stored(ctx context.Context, msg Message) (*SignedInvoice, error)
 	Book(ctx context.Context, msg Message) (Booking, error)
@@ -82,7 +86,8 @@ type Chain interface {
 }
 
 // SQLChain is the chain in the tenant database. A booking uses the reservation columns of branch_zatca_config (goose 00005).
-// The committed chain is last_icv and previous_invoice_hash on the same row. The invoice itself is a zatca_submission row.
+// The committed chain is last_icv and previous_invoice_hash on the same row. The invoice itself is a zatca_submission row, keyed by its
+// document kind and its source id (goose 00011).
 type SQLChain struct {
 	DB            *sql.DB
 	LeaseDuration time.Duration
@@ -226,6 +231,9 @@ func (c *SQLChain) Commit(ctx context.Context, booking Booking, invoice SignedIn
 	if invoice.BranchID != booking.BranchID || invoice.ICV != booking.ICV || invoice.UUID != booking.UUID || invoice.PIH != booking.PIH {
 		return fmt.Errorf("%w: the invoice does not match its booking", ErrChainConflict)
 	}
+	if !invoice.DocType.valid() {
+		return fmt.Errorf("unknown document type %q", invoice.DocType)
+	}
 	tx, err := c.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin invoice commit: %w", err)
@@ -241,17 +249,15 @@ func (c *SQLChain) Commit(ctx context.Context, booking Booking, invoice SignedIn
 	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO zatca_submission
-			(bill_id, branch_id, status, outcome_state, invoice_icv, previous_invoice_hash,
+			(bill_id, document_type, source_id, branch_id, status, outcome_state, invoice_icv, previous_invoice_hash,
 			 invoice_uuid, invoice_hash, invoice_kind, signed_xml)
-		VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
-	`, invoice.SourceID, invoice.BranchID, outcomePending, invoice.ICV, invoice.PIH,
+		VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
+	`, invoice.BillID, string(invoice.DocType), invoice.SourceID, invoice.BranchID, outcomePending, invoice.ICV, invoice.PIH,
 		invoice.UUID, invoice.Hash, invoice.Kind, invoice.SignedXML); err != nil {
-		return fmt.Errorf("store invoice of bill %d: %w", invoice.SourceID, err)
+		return fmt.Errorf("store invoice of %s %d: %w", invoice.DocType, invoice.SourceID, err)
 	}
-	if _, err := tx.ExecContext(ctx, `
-		UPDATE bill SET invoice_uuid = ?, invoice_hash = ?, qr_code = ? WHERE id = ?
-	`, invoice.UUID, invoice.Hash, invoice.QR, invoice.SourceID); err != nil {
-		return fmt.Errorf("record invoice fields of bill %d: %w", invoice.SourceID, err)
+	if err := recordDocumentFields(ctx, tx, invoice); err != nil {
+		return err
 	}
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE branch_zatca_config
@@ -262,44 +268,87 @@ func (c *SQLChain) Commit(ctx context.Context, booking Booking, invoice SignedIn
 		return fmt.Errorf("advance chain of branch %d: %w", booking.BranchID, err)
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit invoice of bill %d: %w", invoice.SourceID, err)
+		return fmt.Errorf("commit invoice of %s %d: %w", invoice.DocType, invoice.SourceID, err)
 	}
 	return nil
 }
 
-// Stored returns the invoice committed for a bill, or nil while the bill has none. The QR code is read from the bill, where
-// Commit wrote it.
+// recordDocumentFields writes the invoice fields of a document into the table that holds the document, in the commit's transaction:
+// its UUID, its hash, and its QR code. A note's UUID was created by the backend, and the commit writes the same value.
+func recordDocumentFields(ctx context.Context, tx *sql.Tx, invoice SignedInvoice) error {
+	var query string
+	switch invoice.DocType {
+	case DocBill:
+		query = `UPDATE bill SET invoice_uuid = ?, invoice_hash = ?, qr_code = ? WHERE id = ?`
+	case DocCredit:
+		query = `UPDATE credit_note SET invoice_uuid = ?, invoice_hash = ?, invoice_qr = ? WHERE id = ?`
+	case DocDebit:
+		query = `UPDATE debit_note SET invoice_uuid = ?, invoice_hash = ?, invoice_qr = ? WHERE id = ?`
+	default:
+		return fmt.Errorf("unknown document type %q", invoice.DocType)
+	}
+	if _, err := tx.ExecContext(ctx, query, invoice.UUID, invoice.Hash, invoice.QR, invoice.SourceID); err != nil {
+		return fmt.Errorf("record invoice fields of %s %d: %w", invoice.DocType, invoice.SourceID, err)
+	}
+	return nil
+}
+
+// storedQR returns the QR code of a stored document. Each kind keeps its QR code in the table that holds the document.
+func (c *SQLChain) storedQR(ctx context.Context, docType DocType, id int64) (string, error) {
+	var query string
+	switch docType {
+	case DocBill:
+		query = `SELECT qr_code FROM bill WHERE id = ?`
+	case DocCredit:
+		query = `SELECT invoice_qr FROM credit_note WHERE id = ?`
+	case DocDebit:
+		query = `SELECT invoice_qr FROM debit_note WHERE id = ?`
+	default:
+		return "", fmt.Errorf("unknown document type %q", docType)
+	}
+	var qr sql.NullString
+	if err := c.DB.QueryRowContext(ctx, query, id).Scan(&qr); err != nil {
+		return "", fmt.Errorf("read QR code of %s %d: %w", docType, id, err)
+	}
+	return qr.String, nil
+}
+
+// Stored returns the invoice committed for a document, or nil while the document has none. The document is found by its kind and its
+// id, so a bill and a note with the same id are two documents.
 func (c *SQLChain) Stored(ctx context.Context, msg Message) (*SignedInvoice, error) {
 	var (
 		invoice SignedInvoice
-		qr      sql.NullString
 		outcome string
 	)
 	err := c.DB.QueryRowContext(ctx, `
-		SELECT s.bill_id, s.branch_id, s.invoice_icv, s.previous_invoice_hash, s.invoice_uuid, s.invoice_hash,
-		       s.invoice_kind, s.signed_xml, b.qr_code, s.outcome_state
+		SELECT s.bill_id, s.source_id, s.branch_id, s.invoice_icv, s.previous_invoice_hash, s.invoice_uuid, s.invoice_hash,
+		       s.invoice_kind, s.signed_xml, s.outcome_state
 		FROM zatca_submission s
-		JOIN bill b ON b.id = s.bill_id
-		WHERE s.bill_id = ?
-	`, msg.ID).Scan(
-		&invoice.SourceID, &invoice.BranchID, &invoice.ICV, &invoice.PIH,
-		&invoice.UUID, &invoice.Hash, &invoice.Kind, &invoice.SignedXML, &qr, &outcome,
+		WHERE s.document_type = ? AND s.source_id = ?
+	`, string(msg.DocType), msg.ID).Scan(
+		&invoice.BillID, &invoice.SourceID, &invoice.BranchID, &invoice.ICV, &invoice.PIH,
+		&invoice.UUID, &invoice.Hash, &invoice.Kind, &invoice.SignedXML, &outcome,
 	)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return nil, nil
 	case err != nil:
-		return nil, fmt.Errorf("lookup invoice of bill %d: %w", msg.ID, err)
+		return nil, fmt.Errorf("lookup invoice of %s %d: %w", msg.DocType, msg.ID, err)
 	}
-	invoice.QR = qr.String
+	invoice.DocType = msg.DocType
+	qr, err := c.storedQR(ctx, msg.DocType, msg.ID)
+	if err != nil {
+		return nil, err
+	}
+	invoice.QR = qr
 	if outcome != outcomePending {
 		invoice.Outcome = outcome
 	}
 	return &invoice, nil
 }
 
-// Record stores ZATCA's outcome for an invoice and appends it to the outcome log. A bill that ZATCA accepted or warned is
-// marked issued. A rejected bill keeps its state, and the rejection is kept with it.
+// Record stores ZATCA's outcome for an invoice and appends it to the outcome log. A bill that ZATCA accepted or warned is marked
+// issued. A note leaves its bill as it is. A rejected document keeps its state, and the rejection is kept with it.
 func (c *SQLChain) Record(ctx context.Context, invoice SignedInvoice, outcome Outcome) error {
 	status, err := submissionStatus(outcome.State)
 	if err != nil {
@@ -313,9 +362,9 @@ func (c *SQLChain) Record(ctx context.Context, invoice SignedInvoice, outcome Ou
 
 	var submissionID int64
 	if err := tx.QueryRowContext(ctx, `
-		SELECT id FROM zatca_submission WHERE bill_id = ? FOR UPDATE
-	`, invoice.SourceID).Scan(&submissionID); err != nil {
-		return fmt.Errorf("lock submission of bill %d: %w", invoice.SourceID, err)
+		SELECT id FROM zatca_submission WHERE document_type = ? AND source_id = ? FOR UPDATE
+	`, string(invoice.DocType), invoice.SourceID).Scan(&submissionID); err != nil {
+		return fmt.Errorf("lock submission of %s %d: %w", invoice.DocType, invoice.SourceID, err)
 	}
 
 	providerCode := nullString(outcome.ProviderCode, 64)
@@ -333,16 +382,16 @@ func (c *SQLChain) Record(ctx context.Context, invoice SignedInvoice, outcome Ou
 		WHERE id = ? AND outcome_state = ?
 	`, status, outcome.State, providerCode, rejectionCode, rejectionMsg, warningMsg, submissionID, outcomePending)
 	if err != nil {
-		return fmt.Errorf("record outcome of bill %d: %w", invoice.SourceID, err)
+		return fmt.Errorf("record outcome of %s %d: %w", invoice.DocType, invoice.SourceID, err)
 	}
 	recorded, err := result.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("inspect outcome of bill %d: %w", invoice.SourceID, err)
+		return fmt.Errorf("inspect outcome of %s %d: %w", invoice.DocType, invoice.SourceID, err)
 	}
 	if recorded == 0 {
 		// The first answer stands. A later record never changes an answer, the invoice, or its hash.
 		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("commit repeated outcome of bill %d: %w", invoice.SourceID, err)
+			return fmt.Errorf("commit repeated outcome of %s %d: %w", invoice.DocType, invoice.SourceID, err)
 		}
 		return nil
 	}
@@ -351,15 +400,15 @@ func (c *SQLChain) Record(ctx context.Context, invoice SignedInvoice, outcome Ou
 			(submission_id, outcome_state, provider_code, provider_warning_message, observed_at)
 		VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
 	`, submissionID, outcome.State, providerCode, warningMsg); err != nil {
-		return fmt.Errorf("append outcome of bill %d: %w", invoice.SourceID, err)
+		return fmt.Errorf("append outcome of %s %d: %w", invoice.DocType, invoice.SourceID, err)
 	}
-	if outcome.State != OutcomeRejected {
+	if outcome.State != OutcomeRejected && invoice.DocType == DocBill {
 		if _, err := tx.ExecContext(ctx, `UPDATE bill SET state = 3 WHERE id = ?`, invoice.SourceID); err != nil {
 			return fmt.Errorf("mark bill %d issued: %w", invoice.SourceID, err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit outcome of bill %d: %w", invoice.SourceID, err)
+		return fmt.Errorf("commit outcome of %s %d: %w", invoice.DocType, invoice.SourceID, err)
 	}
 	return nil
 }
