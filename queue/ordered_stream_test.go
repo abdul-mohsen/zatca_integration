@@ -105,6 +105,7 @@ type fakePipeline struct {
 	buildErr   error
 	submitErr  error
 	outcome    Outcome
+	outcomeErr error
 	built      []Booking
 	submitted  []SignedInvoice
 }
@@ -123,7 +124,7 @@ func (p *fakePipeline) Submit(_ context.Context, invoice SignedInvoice) (Outcome
 	if p.submitErr != nil {
 		return Outcome{}, p.submitErr
 	}
-	return p.outcome, nil
+	return p.outcome, p.outcomeErr
 }
 
 type fakePrepared struct {
@@ -333,6 +334,33 @@ func TestRejectedOutcomeIsRecordedAndReportedAfterTheAck(t *testing.T) {
 	}
 	if h.acks != 1 {
 		t.Fatalf("acks = %d; want 1", h.acks)
+	}
+}
+
+// An ambiguous answer is recorded as it is, never as a rejection. The claim completes, and the redelivery never sends the
+// invoice again. The error is reported for reconciliation.
+func TestAmbiguousAnswerCompletesTheClaimAndIsNeverSentAgain(t *testing.T) {
+	h := newHarness(t)
+	h.pipeline.outcome = Outcome{State: OutcomeAmbiguous, ProviderCode: "409", Message: "already reported"}
+	h.pipeline.outcomeErr = fmt.Errorf("%w: bill 42", ErrOutcomeAmbiguous)
+	if err := h.deliver(); !errors.Is(err, ErrOutcomeAmbiguous) || errors.Is(err, ErrInvoiceRejected) {
+		t.Fatalf("deliver = %v; want ErrOutcomeAmbiguous and no rejection", err)
+	}
+	expectSteps(t, h.calls, "claim", "stored", "prepare", "book", "build", "commit", "submit", "record", "complete")
+	if len(h.chain.recorded) != 1 || h.chain.recorded[0].State != OutcomeAmbiguous {
+		t.Fatalf("recorded = %+v; want one ambiguous outcome and no rejection", h.chain.recorded)
+	}
+	if h.acks != 1 {
+		t.Fatalf("acks = %d; want 1", h.acks)
+	}
+
+	h.calls = nil
+	if err := h.deliver(); err != nil {
+		t.Fatalf("redelivery: %v", err)
+	}
+	expectSteps(t, h.calls, "claim", "stored", "complete")
+	if len(h.pipeline.submitted) != 1 {
+		t.Fatalf("submitted %d times; want once", len(h.pipeline.submitted))
 	}
 }
 

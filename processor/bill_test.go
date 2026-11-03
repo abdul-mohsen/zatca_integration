@@ -2,10 +2,17 @@ package processor
 
 import (
 	"database/sql"
+	"errors"
+	"fmt"
+	"net/http"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/zatca-go/zatca/client"
 	"github.com/zatca-go/zatca/config"
+	"github.com/zatca-go/zatca/models"
 	"github.com/zatca-go/zatca/queue"
 )
 
@@ -93,5 +100,85 @@ func TestBuildBillInvoiceUsesTheBookingAndNothingElse(t *testing.T) {
 	inv := buildBillInvoice(verifiedConfig(), bill, []ProductRow{lineOf(1, 10)}, issued, booking)
 	if inv.UUID != booking.UUID || inv.InvoiceCounterValue != 12 || inv.PreviousInvoiceHash != "previous-hash" {
 		t.Fatalf("invoice = UUID %s, ICV %d, PIH %s; want the booking's values", inv.UUID, inv.InvoiceCounterValue, inv.PreviousInvoiceHash)
+	}
+}
+
+// ZATCA can answer 2xx and still list errors, which reject the invoice. Warnings accept it with a warning.
+func TestSuccessfulAnswerIsClassifiedByItsMessages(t *testing.T) {
+	cases := map[string]struct {
+		resp *models.InvoiceResponse
+		want queue.Outcome
+	}{
+		"error messages reject the invoice": {
+			resp: &models.InvoiceResponse{ValidationResults: &models.ValidationResults{ErrorMessages: []models.ValidationMessage{
+				{Code: "BR-KSA-61", Message: "seller VAT is missing"},
+				{Code: "BR-KSA-62", Message: "buyer name is missing"},
+			}}},
+			want: queue.Outcome{State: queue.OutcomeRejected, ProviderCode: "BR-KSA-61", Message: "seller VAT is missing; buyer name is missing"},
+		},
+		"errors win over warnings": {
+			resp: &models.InvoiceResponse{ValidationResults: &models.ValidationResults{
+				WarningMessages: []models.ValidationMessage{{Code: "BR-KSA-W1", Message: "note is long"}},
+				ErrorMessages:   []models.ValidationMessage{{Code: "BR-KSA-61", Message: "seller VAT is missing"}},
+			}},
+			want: queue.Outcome{State: queue.OutcomeRejected, ProviderCode: "BR-KSA-61", Message: "seller VAT is missing"},
+		},
+		"warning messages accept with a warning": {
+			resp: &models.InvoiceResponse{ValidationResults: &models.ValidationResults{
+				WarningMessages: []models.ValidationMessage{{Code: "BR-KSA-W1", Message: "note is long"}},
+			}},
+			want: queue.Outcome{State: queue.OutcomeWarning, ProviderCode: "BR-KSA-W1", Message: "note is long"},
+		},
+		"warnings accept with a warning": {
+			resp: &models.InvoiceResponse{Warnings: []models.ErrorDetail{{Code: "W1", Message: "late"}}},
+			want: queue.Outcome{State: queue.OutcomeWarning, ProviderCode: "W1", Message: "late"},
+		},
+		"neither accepts": {
+			resp: &models.InvoiceResponse{ValidationResults: &models.ValidationResults{Status: "PASS"}},
+			want: queue.Outcome{State: queue.OutcomeAccepted},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := responseOutcome(tc.resp); got != tc.want {
+				t.Fatalf("responseOutcome = %+v; want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+// A 409 means ZATCA already holds the invoice, for example after a crash. The answer is ambiguous, not a rejection, and the
+// error names the bill and says it needs reconciliation, so the operator is alerted.
+func TestConflictIsAmbiguousAndNamesTheBill(t *testing.T) {
+	invoice := queue.SignedInvoice{SourceID: 42, UUID: testInvoiceUUID}
+	answer := fmt.Errorf("ReportInvoice: %w", &client.APIError{StatusCode: http.StatusConflict, Body: "already reported"})
+	outcome, err := rejectionOutcome(invoice, answer)
+	if outcome != (queue.Outcome{State: queue.OutcomeAmbiguous, ProviderCode: "409", Message: "already reported"}) {
+		t.Fatalf("outcome = %+v; want an ambiguous outcome with code 409", outcome)
+	}
+	if !errors.Is(err, queue.ErrOutcomeAmbiguous) {
+		t.Fatalf("err = %v; want ErrOutcomeAmbiguous", err)
+	}
+	for _, want := range []string{"bill 42", testInvoiceUUID, "reconciliation"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("err = %q; want it to contain %q", err, want)
+		}
+	}
+}
+
+// Other 4xx answers reject the invoice. Authentication, timeouts, rate limits, and server errors stay technical.
+func TestRejectionOutcomeOnlyForInvoiceRejections(t *testing.T) {
+	invoice := queue.SignedInvoice{SourceID: 42, UUID: testInvoiceUUID}
+	for _, status := range []int{http.StatusBadRequest, http.StatusUnprocessableEntity} {
+		outcome, err := rejectionOutcome(invoice, &client.APIError{StatusCode: status, Body: "NOT_VALID"})
+		if err != nil || outcome != (queue.Outcome{State: queue.OutcomeRejected, ProviderCode: strconv.Itoa(status), Message: "NOT_VALID"}) {
+			t.Fatalf("HTTP %d = %+v, %v; want a rejection", status, outcome, err)
+		}
+	}
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusInternalServerError} {
+		outcome, err := rejectionOutcome(invoice, &client.APIError{StatusCode: status})
+		if err == nil || outcome != (queue.Outcome{}) || errors.Is(err, queue.ErrOutcomeAmbiguous) {
+			t.Fatalf("HTTP %d = %+v, %v; want a technical error with no outcome", status, outcome, err)
+		}
 	}
 }
