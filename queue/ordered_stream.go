@@ -12,9 +12,9 @@ type Prepared interface {
 	Build(ctx context.Context, booking Booking) (SignedInvoice, error)
 }
 
-// Pipeline is the fiscal work of one document type. Prepare verifies a document and loads what Build needs, before any number
-// is booked. Submit sends a committed invoice to ZATCA. It returns an error only for a technical failure. A rejection by ZATCA
-// is an Outcome.
+// Pipeline is the fiscal work of the documents: a bill, a credit note, or a debit note. Prepare verifies a document and loads what
+// Build needs, before any number is booked. Submit sends a committed invoice to ZATCA. It returns an error only for a technical failure.
+// A rejection by ZATCA is an Outcome.
 type Pipeline interface {
 	Prepare(ctx context.Context, msg Message) (Prepared, error)
 	Submit(ctx context.Context, invoice SignedInvoice) (Outcome, error)
@@ -117,7 +117,7 @@ func (s *OrderedStream) process(ctx context.Context, msg Message, ack func() err
 	}
 	var rejected error
 	if outcome.State == OutcomeRejected {
-		rejected = fmt.Errorf("%w: bill %d: %s", ErrInvoiceRejected, msg.ID, outcome.Message)
+		rejected = fmt.Errorf("%w: %s %d: %s", ErrInvoiceRejected, msg.DocType, msg.ID, outcome.Message)
 	}
 	return s.finish(ctx, msg, ack, rejected)
 }
@@ -165,8 +165,8 @@ func (s *OrderedStream) invoiceFor(ctx context.Context, msg Message) (SignedInvo
 // is a technical failure for an operator to look at. It is not an input error.
 func checkStored(invoice SignedInvoice, msg Message) (SignedInvoice, error) {
 	if invoice.UUID != msg.InvoiceUUID || invoice.BranchID != msg.BranchID {
-		return SignedInvoice{}, fmt.Errorf("bill %d is stored as invoice %s of branch %d, not %s of branch %d",
-			msg.ID, invoice.UUID, invoice.BranchID, msg.InvoiceUUID, msg.BranchID)
+		return SignedInvoice{}, fmt.Errorf("%s %d is stored as invoice %s of branch %d, not %s of branch %d",
+			msg.DocType, msg.ID, invoice.UUID, invoice.BranchID, msg.InvoiceUUID, msg.BranchID)
 	}
 	return invoice, nil
 }

@@ -109,12 +109,12 @@ type fakePipeline struct {
 	submitted  []SignedInvoice
 }
 
-func (p *fakePipeline) Prepare(context.Context, Message) (Prepared, error) {
+func (p *fakePipeline) Prepare(_ context.Context, msg Message) (Prepared, error) {
 	p.calls.add("prepare")
 	if p.prepareErr != nil {
 		return nil, p.prepareErr
 	}
-	return &fakePrepared{pipeline: p}, nil
+	return &fakePrepared{pipeline: p, msg: msg}, nil
 }
 
 func (p *fakePipeline) Submit(_ context.Context, invoice SignedInvoice) (Outcome, error) {
@@ -128,6 +128,7 @@ func (p *fakePipeline) Submit(_ context.Context, invoice SignedInvoice) (Outcome
 
 type fakePrepared struct {
 	pipeline *fakePipeline
+	msg      Message
 }
 
 func (f *fakePrepared) Build(_ context.Context, booking Booking) (SignedInvoice, error) {
@@ -137,7 +138,9 @@ func (f *fakePrepared) Build(_ context.Context, booking Booking) (SignedInvoice,
 		return SignedInvoice{}, f.pipeline.buildErr
 	}
 	return SignedInvoice{
-		SourceID:  42,
+		DocType:   f.msg.DocType,
+		SourceID:  f.msg.ID,
+		BillID:    42,
 		BranchID:  booking.BranchID,
 		UUID:      booking.UUID,
 		ICV:       booking.ICV,
@@ -405,5 +408,50 @@ func TestEnvelopeWithoutItsInvoiceUUIDIsRefusedBeforeAnyWork(t *testing.T) {
 	expectSteps(t, h.calls)
 	if h.acks != 0 {
 		t.Fatalf("acks = %d; want 0", h.acks)
+	}
+}
+
+// decodeFixture decodes one of the contract envelopes of the queue testdata.
+func decodeFixture(t *testing.T, name string) Message {
+	t.Helper()
+	msg, err := DecodeEnvelope(readFixture(t, name))
+	if err != nil {
+		t.Fatalf("decode %s: %v", name, err)
+	}
+	return msg
+}
+
+// A credit or debit note takes the same steps as a bill. It is verified, booked on the chain that the bills share, built, committed
+// under its own kind and id, submitted, and recorded.
+func TestNoteIsVerifiedBookedBuiltCommittedSubmittedAndCompleted(t *testing.T) {
+	for name, fixture := range map[string]string{"credit": "credit_envelope.json", "debit": "debit_envelope.json"} {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t)
+			h.msg = decodeFixture(t, fixture)
+			if err := h.deliver(); err != nil {
+				t.Fatalf("deliver: %v", err)
+			}
+			expectSteps(t, h.calls, "claim", "stored", "prepare", "book", "build", "commit", "submit", "record", "complete")
+			if h.chain.stored == nil || h.chain.stored.DocType != h.msg.DocType || h.chain.stored.SourceID != h.msg.ID {
+				t.Fatalf("committed %+v; want the %s %d", h.chain.stored, h.msg.DocType, h.msg.ID)
+			}
+			if h.acks != 1 {
+				t.Fatalf("acks = %d; want 1", h.acks)
+			}
+		})
+	}
+}
+
+// A note that cannot be invoiced is refused before a number is booked. The request ends, and nothing is committed.
+func TestRejectedNoteBooksNothingAndEndsTheRequest(t *testing.T) {
+	h := newHarness(t)
+	h.msg = decodeFixture(t, "credit_envelope.json")
+	h.pipeline.prepareErr = fmt.Errorf("%w: the note has no reason", ErrRejectedInput)
+	if err := h.deliver(); !errors.Is(err, ErrRejectedInput) {
+		t.Fatalf("deliver = %v; want ErrRejectedInput", err)
+	}
+	expectSteps(t, h.calls, "claim", "stored", "prepare", "complete")
+	if h.chain.stored != nil || h.acks != 1 {
+		t.Fatalf("stored = %v, acks = %d; want nothing committed and one ACK", h.chain.stored, h.acks)
 	}
 }

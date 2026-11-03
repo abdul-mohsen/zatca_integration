@@ -21,19 +21,31 @@ import (
 // ServiceFunc returns the ZATCA service of a branch and the branch's configuration.
 type ServiceFunc func(branchID int64) (*zatca.Service, *config.Config, error)
 
-// BillPipeline is the fiscal pipeline of a sale. It verifies the bill, builds and signs its invoice under a booking, and
-// submits the stored XML to ZATCA.
-type BillPipeline struct {
+// DocumentPipeline is the fiscal pipeline of the documents: a final sale, a credit note, and a debit note. It verifies the document,
+// builds and signs its invoice under a booking, and submits the stored XML to ZATCA. The three kinds take the same steps. They differ in
+// what they verify, and in the invoice they build.
+type DocumentPipeline struct {
 	DB      *sql.DB
 	Service ServiceFunc
 }
 
-// Prepare loads and verifies the bill. A bill that cannot be reported is refused here, before any number is booked.
-func (p *BillPipeline) Prepare(_ context.Context, msg queue.Message) (queue.Prepared, error) {
+// Prepare loads and verifies the document. A document that cannot be reported is refused here, before any number is booked.
+func (p *DocumentPipeline) Prepare(ctx context.Context, msg queue.Message) (queue.Prepared, error) {
 	svc, cfg, err := p.Service(msg.BranchID)
 	if err != nil {
 		return nil, err
 	}
+	switch msg.DocType {
+	case queue.DocBill:
+		return p.prepareBill(msg, svc, cfg)
+	case queue.DocCredit, queue.DocDebit:
+		return p.prepareNote(ctx, msg, svc, cfg)
+	}
+	return nil, fmt.Errorf("%w: unsupported document type %q", queue.ErrRejectedInput, msg.DocType)
+}
+
+// prepareBill loads and verifies a final sale of the envelope's branch.
+func (p *DocumentPipeline) prepareBill(msg queue.Message, svc *zatca.Service, cfg *config.Config) (queue.Prepared, error) {
 	bill, err := QueryBillByID(p.DB, msg.ID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("%w: bill %d does not exist", queue.ErrRejectedInput, msg.ID)
@@ -52,12 +64,20 @@ func (p *BillPipeline) Prepare(_ context.Context, msg queue.Message) (queue.Prep
 	if err != nil {
 		return nil, fmt.Errorf("%w: bill %d: %v", queue.ErrRejectedInput, msg.ID, err)
 	}
-	return &billDocument{svc: svc, cfg: cfg, bill: *bill, products: products, issueTime: issueTime}, nil
+	return &document{
+		svc:      svc,
+		docType:  queue.DocBill,
+		sourceID: bill.ID,
+		billID:   bill.ID,
+		build: func(booking queue.Booking) *invoice.Invoice {
+			return buildBillInvoice(cfg, *bill, products, issueTime, booking)
+		},
+	}, nil
 }
 
-// Submit sends a committed invoice to ZATCA. A standard invoice is cleared, and a simplified one is reported. A rejection
-// by ZATCA is an outcome. Any other failure is technical, and the stored XML is sent again later.
-func (p *BillPipeline) Submit(_ context.Context, invoice queue.SignedInvoice) (queue.Outcome, error) {
+// Submit sends a committed invoice to ZATCA. A standard invoice is cleared, and a simplified one is reported. A rejection by ZATCA is
+// an outcome. Any other failure is technical, and the stored XML is sent again later.
+func (p *DocumentPipeline) Submit(_ context.Context, invoice queue.SignedInvoice) (queue.Outcome, error) {
 	svc, _, err := p.Service(invoice.BranchID)
 	if err != nil {
 		return queue.Outcome{}, err
@@ -67,7 +87,7 @@ func (p *BillPipeline) Submit(_ context.Context, invoice queue.SignedInvoice) (q
 		return queue.Outcome{}, err
 	}
 	if apiReq.InvoiceHash != "" && apiReq.InvoiceHash != invoice.Hash {
-		return queue.Outcome{}, fmt.Errorf("stored hash of bill %d does not match its signed XML", invoice.SourceID)
+		return queue.Outcome{}, fmt.Errorf("stored hash of %s %d does not match its signed XML", invoice.DocType, invoice.SourceID)
 	}
 
 	var resp *models.InvoiceResponse
@@ -80,7 +100,7 @@ func (p *BillPipeline) Submit(_ context.Context, invoice queue.SignedInvoice) (q
 		return rejectionOutcome(err)
 	}
 	if resp == nil {
-		return queue.Outcome{}, fmt.Errorf("ZATCA returned no response for bill %d", invoice.SourceID)
+		return queue.Outcome{}, fmt.Errorf("ZATCA returned no response for %s %d", invoice.DocType, invoice.SourceID)
 	}
 	if len(resp.Warnings) > 0 {
 		warning := resp.Warnings[0]
@@ -107,52 +127,55 @@ func isInvoiceRejection(status int) bool {
 	return status >= http.StatusBadRequest && status < http.StatusInternalServerError
 }
 
-// billDocument is a verified bill, ready to be built under a booking.
-type billDocument struct {
-	svc       *zatca.Service
-	cfg       *config.Config
-	bill      BillRow
-	products  []ProductRow
-	issueTime time.Time
+// document is a verified document, ready to be built under a booking. Its build function makes the invoice, and nothing is sent to
+// ZATCA while it is built.
+type document struct {
+	svc      *zatca.Service
+	docType  queue.DocType
+	sourceID int64
+	billID   int64
+	build    func(booking queue.Booking) *invoice.Invoice
 }
 
-// Build builds the invoice with the booked UUID, ICV, and previous hash, then signs it and computes its hash and QR code.
-// Nothing is sent to ZATCA here.
-func (d *billDocument) Build(_ context.Context, booking queue.Booking) (queue.SignedInvoice, error) {
-	inv := buildBillInvoice(d.cfg, d.bill, d.products, d.issueTime, booking)
+// Build builds the invoice with the booked UUID, ICV, and previous hash, then signs it and computes its hash and QR code. Nothing is
+// sent to ZATCA here.
+func (d *document) Build(_ context.Context, booking queue.Booking) (queue.SignedInvoice, error) {
+	inv := d.build(booking)
 	xmlStr, err := inv.ToXML()
 	if err != nil {
-		return queue.SignedInvoice{}, fmt.Errorf("build XML of bill %d: %w", d.bill.ID, err)
+		return queue.SignedInvoice{}, fmt.Errorf("build XML of %s %d: %w", d.docType, d.sourceID, err)
 	}
 	signedXML, hash, err := d.svc.SDK.SignInvoice(xmlStr)
 	if err != nil {
-		return queue.SignedInvoice{}, fmt.Errorf("sign bill %d: %w", d.bill.ID, err)
+		return queue.SignedInvoice{}, fmt.Errorf("sign %s %d: %w", d.docType, d.sourceID, err)
 	}
 	apiReq, err := apiRequest(d.svc, signedXML)
 	if err != nil {
 		return queue.SignedInvoice{}, err
 	}
 	if apiReq.UUID != booking.UUID {
-		return queue.SignedInvoice{}, fmt.Errorf("signed bill %d carries UUID %s, not the booked %s",
-			d.bill.ID, apiReq.UUID, booking.UUID)
+		return queue.SignedInvoice{}, fmt.Errorf("signed %s %d carries UUID %s, not the booked %s",
+			d.docType, d.sourceID, apiReq.UUID, booking.UUID)
 	}
 	invoiceHash := apiReq.InvoiceHash
 	if invoiceHash == "" {
 		invoiceHash = hash
 	}
 	if invoiceHash == "" {
-		return queue.SignedInvoice{}, fmt.Errorf("signed bill %d has no invoice hash", d.bill.ID)
+		return queue.SignedInvoice{}, fmt.Errorf("signed %s %d has no invoice hash", d.docType, d.sourceID)
 	}
 	qr, err := d.svc.SDK.GenerateQR(signedXML)
 	if err != nil {
-		return queue.SignedInvoice{}, fmt.Errorf("QR code of bill %d: %w", d.bill.ID, err)
+		return queue.SignedInvoice{}, fmt.Errorf("QR code of %s %d: %w", d.docType, d.sourceID, err)
 	}
 	kind := queue.InvoiceSimplified
 	if inv.IsStandard() {
 		kind = queue.InvoiceStandard
 	}
 	return queue.SignedInvoice{
-		SourceID:  d.bill.ID,
+		DocType:   d.docType,
+		SourceID:  d.sourceID,
+		BillID:    d.billID,
 		BranchID:  booking.BranchID,
 		UUID:      booking.UUID,
 		ICV:       booking.ICV,
@@ -207,31 +230,36 @@ func apiRequest(svc *zatca.Service, signedXML string) (models.InvoiceRequest, er
 	return req, nil
 }
 
+// supplierOf is the seller of an invoice: the branch's company, from its configuration.
+func supplierOf(cfg *config.Config) invoice.Party {
+	return invoice.Party{
+		RegistrationName:   cfg.Seller.Name,
+		RegistrationNameAR: cfg.Seller.NameAR,
+		VAT:                cfg.Seller.VAT,
+		SchemeID:           cfg.Seller.CRN,
+		ID:                 cfg.Seller.CRN,
+		Street:             cfg.Seller.Street,
+		Building:           cfg.Seller.Building,
+		District:           cfg.Seller.District,
+		City:               cfg.Seller.City,
+		PostalCode:         cfg.Seller.PostalCode,
+		Country:            cfg.Seller.Country,
+	}
+}
+
 // buildBillInvoice constructs the invoice (type 388) under a booking. It uses the booked UUID, ICV, and previous hash, and
 // never chooses its own.
 func buildBillInvoice(cfg *config.Config, b BillRow, products []ProductRow, issueTime time.Time, booking queue.Booking) *invoice.Invoice {
 	isStandard := b.BuyerVAT.Valid && b.BuyerVAT.String != ""
 	inv := &invoice.Invoice{
-		ID:               fmt.Sprintf("INV-%d", b.ID),
-		UUID:             booking.UUID,
-		IssueDate:        issueTime,
-		IssueTime:        issueTime,
-		TypeCode:         invoice.TypeInvoice,
-		DocumentCurrency: "SAR",
-		TaxCurrency:      "SAR",
-		Supplier: invoice.Party{
-			RegistrationName:   cfg.Seller.Name,
-			RegistrationNameAR: cfg.Seller.NameAR,
-			VAT:                cfg.Seller.VAT,
-			SchemeID:           cfg.Seller.CRN,
-			ID:                 cfg.Seller.CRN,
-			Street:             cfg.Seller.Street,
-			Building:           cfg.Seller.Building,
-			District:           cfg.Seller.District,
-			City:               cfg.Seller.City,
-			PostalCode:         cfg.Seller.PostalCode,
-			Country:            cfg.Seller.Country,
-		},
+		ID:                  fmt.Sprintf("INV-%d", b.ID),
+		UUID:                booking.UUID,
+		IssueDate:           issueTime,
+		IssueTime:           issueTime,
+		TypeCode:            invoice.TypeInvoice,
+		DocumentCurrency:    "SAR",
+		TaxCurrency:         "SAR",
+		Supplier:            supplierOf(cfg),
 		Customer:            buildCustomer(b, isStandard),
 		PreviousInvoiceHash: booking.PIH,
 		InvoiceCounterValue: int(booking.ICV),

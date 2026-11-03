@@ -68,6 +68,7 @@ type BillRow struct {
 	BuyerRegistration sql.NullString
 	State             int64
 	InvoiceUUID       sql.NullString
+	Total             float64
 }
 
 // LoadProducts loads products for a given bill from the bill_product table.

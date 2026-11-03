@@ -112,6 +112,7 @@ func TestToXMLCreditNote(t *testing.T) {
 	inv := sampleInvoice()
 	inv.TypeCode = TypeCreditNote
 	inv.BillingReferenceID = "SME00001"
+	inv.BillingReferenceUUID = "0c4f7a1e-2b3d-4e5f-8a9b-1c2d3e4f5a6b"
 
 	xml, err := inv.ToXML()
 	if err != nil {
@@ -123,6 +124,29 @@ func TestToXMLCreditNote(t *testing.T) {
 	}
 	if !strings.Contains(xml, "SME00001") {
 		t.Error("should contain billing reference")
+	}
+	// The billing reference names the original invoice by its number and its UUID, in that order.
+	want := "<cac:InvoiceDocumentReference>\n            <cbc:ID>SME00001</cbc:ID>\n            <cbc:UUID>0c4f7a1e-2b3d-4e5f-8a9b-1c2d3e4f5a6b</cbc:UUID>"
+	if !strings.Contains(xml, want) {
+		t.Error("the billing reference should carry the original invoice's UUID")
+	}
+}
+
+func TestToXMLDebitNote(t *testing.T) {
+	inv := sampleInvoice()
+	inv.TypeCode = TypeDebitNote
+	inv.BillingReferenceID = "SME00001"
+
+	xml, err := inv.ToXML()
+	if err != nil {
+		t.Fatalf("ToXML() error: %v", err)
+	}
+	if !strings.Contains(xml, ">383<") {
+		t.Error("should contain debit note type code 383")
+	}
+	// Without a UUID, the billing reference is its number alone.
+	if !strings.Contains(xml, "<cac:InvoiceDocumentReference>\n            <cbc:ID>SME00001</cbc:ID>\n        </cac:InvoiceDocumentReference>") {
+		t.Error("a billing reference without a UUID should not invent one")
 	}
 }
 

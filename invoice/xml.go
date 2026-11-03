@@ -63,11 +63,14 @@ func (inv *Invoice) ToXML() (string, error) {
 	writeElement(&b, "cbc:DocumentCurrencyCode", orDefault(inv.DocumentCurrency, "SAR"))
 	writeElement(&b, "cbc:TaxCurrencyCode", orDefault(inv.TaxCurrency, "SAR"))
 
-	// Billing Reference (for credit/debit notes)
+	// Billing Reference (for credit/debit notes): the original invoice, by its number and its UUID
 	if inv.BillingReferenceID != "" {
 		b.WriteString("    <cac:BillingReference>\n")
 		b.WriteString("        <cac:InvoiceDocumentReference>\n")
 		writeElementIndent(&b, "            ", "cbc:ID", inv.BillingReferenceID)
+		if inv.BillingReferenceUUID != "" {
+			writeElementIndent(&b, "            ", "cbc:UUID", inv.BillingReferenceUUID)
+		}
 		b.WriteString("        </cac:InvoiceDocumentReference>\n")
 		b.WriteString("    </cac:BillingReference>\n")
 	}

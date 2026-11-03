@@ -81,7 +81,7 @@ func runWorker(js nats.JetStreamContext, tc *tenantCtx, getService getServiceFun
 		log.Printf("ERROR: subscribe %s: %v", subject, err)
 		return
 	}
-	stream := queue.NewOrderedStream(tc.claims, tc.chain, &processor.BillPipeline{
+	stream := queue.NewOrderedStream(tc.claims, tc.chain, &processor.DocumentPipeline{
 		DB: tc.db,
 		Service: func(branch int64) (*zatca.Service, *config.Config, error) {
 			return getService(dbName, branch)
@@ -123,16 +123,16 @@ func handleDelivery(stream *queue.OrderedStream, tc *tenantCtx, dbName string, b
 	switch {
 	case err == nil:
 	case errors.Is(err, queue.ErrClaimInFlight), errors.Is(err, queue.ErrChainBusy):
-		log.Printf("Document still in flight: bill %d: %v", msg.ID, err)
+		log.Printf("Document still in flight: %s %d: %v", msg.DocType, msg.ID, err)
 	case errors.Is(err, queue.ErrInvoiceRejected):
-		log.Printf("ERROR: ZATCA rejected verified bill %d: %v", msg.ID, err)
-		alert(tc, fmt.Sprintf("bill %d of branch %d rejected by ZATCA", msg.ID, msg.BranchID), err)
+		log.Printf("ERROR: ZATCA rejected verified %s %d: %v", msg.DocType, msg.ID, err)
+		alert(tc, fmt.Sprintf("%s %d of branch %d rejected by ZATCA", msg.DocType, msg.ID, msg.BranchID), err)
 	case errors.Is(err, queue.ErrRejectedInput), errors.Is(err, queue.ErrFingerprintConflict):
-		log.Printf("ERROR: bill %d not invoiced: %v", msg.ID, err)
-		alert(tc, fmt.Sprintf("bill %d of branch %d", msg.ID, msg.BranchID), err)
+		log.Printf("ERROR: %s %d not invoiced: %v", msg.DocType, msg.ID, err)
+		alert(tc, fmt.Sprintf("%s %d of branch %d", msg.DocType, msg.ID, msg.BranchID), err)
 	default:
-		log.Printf("ERROR: bill %d FAILED without ACK, it is retried: %v", msg.ID, err)
-		alert(tc, fmt.Sprintf("bill %d of branch %d", msg.ID, msg.BranchID), err)
+		log.Printf("ERROR: %s %d FAILED without ACK, it is retried: %v", msg.DocType, msg.ID, err)
+		alert(tc, fmt.Sprintf("%s %d of branch %d", msg.DocType, msg.ID, msg.BranchID), err)
 	}
 }
 

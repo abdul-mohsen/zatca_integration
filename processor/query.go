@@ -78,6 +78,7 @@ func QueryBillByID(db *sql.DB, billID int64) (*BillRow, error) {
 	b.URL = url
 	b.State = state.Int64
 	b.InvoiceUUID = invoiceUUID
+	b.Total = total.Float64
 	return &b, nil
 }
 

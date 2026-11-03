@@ -58,8 +58,8 @@ func TestDecodeEnvelopeRefusesAnyOtherContract(t *testing.T) {
 		"a missing request fingerprint": func(f map[string]any) {
 			delete(f, "request_fingerprint")
 		},
-		"a credit note": func(f map[string]any) {
-			f["doc_type"] = "credit"
+		"an unknown document type": func(f map[string]any) {
+			f["doc_type"] = "refund"
 		},
 	}
 	for name, change := range cases {
@@ -67,6 +67,30 @@ func TestDecodeEnvelopeRefusesAnyOtherContract(t *testing.T) {
 			_, err := DecodeEnvelope(envelopeWith(t, change))
 			if !errors.Is(err, ErrInvalidEnvelope) {
 				t.Fatalf("DecodeEnvelope = %v; want ErrInvalidEnvelope", err)
+			}
+		})
+	}
+}
+
+// The backend publishes a credit and a debit envelope with the same fields as a bill. Both decode, and each keeps its own doc_type
+// and id.
+func TestDecodeEnvelopeAcceptsTheCreditAndDebitEnvelopes(t *testing.T) {
+	cases := map[string]struct {
+		fixture string
+		docType DocType
+		id      int64
+	}{
+		"credit": {"credit_envelope.json", DocCredit, 9},
+		"debit":  {"debit_envelope.json", DocDebit, 10},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			msg, err := DecodeEnvelope(readFixture(t, tc.fixture))
+			if err != nil {
+				t.Fatalf("DecodeEnvelope: %v", err)
+			}
+			if msg.DocType != tc.docType || msg.ID != tc.id || msg.BranchID != 7 {
+				t.Fatalf("decoded %s %d on branch %d; want %s %d on branch 7", msg.DocType, msg.ID, msg.BranchID, tc.docType, tc.id)
 			}
 		})
 	}

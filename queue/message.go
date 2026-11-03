@@ -14,8 +14,18 @@ import (
 // DocType identifies the fiscal document an envelope carries.
 type DocType string
 
-// DocBill is the only document the daemon accepts until credit and debit notes return (B6, Z9).
-const DocBill DocType = "bill"
+// The document kinds the daemon invoices. A credit or debit note is invoiced like a bill: it is verified, booked on the branch's chain,
+// built, committed, and submitted. Its envelope names its own id, and the bill it refers to is found from that id.
+const (
+	DocBill   DocType = "bill"
+	DocCredit DocType = "credit"
+	DocDebit  DocType = "debit"
+)
+
+// valid reports whether d is a document kind that the daemon invoices.
+func (d DocType) valid() bool {
+	return d == DocBill || d == DocCredit || d == DocDebit
+}
 
 // StreamName is the JetStream stream that holds document envelopes.
 const StreamName = "ZATCA"
@@ -26,8 +36,9 @@ const SubjectAll = "zatca.>"
 // ErrInvalidEnvelope marks a message that can never be processed. Its delivery is terminated, not retried.
 var ErrInvalidEnvelope = errors.New("invalid queue envelope")
 
-// Message is the document envelope the backend publishes for one final sale. The backend sets every identity field, and the
-// daemon reads them without creating any. The fiscal identity (seller VAT and EGS id) comes from the branch configuration.
+// Message is the document envelope the backend publishes for one final document: a sale, a credit note, or a debit note. The backend sets
+// every identity field, and the daemon reads them without creating any. The fiscal identity (seller VAT and EGS id) comes from the
+// branch configuration.
 type Message struct {
 	DocType            DocType `json:"doc_type"`
 	ID                 int64   `json:"id"`
@@ -58,7 +69,7 @@ func DecodeEnvelope(data []byte) (Message, error) {
 // Validate checks the identity a document needs before it is claimed.
 func (m Message) Validate() error {
 	switch {
-	case m.DocType != DocBill:
+	case !m.DocType.valid():
 		return invalidf("unsupported doc_type %q", m.DocType)
 	case m.ID <= 0:
 		return invalidf("id is required")

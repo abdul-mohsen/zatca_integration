@@ -79,6 +79,8 @@ func newChainFixture(t *testing.T, db *sql.DB, bills int) chainFixture {
 			arg   any
 		}{
 			{`DELETE FROM zatca_consumer_claim WHERE pos_id = ?`, fx.posID},
+			{`DELETE FROM credit_note WHERE bill_id IN (SELECT id FROM bill WHERE branch_id = ?)`, fx.branchID},
+			{`DELETE FROM debit_note WHERE bill_id IN (SELECT id FROM bill WHERE branch_id = ?)`, fx.branchID},
 			{`DELETE FROM bill WHERE branch_id = ?`, fx.branchID},
 			{`DELETE FROM branches WHERE id = ?`, fx.branchID},
 			{`DELETE FROM company WHERE id = ?`, companyID},
@@ -128,10 +130,12 @@ func fixtureMessage(fx chainFixture, bill int64, request string) Message {
 	}
 }
 
-// signedFor is the invoice a builder would produce under a booking.
+// signedFor is the invoice a builder would produce under a booking, for a bill.
 func signedFor(b Booking, bill int64, hash string) SignedInvoice {
 	return SignedInvoice{
+		DocType:   DocBill,
 		SourceID:  bill,
+		BillID:    bill,
 		BranchID:  b.BranchID,
 		UUID:      b.UUID,
 		ICV:       b.ICV,
