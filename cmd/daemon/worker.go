@@ -139,9 +139,12 @@ func handleDelivery(stream *queue.OrderedStream, tc *tenantCtx, dbName string, b
 	}
 }
 
+// sendAlertEmail sends each alert. A test replaces it to capture the alerts.
+var sendAlertEmail = sendAlert
+
 func alert(tc *tenantCtx, what string, err error) {
 	if tc.tenant.AlertEmail != "" {
-		sendAlert(tc.tenant.AlertEmail, what, tc.tenant.DBName, err)
+		sendAlertEmail(tc.tenant.AlertEmail, what, tc.tenant.DBName, err)
 	}
 }
 
