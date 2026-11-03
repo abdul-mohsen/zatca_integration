@@ -72,6 +72,18 @@ func TestDecodeEnvelopeRefusesAnyOtherContract(t *testing.T) {
 	}
 }
 
+// pos_id is limited to 64 characters, as the backend counts it. A 40-character Arabic name is 80 bytes and still fits.
+func TestPosIDLimitCountsCharactersNotBytes(t *testing.T) {
+	fits := strings.Repeat("م", 40)
+	tooLong := strings.Repeat("م", 65)
+	if _, err := DecodeEnvelope(envelopeWith(t, func(f map[string]any) { f["pos_id"] = fits })); err != nil {
+		t.Fatalf("a 40-character pos_id (80 bytes) was refused: %v", err)
+	}
+	if _, err := DecodeEnvelope(envelopeWith(t, func(f map[string]any) { f["pos_id"] = tooLong })); !errors.Is(err, ErrInvalidEnvelope) {
+		t.Fatalf("DecodeEnvelope with a 65-character pos_id = %v; want ErrInvalidEnvelope", err)
+	}
+}
+
 func TestOrderedSubjectsNameTheBranchOnly(t *testing.T) {
 	if got := OrderedSubject("tenant_acme", 7); !strings.HasSuffix(got, ".tenant_acme.7") {
 		t.Fatalf("OrderedSubject = %q", got)

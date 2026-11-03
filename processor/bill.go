@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/zatca-go/zatca/client"
@@ -55,8 +56,9 @@ func (p *BillPipeline) Prepare(_ context.Context, msg queue.Message) (queue.Prep
 	return &billDocument{svc: svc, cfg: cfg, bill: *bill, products: products, issueTime: issueTime}, nil
 }
 
-// Submit sends a committed invoice to ZATCA. A standard invoice is cleared, and a simplified one is reported. A rejection
-// by ZATCA is an outcome. Any other failure is technical, and the stored XML is sent again later.
+// Submit sends a committed invoice to ZATCA. A standard invoice is cleared, and a simplified one is reported. A rejection by
+// ZATCA is an outcome, and so is an answer that needs reconciliation. Any other failure is technical, and the stored XML is
+// sent again later.
 func (p *BillPipeline) Submit(_ context.Context, invoice queue.SignedInvoice) (queue.Outcome, error) {
 	svc, _, err := p.Service(invoice.BranchID)
 	if err != nil {
@@ -77,22 +79,50 @@ func (p *BillPipeline) Submit(_ context.Context, invoice queue.SignedInvoice) (q
 		resp, err = svc.Client.ReportInvoice(apiReq)
 	}
 	if err != nil {
-		return rejectionOutcome(err)
+		return rejectionOutcome(invoice, err)
 	}
 	if resp == nil {
 		return queue.Outcome{}, fmt.Errorf("ZATCA returned no response for bill %d", invoice.SourceID)
 	}
-	if len(resp.Warnings) > 0 {
-		warning := resp.Warnings[0]
-		return queue.Outcome{State: queue.OutcomeWarning, ProviderCode: warning.Code, Message: warning.Message}, nil
-	}
-	return queue.Outcome{State: queue.OutcomeAccepted}, nil
+	return responseOutcome(resp), nil
 }
 
-// rejectionOutcome classifies an error from ZATCA. A 4xx answer is a rejection of the invoice, except for authentication,
-// timeouts, and rate limits, which are technical. Any other error is technical.
-func rejectionOutcome(err error) (queue.Outcome, error) {
+// responseOutcome classifies a 2xx answer. ZATCA can answer 2xx and still list error messages, and those reject the invoice.
+// Warnings, in the answer or in its validation results, accept it with a warning.
+func responseOutcome(resp *models.InvoiceResponse) queue.Outcome {
+	if vr := resp.ValidationResults; vr != nil && len(vr.ErrorMessages) > 0 {
+		return queue.Outcome{State: queue.OutcomeRejected, ProviderCode: vr.ErrorMessages[0].Code, Message: validationText(vr.ErrorMessages)}
+	}
+	if len(resp.Warnings) > 0 {
+		warning := resp.Warnings[0]
+		return queue.Outcome{State: queue.OutcomeWarning, ProviderCode: warning.Code, Message: warning.Message}
+	}
+	if vr := resp.ValidationResults; vr != nil && len(vr.WarningMessages) > 0 {
+		warning := vr.WarningMessages[0]
+		return queue.Outcome{State: queue.OutcomeWarning, ProviderCode: warning.Code, Message: warning.Message}
+	}
+	return queue.Outcome{State: queue.OutcomeAccepted}
+}
+
+// validationText joins the messages of a validation result into one text.
+func validationText(messages []models.ValidationMessage) string {
+	texts := make([]string, 0, len(messages))
+	for _, m := range messages {
+		texts = append(texts, m.Message)
+	}
+	return strings.Join(texts, "; ")
+}
+
+// rejectionOutcome classifies an error from ZATCA. A 409 means ZATCA already holds an invoice with this UUID, for example after
+// a crash. That answer is ambiguous, not a rejection, and it needs reconciliation. A 4xx answer is a rejection of the invoice,
+// except for authentication, timeouts, and rate limits, which are technical. Any other error is technical.
+func rejectionOutcome(invoice queue.SignedInvoice, err error) (queue.Outcome, error) {
 	var apiErr *client.APIError
+	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusConflict {
+		return queue.Outcome{State: queue.OutcomeAmbiguous, ProviderCode: strconv.Itoa(apiErr.StatusCode), Message: apiErr.Body},
+			fmt.Errorf("%w: bill %d (invoice %s): ZATCA already holds this invoice, so the outcome needs reconciliation",
+				queue.ErrOutcomeAmbiguous, invoice.SourceID, invoice.UUID)
+	}
 	if errors.As(err, &apiErr) && isInvoiceRejection(apiErr.StatusCode) {
 		return queue.Outcome{State: queue.OutcomeRejected, ProviderCode: strconv.Itoa(apiErr.StatusCode), Message: apiErr.Body}, nil
 	}
