@@ -318,6 +318,50 @@ func TestOutcomeIsRecordedAndOnlyAcceptanceIssuesTheBill(t *testing.T) {
 	}
 }
 
+// An ambiguous answer is stored as it is. It is not a rejection, the bill is not issued, and the invoice is final, so a
+// redelivery finds the outcome and never sends the invoice again.
+func TestAmbiguousOutcomeIsStoredAndIssuesNothing(t *testing.T) {
+	db := testDB(t)
+	fx := newChainFixture(t, db, 1)
+	ctx := context.Background()
+	chain := NewSQLChain(db)
+	msg := fixtureMessage(fx, fx.bills[0], "ambiguous")
+
+	booking, err := chain.Book(ctx, msg)
+	if err != nil {
+		t.Fatalf("Book: %v", err)
+	}
+	invoice := signedFor(booking, fx.bills[0], "hash-ambiguous")
+	if err := chain.Commit(ctx, booking, invoice); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if err := chain.Record(ctx, invoice, Outcome{State: OutcomeAmbiguous, ProviderCode: "409", Message: "already reported"}); err != nil {
+		t.Fatalf("Record ambiguous: %v", err)
+	}
+
+	var status int
+	var state string
+	var rejection sql.NullString
+	var issued int
+	scanOne(t, db, &status, `SELECT status FROM zatca_submission WHERE bill_id = ?`, fx.bills[0])
+	scanOne(t, db, &state, `SELECT outcome_state FROM zatca_submission WHERE bill_id = ?`, fx.bills[0])
+	scanOne(t, db, &rejection, `SELECT rejection_msg FROM zatca_submission WHERE bill_id = ?`, fx.bills[0])
+	scanOne(t, db, &issued, `SELECT state FROM bill WHERE id = ?`, fx.bills[0])
+	if status != 1 || state != OutcomeAmbiguous || rejection.Valid || issued != 0 {
+		t.Fatalf("ambiguous: status %d, outcome %s, rejection %v, bill state %d; want 1, ambiguous, no rejection, bill not issued",
+			status, state, rejection, issued)
+	}
+	var logged int
+	scanOne(t, db, &logged, `SELECT COUNT(*) FROM zatca_submission_outcome o JOIN zatca_submission s ON s.id = o.submission_id WHERE s.bill_id = ? AND o.outcome_state = ?`, fx.bills[0], OutcomeAmbiguous)
+	if logged != 1 {
+		t.Fatalf("ambiguous rows in the outcome log = %d; want 1", logged)
+	}
+	stored, err := chain.Stored(ctx, msg)
+	if err != nil || stored == nil || stored.Outcome != OutcomeAmbiguous {
+		t.Fatalf("Stored = %+v, %v; want the invoice with its ambiguous outcome, so it is not sent again", stored, err)
+	}
+}
+
 func TestClaimIsProcessedOnceAndAFingerprintChangeConflicts(t *testing.T) {
 	db := testDB(t)
 	fx := newChainFixture(t, db, 1)

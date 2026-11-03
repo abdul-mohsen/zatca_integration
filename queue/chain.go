@@ -11,11 +11,13 @@ import (
 // GenesisPIH is the previous-invoice hash of a branch's first invoice: base64 of the SHA-256 of "0".
 const GenesisPIH = "NWZlY2ViNjZmZmM4NmYzOGQ5NTI3ODZjNmQ2OTZjNzljMmRiYzIzOWRkNGU5MWI0NjcyOWQ3M2EyN2ZiNTdlOQ=="
 
-// Outcome states of one invoice. An accepted, warned, or rejected invoice is final.
+// Outcome states of one invoice. An accepted, warned, rejected, or ambiguous invoice is final. An ambiguous one needs
+// reconciliation with ZATCA before anyone acts on it.
 const (
-	OutcomeAccepted = "accepted"
-	OutcomeWarning  = "accepted_with_warning"
-	OutcomeRejected = "rejected"
+	OutcomeAccepted  = "accepted"
+	OutcomeWarning   = "accepted_with_warning"
+	OutcomeRejected  = "rejected"
+	OutcomeAmbiguous = "ambiguous"
 )
 
 // Invoice kinds select the ZATCA endpoint: a standard invoice is cleared, a simplified one is reported.
@@ -299,7 +301,8 @@ func (c *SQLChain) Stored(ctx context.Context, msg Message) (*SignedInvoice, err
 }
 
 // Record stores ZATCA's outcome for an invoice and appends it to the outcome log. A bill that ZATCA accepted or warned is
-// marked issued. A rejected bill keeps its state, and the rejection is kept with it.
+// marked issued. A rejected bill keeps its state, and the rejection is kept with it. An ambiguous bill keeps its state until
+// it is reconciled.
 func (c *SQLChain) Record(ctx context.Context, invoice SignedInvoice, outcome Outcome) error {
 	status, err := submissionStatus(outcome.State)
 	if err != nil {
@@ -353,7 +356,7 @@ func (c *SQLChain) Record(ctx context.Context, invoice SignedInvoice, outcome Ou
 	`, submissionID, outcome.State, providerCode, warningMsg); err != nil {
 		return fmt.Errorf("append outcome of bill %d: %w", invoice.SourceID, err)
 	}
-	if outcome.State != OutcomeRejected {
+	if outcome.State == OutcomeAccepted || outcome.State == OutcomeWarning {
 		if _, err := tx.ExecContext(ctx, `UPDATE bill SET state = 3 WHERE id = ?`, invoice.SourceID); err != nil {
 			return fmt.Errorf("mark bill %d issued: %w", invoice.SourceID, err)
 		}
@@ -364,7 +367,8 @@ func (c *SQLChain) Record(ctx context.Context, invoice SignedInvoice, outcome Ou
 	return nil
 }
 
-// submissionStatus is the numeric status kept beside outcome_state (goose 00003): 2 accepted, 3 rejected, 4 warned.
+// submissionStatus is the numeric status kept beside outcome_state (goose 00001 and 00003): 2 accepted, 3 rejected, 4 warned.
+// An ambiguous answer keeps the status of a submitted invoice (1), because ZATCA may already hold it.
 func submissionStatus(state string) (int, error) {
 	switch state {
 	case OutcomeAccepted:
@@ -373,6 +377,8 @@ func submissionStatus(state string) (int, error) {
 		return 3, nil
 	case OutcomeWarning:
 		return 4, nil
+	case OutcomeAmbiguous:
+		return 1, nil
 	}
 	return 0, fmt.Errorf("unknown outcome state %q", state)
 }

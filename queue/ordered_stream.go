@@ -14,7 +14,7 @@ type Prepared interface {
 
 // Pipeline is the fiscal work of one document type. Prepare verifies a document and loads what Build needs, before any number
 // is booked. Submit sends a committed invoice to ZATCA. It returns an error only for a technical failure. A rejection by ZATCA
-// is an Outcome.
+// is an Outcome. An ambiguous answer is an Outcome too, returned with ErrOutcomeAmbiguous.
 type Pipeline interface {
 	Prepare(ctx context.Context, msg Message) (Prepared, error)
 	Submit(ctx context.Context, invoice SignedInvoice) (Outcome, error)
@@ -23,6 +23,10 @@ type Pipeline interface {
 // ErrInvoiceRejected means ZATCA rejected an invoice that passed verification. The rejection is recorded and the request ends.
 // Verification let it through, so it is a defect to fix on this side. It is reported, and it is never retried.
 var ErrInvoiceRejected = errors.New("ZATCA rejected a verified invoice")
+
+// ErrOutcomeAmbiguous means ZATCA's answer does not say whether the invoice is accepted, for example because ZATCA already holds
+// the invoice. The answer is recorded and the request ends, so the invoice is not sent again. It is reported for reconciliation.
+var ErrOutcomeAmbiguous = errors.New("ZATCA's outcome is ambiguous")
 
 // OrderedStream runs the deliveries of a tenant's branches through the chain protocol. Deliveries of one tenant and EGS run one
 // at a time, in order.
@@ -109,17 +113,16 @@ func (s *OrderedStream) process(ctx context.Context, msg Message, ack func() err
 		return s.finish(ctx, msg, ack, nil)
 	}
 	outcome, err := s.pipeline.Submit(ctx, invoice)
-	if err != nil {
+	if err != nil && !errors.Is(err, ErrOutcomeAmbiguous) {
 		return s.failed(ctx, msg, err, ack)
 	}
 	if err := s.chain.Record(ctx, invoice, outcome); err != nil {
 		return s.failed(ctx, msg, err, ack)
 	}
-	var rejected error
 	if outcome.State == OutcomeRejected {
-		rejected = fmt.Errorf("%w: bill %d: %s", ErrInvoiceRejected, msg.ID, outcome.Message)
+		err = fmt.Errorf("%w: bill %d: %s", ErrInvoiceRejected, msg.ID, outcome.Message)
 	}
-	return s.finish(ctx, msg, ack, rejected)
+	return s.finish(ctx, msg, ack, err)
 }
 
 // finish completes the claim and acknowledges the delivery. The result, if any, is returned after that.

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -68,7 +69,7 @@ func (m Message) Validate() error {
 		return invalidf("db_name is required")
 	case strings.TrimSpace(m.TenantKey) == "":
 		return invalidf("tenant_key is required")
-	case strings.TrimSpace(m.PosID) == "" || len(m.PosID) > 64:
+	case strings.TrimSpace(m.PosID) == "" || utf8.RuneCountInString(m.PosID) > 64:
 		return invalidf("pos_id is required and must be at most 64 characters")
 	case strings.TrimSpace(m.BillRequestID) == "":
 		return invalidf("bill_request_id is required")

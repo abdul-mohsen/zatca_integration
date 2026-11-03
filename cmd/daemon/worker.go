@@ -127,6 +127,9 @@ func handleDelivery(stream *queue.OrderedStream, tc *tenantCtx, dbName string, b
 	case errors.Is(err, queue.ErrInvoiceRejected):
 		log.Printf("ERROR: ZATCA rejected verified bill %d: %v", msg.ID, err)
 		alert(tc, fmt.Sprintf("bill %d of branch %d rejected by ZATCA", msg.ID, msg.BranchID), err)
+	case errors.Is(err, queue.ErrOutcomeAmbiguous):
+		log.Printf("ERROR: ZATCA's outcome for bill %d needs reconciliation: %v", msg.ID, err)
+		alert(tc, fmt.Sprintf("bill %d of branch %d needs reconciliation with ZATCA", msg.ID, msg.BranchID), err)
 	case errors.Is(err, queue.ErrRejectedInput), errors.Is(err, queue.ErrFingerprintConflict):
 		log.Printf("ERROR: bill %d not invoiced: %v", msg.ID, err)
 		alert(tc, fmt.Sprintf("bill %d of branch %d", msg.ID, msg.BranchID), err)
