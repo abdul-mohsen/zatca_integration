@@ -6,13 +6,11 @@ import (
 	"net/smtp"
 	"os"
 	"strings"
-
-	"github.com/zatca-go/zatca/queue"
 )
 
-// sendAlert sends a failure notification email.
+// sendAlert sends a failure notification email about one item of a tenant: a bill, or an onboarding.
 // recipients is a comma-separated list of email addresses from the tenant config.
-func sendAlert(recipients string, msg queue.Message, processErr error) {
+func sendAlert(recipients, what, dbName string, processErr error) {
 	if recipients == "" {
 		return
 	}
@@ -25,17 +23,14 @@ func sendAlert(recipients string, msg queue.Message, processErr error) {
 	smtpPass := envOrDefault("SMTP_PASS", "")
 	fromAddr := envOrDefault("SMTP_FROM", "zatca-daemon@localhost")
 
-	subject := fmt.Sprintf("ZATCA Processing Failed: %s id=%d (%s)", msg.DocType, msg.ID, msg.DBName)
+	subject := fmt.Sprintf("ZATCA Processing Failed: %s (%s)", what, dbName)
 	body := fmt.Sprintf(
-		"ZATCA document processing failed after %d retries.\n\n"+
+		"ZATCA processing failed.\n\n"+
 			"Tenant DB: %s\n"+
-			"Document Type: %s\n"+
-			"Document ID: %d\n"+
-			"Branch ID: %d\n"+
+			"Item: %s\n"+
 			"Error: %v\n\n"+
-			"The document remains in a pending state and needs manual attention.\n"+
-			"You can reprocess it using the CLI tool or restart the daemon to trigger replay.",
-		maxRetries, msg.DBName, msg.DocType, msg.ID, msg.BranchID, processErr,
+			"The item is not invoiced or not submitted. Fix the cause; a bill that was not invoiced is retried by the daemon.",
+		dbName, what, processErr,
 	)
 
 	toList := strings.Split(recipients, ",")
@@ -55,7 +50,7 @@ func sendAlert(recipients string, msg queue.Message, processErr error) {
 	if err := smtp.SendMail(addr, auth, fromAddr, toList, []byte(emailBody)); err != nil {
 		log.Printf("WARN: failed to send alert email to %s: %v", recipients, err)
 	} else {
-		log.Printf("Alert email sent to %s for %s id=%d", recipients, msg.DocType, msg.ID)
+		log.Printf("Alert email sent to %s for %s", recipients, what)
 	}
 }
 

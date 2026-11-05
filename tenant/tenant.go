@@ -11,6 +11,7 @@ import (
 // Tenant represents a single tenant (client) from the zatca_master registry.
 type Tenant struct {
 	ID         int64
+	TenantKey  string // immutable stable identity (zatca_master.tenant.tenant_key)
 	Name       string
 	DBName     string
 	ZATCAEnv   string // sandbox, simulation, or production
@@ -19,7 +20,7 @@ type Tenant struct {
 
 // LoadAll returns all enabled tenants from the master database.
 func LoadAll(masterDB *sql.DB) ([]Tenant, error) {
-	rows, err := masterDB.Query(`SELECT id, name, db_name, zatca_env, alert_email FROM tenant WHERE enabled = 1`)
+	rows, err := masterDB.Query(`SELECT id, tenant_key, name, db_name, zatca_env, alert_email FROM tenant WHERE enabled = 1`)
 	if err != nil {
 		return nil, fmt.Errorf("query tenants: %w", err)
 	}
@@ -28,7 +29,7 @@ func LoadAll(masterDB *sql.DB) ([]Tenant, error) {
 	var tenants []Tenant
 	for rows.Next() {
 		var t Tenant
-		if err := rows.Scan(&t.ID, &t.Name, &t.DBName, &t.ZATCAEnv, &t.AlertEmail); err != nil {
+		if err := rows.Scan(&t.ID, &t.TenantKey, &t.Name, &t.DBName, &t.ZATCAEnv, &t.AlertEmail); err != nil {
 			return nil, fmt.Errorf("scan tenant: %w", err)
 		}
 		tenants = append(tenants, t)

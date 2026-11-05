@@ -1,56 +1,299 @@
 package processor
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"log"
-	"os"
-	"path/filepath"
+	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
-	"github.com/google/uuid"
-
+	"github.com/zatca-go/zatca/client"
 	"github.com/zatca-go/zatca/config"
 	"github.com/zatca-go/zatca/invoice"
 	"github.com/zatca-go/zatca/models"
+	"github.com/zatca-go/zatca/queue"
 	"github.com/zatca-go/zatca/zatca"
 )
 
-// ProcessBill performs the full sign → submit → update pipeline for a single bill.
-func ProcessBill(db *sql.DB, svc *zatca.Service, cfg *config.Config, b BillRow) (string, error) {
-	log.Printf("Processing bill id=%d seq=%s", b.ID, b.SeqNumber.String)
+// ServiceFunc returns the ZATCA service of a branch and the branch's configuration.
+type ServiceFunc func(branchID int64) (*zatca.Service, *config.Config, error)
 
-	issueTime, err := ParseDates(b.EffectiveDate, b.PaymentDue, b.ID)
-	if err != nil {
-		return "", err
-	}
-
-	products, err := LoadProducts(db, b.ID)
-	if err != nil {
-		return "", fmt.Errorf("load products failed for bill %d: %w", b.ID, err)
-	}
-
-	inv := BuildBillInvoice(cfg, b, products, issueTime)
-	return signSubmitUpdate(db, svc, inv, b.ID, "bill", xmlMeta{
-		xmlDir:    cfg.XMLDir,
-		tenantID:  cfg.TenantID,
-		companyID: b.CompanyID,
-		branchID:  b.BranchID,
-		billType:  "invoice",
-		qrColumn:  "qr_code",
-	})
+// BillPipeline is the fiscal pipeline of a sale. It verifies the bill, builds and signs its invoice under a booking, and
+// submits the stored XML to ZATCA.
+type BillPipeline struct {
+	DB      *sql.DB
+	Service ServiceFunc
 }
 
-// BuildBillInvoice constructs an Invoice (type 388) from a BillRow.
-func BuildBillInvoice(cfg *config.Config, b BillRow, products []ProductRow, issueTime time.Time) *invoice.Invoice {
-	isStandard := b.BuyerVAT.Valid && b.BuyerVAT.String != ""
-	customer := buildCustomer(b, isStandard)
+// Prepare loads and verifies the bill. A bill that cannot be reported is refused here, before any number is booked.
+func (p *BillPipeline) Prepare(_ context.Context, msg queue.Message) (queue.Prepared, error) {
+	svc, cfg, err := p.Service(msg.BranchID)
+	if err != nil {
+		return nil, err
+	}
+	bill, err := QueryBillByID(p.DB, msg.ID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("%w: bill %d does not exist", queue.ErrRejectedInput, msg.ID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	products, err := LoadProducts(p.DB, msg.ID)
+	if err != nil {
+		return nil, fmt.Errorf("load products failed for bill %d: %w", msg.ID, err)
+	}
+	if err := verifyBill(cfg, msg, *bill, products); err != nil {
+		return nil, fmt.Errorf("%w: bill %d: %v", queue.ErrRejectedInput, msg.ID, err)
+	}
+	issueTime, err := ParseDates(bill.EffectiveDate, bill.PaymentDue, bill.ID)
+	if err != nil {
+		return nil, fmt.Errorf("%w: bill %d: %v", queue.ErrRejectedInput, msg.ID, err)
+	}
+	return &billDocument{svc: svc, cfg: cfg, bill: *bill, products: products, issueTime: issueTime}, nil
+}
 
+// Submit sends a committed invoice to ZATCA. A standard invoice is cleared, and a simplified one is reported. A rejection by
+// ZATCA is an outcome, and so is an answer that needs reconciliation. Any other failure is technical, and the stored XML is
+// sent again later.
+func (p *BillPipeline) Submit(_ context.Context, invoice queue.SignedInvoice) (queue.Outcome, error) {
+	svc, _, err := p.Service(invoice.BranchID)
+	if err != nil {
+		return queue.Outcome{}, err
+	}
+	apiReq, err := apiRequest(svc, invoice.SignedXML)
+	if err != nil {
+		return queue.Outcome{}, err
+	}
+	if apiReq.InvoiceHash != "" && apiReq.InvoiceHash != invoice.Hash {
+		return queue.Outcome{}, fmt.Errorf("stored hash of bill %d does not match its signed XML", invoice.SourceID)
+	}
+
+	var resp *models.InvoiceResponse
+	if invoice.Kind == queue.InvoiceStandard {
+		resp, err = svc.Client.ClearInvoice(apiReq)
+	} else {
+		resp, err = svc.Client.ReportInvoice(apiReq)
+	}
+	if err != nil {
+		return rejectionOutcome(invoice, err)
+	}
+	if resp == nil {
+		return queue.Outcome{}, fmt.Errorf("ZATCA returned no response for bill %d", invoice.SourceID)
+	}
+	return responseOutcome(resp), nil
+}
+
+// responseOutcome classifies a 2xx answer. ZATCA can answer 2xx and still list
+// error messages or a failed validation status, and those reject the invoice.
+// Warnings, in the answer or in its validation results, accept it with a
+// warning.
+func responseOutcome(resp *models.InvoiceResponse) queue.Outcome {
+	if vr := resp.ValidationResults; vr != nil && len(vr.ErrorMessages) > 0 {
+		return queue.Outcome{State: queue.OutcomeRejected, ProviderCode: vr.ErrorMessages[0].Code, Message: validationText(vr.ErrorMessages)}
+	}
+	if len(resp.Errors) > 0 {
+		return queue.Outcome{
+			State:        queue.OutcomeRejected,
+			ProviderCode: resp.Errors[0].Code,
+			Message:      errorText(resp.Errors),
+		}
+	}
+	if vr := resp.ValidationResults; vr != nil {
+		switch strings.ToUpper(strings.TrimSpace(vr.Status)) {
+		case "ERROR", "FAIL", "FAILED":
+			return queue.Outcome{
+				State:        queue.OutcomeRejected,
+				ProviderCode: strings.ToUpper(strings.TrimSpace(vr.Status)),
+				Message:      "provider validation status: " + strings.ToUpper(strings.TrimSpace(vr.Status)),
+			}
+		}
+	}
+	if len(resp.Warnings) > 0 {
+		warning := resp.Warnings[0]
+		return queue.Outcome{State: queue.OutcomeWarning, ProviderCode: warning.Code, Message: warning.Message}
+	}
+	if vr := resp.ValidationResults; vr != nil && len(vr.WarningMessages) > 0 {
+		warning := vr.WarningMessages[0]
+		return queue.Outcome{State: queue.OutcomeWarning, ProviderCode: warning.Code, Message: warning.Message}
+	}
+	if vr := resp.ValidationResults; vr != nil {
+		switch strings.ToUpper(strings.TrimSpace(vr.Status)) {
+		case "WARNING", "WARN":
+			status := strings.ToUpper(strings.TrimSpace(vr.Status))
+			return queue.Outcome{
+				State:        queue.OutcomeWarning,
+				ProviderCode: status,
+				Message:      "provider validation status: " + status,
+			}
+		}
+	}
+	return queue.Outcome{State: queue.OutcomeAccepted}
+}
+
+// validationText joins the messages of a validation result into one text.
+func validationText(messages []models.ValidationMessage) string {
+	texts := make([]string, 0, len(messages))
+	for _, m := range messages {
+		texts = append(texts, m.Message)
+	}
+	return strings.Join(texts, "; ")
+}
+
+func errorText(messages []models.ErrorDetail) string {
+	texts := make([]string, 0, len(messages))
+	for _, m := range messages {
+		texts = append(texts, m.Message)
+	}
+	return strings.Join(texts, "; ")
+}
+
+// rejectionOutcome classifies an error from ZATCA. A 409 means ZATCA already holds an invoice with this UUID, for example after
+// a crash. That answer is ambiguous, not a rejection, and it needs reconciliation. A 4xx answer is a rejection of the invoice,
+// except for authentication, timeouts, and rate limits, which are technical. Any other error is technical.
+func rejectionOutcome(invoice queue.SignedInvoice, err error) (queue.Outcome, error) {
+	var apiErr *client.APIError
+	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusConflict {
+		return queue.Outcome{State: queue.OutcomeAmbiguous, ProviderCode: strconv.Itoa(apiErr.StatusCode), Message: apiErr.Body},
+			fmt.Errorf("%w: bill %d (invoice %s): ZATCA already holds this invoice, so the outcome needs reconciliation",
+				queue.ErrOutcomeAmbiguous, invoice.SourceID, invoice.UUID)
+	}
+	if errors.As(err, &apiErr) && isInvoiceRejection(apiErr.StatusCode) {
+		return queue.Outcome{State: queue.OutcomeRejected, ProviderCode: strconv.Itoa(apiErr.StatusCode), Message: apiErr.Body}, nil
+	}
+	return queue.Outcome{}, fmt.Errorf("submit invoice to ZATCA: %w", err)
+}
+
+func isInvoiceRejection(status int) bool {
+	switch status {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusRequestTimeout, http.StatusTooManyRequests:
+		return false
+	}
+	return status >= http.StatusBadRequest && status < http.StatusInternalServerError
+}
+
+// billDocument is a verified bill, ready to be built under a booking.
+type billDocument struct {
+	svc       *zatca.Service
+	cfg       *config.Config
+	bill      BillRow
+	products  []ProductRow
+	issueTime time.Time
+}
+
+// Build builds the invoice with the booked UUID, ICV, and previous hash, then signs it and computes its hash and QR code.
+// Nothing is sent to ZATCA here.
+func (d *billDocument) Build(_ context.Context, booking queue.Booking) (queue.SignedInvoice, error) {
+	inv := buildBillInvoice(d.cfg, d.bill, d.products, d.issueTime, booking)
+	xmlStr, err := inv.ToXML()
+	if err != nil {
+		return queue.SignedInvoice{}, fmt.Errorf("build XML of bill %d: %w", d.bill.ID, err)
+	}
+	signedXML, hash, err := d.svc.SDK.SignInvoice(xmlStr)
+	if err != nil {
+		return queue.SignedInvoice{}, fmt.Errorf("sign bill %d: %w", d.bill.ID, err)
+	}
+	apiReq, err := apiRequest(d.svc, signedXML)
+	if err != nil {
+		return queue.SignedInvoice{}, err
+	}
+	if apiReq.UUID != booking.UUID {
+		return queue.SignedInvoice{}, fmt.Errorf("signed bill %d carries UUID %s, not the booked %s",
+			d.bill.ID, apiReq.UUID, booking.UUID)
+	}
+	invoiceHash := apiReq.InvoiceHash
+	if invoiceHash == "" {
+		invoiceHash = hash
+	}
+	if invoiceHash == "" {
+		return queue.SignedInvoice{}, fmt.Errorf("signed bill %d has no invoice hash", d.bill.ID)
+	}
+	qr, err := d.svc.SDK.GenerateQR(signedXML)
+	if err != nil {
+		return queue.SignedInvoice{}, fmt.Errorf("QR code of bill %d: %w", d.bill.ID, err)
+	}
+	kind := queue.InvoiceSimplified
+	if inv.IsStandard() {
+		kind = queue.InvoiceStandard
+	}
+	return queue.SignedInvoice{
+		SourceID:  d.bill.ID,
+		BranchID:  booking.BranchID,
+		UUID:      booking.UUID,
+		ICV:       booking.ICV,
+		PIH:       booking.PIH,
+		Hash:      invoiceHash,
+		Kind:      kind,
+		SignedXML: signedXML,
+		QR:        qr,
+	}, nil
+}
+
+// verifyBill refuses a bill that cannot be reported, before any number is booked. The bill must belong to the envelope's branch,
+// be a final sale, carry the envelope's invoice UUID when it has one, and have
+// the branch/printed document identity that is emitted as XML cbc:ID. The
+// seller's VAT and EGS id come from the branch configuration, and the bill
+// needs at least one line with a positive quantity and a price that is not
+// negative.
+func verifyBill(cfg *config.Config, msg queue.Message, bill BillRow, products []ProductRow) error {
+	switch {
+	case bill.BranchID != msg.BranchID:
+		return fmt.Errorf("the bill belongs to branch %d, not %d", bill.BranchID, msg.BranchID)
+	case bill.State < 1:
+		return fmt.Errorf("the bill is not a final sale (state %d)", bill.State)
+	case bill.InvoiceUUID.Valid && bill.InvoiceUUID.String != msg.InvoiceUUID:
+		return errors.New("the bill carries another invoice UUID")
+	case billDocumentID(bill) == "":
+		return errors.New("the bill has no branch sequence/printed document identity")
+	case cfg.Seller.VAT == "":
+		return errors.New("the branch has no seller VAT number")
+	case cfg.EGSID == "":
+		return errors.New("the branch has no EGS id: onboard the branch first")
+	case len(products) == 0:
+		return errors.New("the bill has no lines")
+	}
+	for i := range products {
+		if products[i].QuantityOrZero() <= 0 {
+			return fmt.Errorf("line %d has no positive quantity", i+1)
+		}
+		if products[i].PriceOrZero() < 0 {
+			return fmt.Errorf("line %d has a negative price", i+1)
+		}
+	}
+	return nil
+}
+
+func billDocumentID(b BillRow) string {
+	if !b.SeqNumber.Valid {
+		return ""
+	}
+	return strings.TrimSpace(b.SeqNumber.String)
+}
+
+// apiRequest derives the ZATCA request of a signed invoice. It is deterministic, so a stored XML gives the same request
+// every time it is sent.
+func apiRequest(svc *zatca.Service, signedXML string) (models.InvoiceRequest, error) {
+	apiJSON, err := svc.SDK.GenerateAPIRequest(signedXML)
+	if err != nil {
+		return models.InvoiceRequest{}, fmt.Errorf("generate API request: %w", err)
+	}
+	var req models.InvoiceRequest
+	if err := json.Unmarshal([]byte(apiJSON), &req); err != nil {
+		return models.InvoiceRequest{}, fmt.Errorf("parse API request: %w", err)
+	}
+	return req, nil
+}
+
+// buildBillInvoice constructs the invoice (type 388) under a booking. It uses the booked UUID, ICV, and previous hash, and
+// never chooses its own.
+func buildBillInvoice(cfg *config.Config, b BillRow, products []ProductRow, issueTime time.Time, booking queue.Booking) *invoice.Invoice {
+	isStandard := b.BuyerVAT.Valid && b.BuyerVAT.String != ""
 	inv := &invoice.Invoice{
-		ID:               fmt.Sprintf("INV-%d", b.ID),
-		UUID:             uuid.New().String(),
+		ID:               billDocumentID(b),
+		UUID:             booking.UUID,
 		IssueDate:        issueTime,
 		IssueTime:        issueTime,
 		TypeCode:         invoice.TypeInvoice,
@@ -69,149 +312,25 @@ func BuildBillInvoice(cfg *config.Config, b BillRow, products []ProductRow, issu
 			PostalCode:         cfg.Seller.PostalCode,
 			Country:            cfg.Seller.Country,
 		},
-		Customer:            customer,
-		PreviousInvoiceHash: DefaultPIH,
-		InvoiceCounterValue: 1,
-		PaymentMeans: func() string {
-			if b.PaymentMethod.Valid && b.PaymentMethod.String != "" {
-				return b.PaymentMethod.String
-			}
-			return invoice.PaymentCash
-		}(),
+		Customer:            buildCustomer(b, isStandard),
+		PreviousInvoiceHash: booking.PIH,
+		InvoiceCounterValue: int(booking.ICV),
+		PaymentMeans:        paymentMeans(b),
+		Lines:               buildLines(products),
 	}
-
 	if isStandard {
 		inv.SubType = invoice.SubTypeStandard
 	} else {
 		inv.SubType = invoice.SubTypeSimplified
 	}
-
-	if b.SeqNumber.Valid {
-		if v, err := strconv.Atoi(b.SeqNumber.String); err == nil {
-			inv.InvoiceCounterValue = v
-		}
-	}
-
-	inv.Lines = buildLines(products)
 	return inv
 }
 
-// xmlMeta holds the filesystem path components for saving signed XML.
-type xmlMeta struct {
-	xmlDir    string // base directory (e.g. /data/zatca-xml)
-	tenantID  string // tenant identifier (db_name) - prevents cross-tenant collisions
-	companyID int64
-	branchID  int64
-	billType  string // "invoice", "credit", "debit"
-	qrColumn  string // DB column name for QR code ("qr_code" for bill, "invoice_qr" for credit_note)
-}
-
-// signSubmitUpdate is the shared sign → submit → QR → save XML → UPDATE pipeline used by all doc types.
-func signSubmitUpdate(db *sql.DB, svc *zatca.Service, inv *invoice.Invoice, rowID int64, table string, meta xmlMeta) (string, error) {
-	xmlStr, err := inv.ToXML()
-	if err != nil {
-		return "", fmt.Errorf("ToXML failed: %w", err)
+func paymentMeans(b BillRow) string {
+	if b.PaymentMethod.Valid && b.PaymentMethod.String != "" {
+		return b.PaymentMethod.String
 	}
-
-	signedXML, hash, err := svc.SDK.SignInvoice(xmlStr)
-	if err != nil {
-		return "", fmt.Errorf("SignInvoice failed: %w", err)
-	}
-
-	// Save signed XML to filesystem:
-	//   {xmlDir}/{tenant}/{company_id}/{branch_id}/{bill_type}/{rowID}.xml
-	// Tenant prefix prevents collisions when multiple tenants share the
-	// same xml-dir mount.
-	var xmlPath string
-	if meta.xmlDir != "" {
-		tenant := meta.tenantID
-		if tenant == "" {
-			tenant = "_default"
-		}
-		dir := filepath.Join(meta.xmlDir, tenant, fmt.Sprintf("%d", meta.companyID), fmt.Sprintf("%d", meta.branchID), meta.billType)
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			log.Printf("WARN: mkdir %s: %v", dir, err)
-		} else {
-			xmlPath = filepath.Join(dir, fmt.Sprintf("%d.xml", rowID))
-			if err := os.WriteFile(xmlPath, []byte(signedXML), 0644); err != nil {
-				log.Printf("WARN: write xml %s: %v", xmlPath, err)
-				xmlPath = "" // don't store path if write failed
-			} else {
-				log.Printf("  Saved signed XML: %s", xmlPath)
-			}
-		}
-	}
-
-	apiJSON, err := svc.SDK.GenerateAPIRequest(signedXML)
-	if err != nil {
-		return "", fmt.Errorf("GenerateAPIRequest failed: %w", err)
-	}
-
-	var apiReq models.InvoiceRequest
-	if err := json.Unmarshal([]byte(apiJSON), &apiReq); err != nil {
-		return "", fmt.Errorf("parse api json failed: %w", err)
-	}
-
-	var resp *models.InvoiceResponse
-	if inv.IsStandard() {
-		log.Printf("DEBUG: ClearInvoice request UUID=%s hash=%s", apiReq.UUID, apiReq.InvoiceHash)
-		resp, err = svc.Client.ClearInvoice(apiReq)
-		if err != nil {
-			return "", fmt.Errorf("ClearInvoice API failed: %v", err)
-		}
-	} else {
-		log.Printf("DEBUG: ReportInvoice request UUID=%s hash=%s", apiReq.UUID, apiReq.InvoiceHash)
-		resp, err = svc.Client.ReportInvoice(apiReq)
-		if err != nil {
-			return "", fmt.Errorf("ReportInvoice API failed: %v", err)
-		}
-	}
-	if resp == nil {
-		return "", fmt.Errorf("invoice API returned nil response")
-	}
-
-	log.Printf("  Result: status=%s, hash=%s", resp.Status, apiReq.InvoiceHash)
-
-	qr := ""
-	if signedXML != "" {
-		if q, qerr := svc.SDK.GenerateQR(signedXML); qerr == nil {
-			qr = q
-		} else {
-			log.Printf("DEBUG: GenerateQR failed: %v", qerr)
-		}
-	}
-
-	finalHash := apiReq.InvoiceHash
-	if finalHash == "" {
-		finalHash = resp.InvoiceHash
-	}
-	if finalHash == "" {
-		finalHash = hash
-	}
-
-	qrCol := meta.qrColumn
-	if qrCol == "" {
-		qrCol = "qr_code"
-	}
-
-	updateQ := fmt.Sprintf(`UPDATE %s SET invoice_hash = ?, %s = ?, invoice_uuid = ?, state = 3 WHERE id = ?`, table, qrCol)
-	if _, uerr := db.Exec(updateQ, finalHash, qr, apiReq.UUID, rowID); uerr != nil {
-		return "", fmt.Errorf("update metadata failed for %s %d: %w", table, rowID, uerr)
-	}
-
-	if len(resp.Warnings) > 0 {
-		for _, w := range resp.Warnings {
-			log.Printf("    WARN [%s] %s", w.Code, w.Message)
-		}
-	}
-
-	if apiReq.InvoiceHash != "" {
-		return apiReq.InvoiceHash, nil
-	}
-	if resp.InvoiceHash != "" {
-		return resp.InvoiceHash, nil
-	}
-	return "", fmt.Errorf("no invoice hash returned for %s %d", table, rowID)
+	return invoice.PaymentCash
 }
 
 // buildCustomer builds the Customer party from BillRow.
