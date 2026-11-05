@@ -489,13 +489,34 @@ SMTP_FROM=alerts@yourcompany.com
 
 ---
 
-## 8. Signed XML Storage
+## 8. Document identity and provider recovery
+
+- The XML root `cbc:ID` is the bill's branch/printed `sequence_number`.
+- The database bill ID is only a storage locator; it is not substituted into
+  the XML document identity.
+- The provider UUID, branch ICV, previous hash, and printed document identity
+  are separate values. The ICV and previous hash continue to come from the
+  branch chain.
+- A 2xx response without error signals is accepted, warning-only responses are
+  accepted with a warning, and 2xx responses containing validation/provider
+  errors are rejected.
+- A provider HTTP 409 is recorded as **ambiguous** rather than accepted or
+  rejected. The bill is not marked issued and requires reconciliation.
+- Outcomes are stored before the queue delivery is acknowledged. A technical
+  failure remains retryable; a stored outcome is terminal and is not submitted
+  again.
+
+The exact duplicate-invoice response and acceptance behavior of a live ZATCA
+sandbox require an external sandbox run; local tests do not claim that
+evidence.
+
+## 9. Signed XML Storage
 
 The signed XML is stored in the tenant database, in zatca_submission.signed_xml, in the same transaction as its ICV, hash, and UUID. It never changes afterwards: a retry sends the stored XML again and does not build a new one.
 
 ---
 
-## 9. ZATCA Environments
+## 10. ZATCA Environments
 
 | Environment | Base URL | Usage |
 |-------------|----------|-------|
@@ -507,7 +528,7 @@ Set per-tenant via `tenant.zatca_env` column in the master DB.
 
 ---
 
-## 10. ZATCA Timing Rules
+## 11. ZATCA Timing Rules
 
 | Invoice Type | API | Deadline |
 |---|---|---|
@@ -516,7 +537,7 @@ Set per-tenant via `tenant.zatca_env` column in the master DB.
 
 ---
 
-## 11. Certificate Renewal
+## 12. Certificate Renewal
 
 ZATCA certificates expire after ~1 year. To renew, get a fresh OTP from the Fatoora portal and re-onboard:
 
@@ -534,7 +555,7 @@ The `INSERT ... ON DUPLICATE KEY UPDATE` in the onboarding flow handles both ini
 
 ---
 
-## 12. Monitoring
+## 13. Monitoring
 
 | What | How | Frequency |
 |---|---|---|
@@ -546,7 +567,7 @@ The `INSERT ... ON DUPLICATE KEY UPDATE` in the onboarding flow handles both ini
 
 ---
 
-## Project Structure
+## 14. Project Structure
 
 ```
 ├── cmd/

@@ -87,11 +87,30 @@ func (p *BillPipeline) Submit(_ context.Context, invoice queue.SignedInvoice) (q
 	return responseOutcome(resp), nil
 }
 
-// responseOutcome classifies a 2xx answer. ZATCA can answer 2xx and still list error messages, and those reject the invoice.
-// Warnings, in the answer or in its validation results, accept it with a warning.
+// responseOutcome classifies a 2xx answer. ZATCA can answer 2xx and still list
+// error messages or a failed validation status, and those reject the invoice.
+// Warnings, in the answer or in its validation results, accept it with a
+// warning.
 func responseOutcome(resp *models.InvoiceResponse) queue.Outcome {
 	if vr := resp.ValidationResults; vr != nil && len(vr.ErrorMessages) > 0 {
 		return queue.Outcome{State: queue.OutcomeRejected, ProviderCode: vr.ErrorMessages[0].Code, Message: validationText(vr.ErrorMessages)}
+	}
+	if len(resp.Errors) > 0 {
+		return queue.Outcome{
+			State:        queue.OutcomeRejected,
+			ProviderCode: resp.Errors[0].Code,
+			Message:      errorText(resp.Errors),
+		}
+	}
+	if vr := resp.ValidationResults; vr != nil {
+		switch strings.ToUpper(strings.TrimSpace(vr.Status)) {
+		case "ERROR", "FAIL", "FAILED":
+			return queue.Outcome{
+				State:        queue.OutcomeRejected,
+				ProviderCode: strings.ToUpper(strings.TrimSpace(vr.Status)),
+				Message:      "provider validation status: " + strings.ToUpper(strings.TrimSpace(vr.Status)),
+			}
+		}
 	}
 	if len(resp.Warnings) > 0 {
 		warning := resp.Warnings[0]
@@ -101,11 +120,30 @@ func responseOutcome(resp *models.InvoiceResponse) queue.Outcome {
 		warning := vr.WarningMessages[0]
 		return queue.Outcome{State: queue.OutcomeWarning, ProviderCode: warning.Code, Message: warning.Message}
 	}
+	if vr := resp.ValidationResults; vr != nil {
+		switch strings.ToUpper(strings.TrimSpace(vr.Status)) {
+		case "WARNING", "WARN":
+			status := strings.ToUpper(strings.TrimSpace(vr.Status))
+			return queue.Outcome{
+				State:        queue.OutcomeWarning,
+				ProviderCode: status,
+				Message:      "provider validation status: " + status,
+			}
+		}
+	}
 	return queue.Outcome{State: queue.OutcomeAccepted}
 }
 
 // validationText joins the messages of a validation result into one text.
 func validationText(messages []models.ValidationMessage) string {
+	texts := make([]string, 0, len(messages))
+	for _, m := range messages {
+		texts = append(texts, m.Message)
+	}
+	return strings.Join(texts, "; ")
+}
+
+func errorText(messages []models.ErrorDetail) string {
 	texts := make([]string, 0, len(messages))
 	for _, m := range messages {
 		texts = append(texts, m.Message)
@@ -195,8 +233,11 @@ func (d *billDocument) Build(_ context.Context, booking queue.Booking) (queue.Si
 }
 
 // verifyBill refuses a bill that cannot be reported, before any number is booked. The bill must belong to the envelope's branch,
-// be a final sale, and carry the envelope's invoice UUID when it has one. The seller's VAT and EGS id come from the branch
-// configuration, and the bill needs at least one line with a positive quantity and a price that is not negative.
+// be a final sale, carry the envelope's invoice UUID when it has one, and have
+// the branch/printed document identity that is emitted as XML cbc:ID. The
+// seller's VAT and EGS id come from the branch configuration, and the bill
+// needs at least one line with a positive quantity and a price that is not
+// negative.
 func verifyBill(cfg *config.Config, msg queue.Message, bill BillRow, products []ProductRow) error {
 	switch {
 	case bill.BranchID != msg.BranchID:
@@ -205,6 +246,8 @@ func verifyBill(cfg *config.Config, msg queue.Message, bill BillRow, products []
 		return fmt.Errorf("the bill is not a final sale (state %d)", bill.State)
 	case bill.InvoiceUUID.Valid && bill.InvoiceUUID.String != msg.InvoiceUUID:
 		return errors.New("the bill carries another invoice UUID")
+	case billDocumentID(bill) == "":
+		return errors.New("the bill has no branch sequence/printed document identity")
 	case cfg.Seller.VAT == "":
 		return errors.New("the branch has no seller VAT number")
 	case cfg.EGSID == "":
@@ -221,6 +264,13 @@ func verifyBill(cfg *config.Config, msg queue.Message, bill BillRow, products []
 		}
 	}
 	return nil
+}
+
+func billDocumentID(b BillRow) string {
+	if !b.SeqNumber.Valid {
+		return ""
+	}
+	return strings.TrimSpace(b.SeqNumber.String)
 }
 
 // apiRequest derives the ZATCA request of a signed invoice. It is deterministic, so a stored XML gives the same request
@@ -242,7 +292,7 @@ func apiRequest(svc *zatca.Service, signedXML string) (models.InvoiceRequest, er
 func buildBillInvoice(cfg *config.Config, b BillRow, products []ProductRow, issueTime time.Time, booking queue.Booking) *invoice.Invoice {
 	isStandard := b.BuyerVAT.Valid && b.BuyerVAT.String != ""
 	inv := &invoice.Invoice{
-		ID:               fmt.Sprintf("INV-%d", b.ID),
+		ID:               billDocumentID(b),
 		UUID:             booking.UUID,
 		IssueDate:        issueTime,
 		IssueTime:        issueTime,

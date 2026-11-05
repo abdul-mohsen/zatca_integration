@@ -301,6 +301,46 @@ func TestRecordFailureAfterAnAnswerKeepsTheDeliveryAndReleasesTheClaim(t *testin
 	}
 }
 
+// If the provider accepted an invoice but the process failed before recording
+// the answer, a replay can receive 409. It must use the stored XML, record the
+// ambiguity, and acknowledge only after that record succeeds.
+func TestAcceptedThenRecordFailureReplaysStoredXMLAndRecordsAmbiguous(t *testing.T) {
+	h := newHarness(t)
+	h.chain.recordErr = errors.New("crash after provider acceptance")
+	if err := h.deliver(); err == nil {
+		t.Fatal("first delivery succeeded; want the record failure")
+	}
+	if h.chain.stored == nil || len(h.pipeline.submitted) != 1 {
+		t.Fatalf("stored = %v, submitted = %d; want a committed invoice and one provider call", h.chain.stored, len(h.pipeline.submitted))
+	}
+	first := h.pipeline.submitted[0]
+
+	h.chain.recordErr = nil
+	h.pipeline.outcome = Outcome{State: OutcomeAmbiguous, ProviderCode: "409", Message: "already reported"}
+	h.pipeline.outcomeErr = fmt.Errorf("%w: provider already holds the invoice", ErrOutcomeAmbiguous)
+	h.calls = nil
+	if err := h.deliver(); !errors.Is(err, ErrOutcomeAmbiguous) {
+		t.Fatalf("redelivery = %v; want ErrOutcomeAmbiguous", err)
+	}
+	expectSteps(t, h.calls, "claim", "stored", "submit", "record", "complete")
+	if len(h.pipeline.built) != 1 {
+		t.Fatalf("built %d times; want once", len(h.pipeline.built))
+	}
+	if len(h.pipeline.submitted) != 2 {
+		t.Fatalf("submitted %d times; want the original and one replay", len(h.pipeline.submitted))
+	}
+	second := h.pipeline.submitted[1]
+	if second.SignedXML != first.SignedXML || second.UUID != first.UUID || second.ICV != first.ICV {
+		t.Fatalf("replay = %+v; want the exact stored invoice %+v", second, first)
+	}
+	if len(h.chain.recorded) != 1 || h.chain.recorded[0].State != OutcomeAmbiguous {
+		t.Fatalf("recorded = %+v; want one ambiguous outcome", h.chain.recorded)
+	}
+	if h.acks != 1 {
+		t.Fatalf("acks = %d; want 1 after the ambiguous outcome was recorded", h.acks)
+	}
+}
+
 // Once ZATCA's answer is recorded, the invoice is final. A redelivery that has to finish the request must not send it again.
 func TestRecordedAnswerIsNeverSubmittedAgain(t *testing.T) {
 	h := newHarness(t)
