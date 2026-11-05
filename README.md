@@ -69,7 +69,9 @@ VALUES ('Al-Faris Restaurant', 'alfaris_db', 'production', 'admin@alfaris.com');
 
 ### 1b. Per-Tenant Tables
 
-These tables must exist **inside each tenant's database**. The full schema is in [todo/master_schema.sql](todo/master_schema.sql). The key tables:
+These tables must exist **inside each tenant's database**. The schema is owned
+by ifritah-go and applied with `go run ./cmd/migrate up` (the deployment
+`migrate` service runs the same command). The key tables:
 
 | Table | Purpose |
 |-------|---------|

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -39,6 +40,21 @@ var (
 )
 
 const defaultBookingLease = 5 * time.Minute
+
+var (
+	// ErrChainSchema means the tenant database cannot support the daemon's
+	// reservation-based chain protocol.
+	ErrChainSchema = errors.New("ZATCA chain schema preflight failed")
+
+	chainReservationColumns = [...]string{
+		"icv_reservation_key",
+		"icv_reservation_token",
+		"reserved_icv",
+		"reservation_lease_expires_at",
+	}
+)
+
+const chainSchemaMigrationHint = "run ifritah-go's cmd/migrate up for this tenant database (Goose 00005_egs_chain_reservation.sql)"
 
 // Booking is the number a bill is built with: its ICV, the hash it chains from, and the UUID from its envelope. A booking
 // holds the branch's chain until it is committed or released.
@@ -113,6 +129,53 @@ func (c *SQLChain) leaseDuration() time.Duration {
 	return c.LeaseDuration
 }
 
+// SchemaPreflight verifies the reservation columns required by Book. The
+// backend owns the migration, but the daemon owns this runtime contract.
+func (c *SQLChain) SchemaPreflight(ctx context.Context) error {
+	if c == nil || c.DB == nil {
+		return fmt.Errorf("%w: tenant database is not configured; %s", ErrChainSchema, chainSchemaMigrationHint)
+	}
+
+	rows, err := c.DB.QueryContext(ctx, `
+		SELECT column_name
+		FROM information_schema.columns
+		WHERE table_schema = DATABASE()
+		  AND table_name = 'branch_zatca_config'
+		  AND column_name IN (?, ?, ?, ?)
+	`, chainReservationColumns[0], chainReservationColumns[1], chainReservationColumns[2], chainReservationColumns[3])
+	if err != nil {
+		return fmt.Errorf("%w: inspect branch_zatca_config reservation columns: %v; %s", ErrChainSchema, err, chainSchemaMigrationHint)
+	}
+	defer rows.Close()
+
+	found := make(map[string]bool, len(chainReservationColumns))
+	for rows.Next() {
+		var column string
+		if err := rows.Scan(&column); err != nil {
+			return fmt.Errorf("%w: read branch_zatca_config reservation columns: %v; %s", ErrChainSchema, err, chainSchemaMigrationHint)
+		}
+		found[column] = true
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("%w: read branch_zatca_config reservation columns: %v; %s", ErrChainSchema, err, chainSchemaMigrationHint)
+	}
+	return validateReservationColumns(found)
+}
+
+func validateReservationColumns(found map[string]bool) error {
+	var missing []string
+	for _, column := range chainReservationColumns {
+		if !found[column] {
+			missing = append(missing, column)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: branch_zatca_config is missing reservation columns %s; %s",
+		ErrChainSchema, strings.Join(missing, ", "), chainSchemaMigrationHint)
+}
+
 // chainRow is the chain state of one branch, read under a row lock.
 type chainRow struct {
 	lastICV     uint64
@@ -168,6 +231,9 @@ func (r chainRow) holds(b Booking) bool {
 // Book reserves the next ICV for a request. Another request's booking blocks it while the lease is live. A request
 // resumes its own booking after a crash, and the lease of a crashed booking expires.
 func (c *SQLChain) Book(ctx context.Context, msg Message) (Booking, error) {
+	if err := c.SchemaPreflight(ctx); err != nil {
+		return Booking{}, err
+	}
 	tx, err := c.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return Booking{}, fmt.Errorf("begin booking: %w", err)
