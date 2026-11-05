@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"os"
+	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -14,9 +16,11 @@ import (
 	"github.com/google/uuid"
 )
 
-// testDB opens the database named by ZATCA_TEST_DB on the server in ZATCA_TEST_MYSQL_DSN, and skips the test when either is
-// unset. The database must hold the backend's schema, built with ifritah-go's cmd/migrate up. These tests use the real
-// tables, not a copy of them.
+// testDB opens the database named by ZATCA_TEST_DB on the server in
+// ZATCA_TEST_MYSQL_DSN, and skips the test when either is unset. The database
+// must hold the backend's Goose tenant schema, including the chain/submission
+// contract from 00001, 00003, 00005, and 00010, built with ifritah-go's
+// cmd/migrate up. These tests use the real tables, not a copy of them.
 func testDB(t *testing.T) *sql.DB {
 	t.Helper()
 	dsn := os.Getenv("ZATCA_TEST_MYSQL_DSN")
@@ -46,9 +50,93 @@ func testDB(t *testing.T) *sql.DB {
 		t.Fatal(err)
 	}
 	if tables != 3 {
-		t.Fatalf("%s lacks the backend schema: run ifritah-go's cmd/migrate up on it first", name)
+		t.Fatalf("%s lacks the backend ZATCA schema: run ifritah-go's cmd/migrate up on it first", name)
 	}
 	return db
+}
+
+func TestZATCASchemaProvidesTheDaemonChainContract(t *testing.T) {
+	db := testDB(t)
+	required := map[string][]string{
+		"branch_zatca_config": {
+			"last_icv",
+			"previous_invoice_hash",
+			"icv_reservation_key",
+			"icv_reservation_token",
+			"reserved_icv",
+			"reservation_lease_expires_at",
+		},
+		"zatca_submission": {
+			"id",
+			"bill_id",
+			"branch_id",
+			"status",
+			"outcome_state",
+			"invoice_icv",
+			"previous_invoice_hash",
+			"invoice_uuid",
+			"invoice_hash",
+			"invoice_kind",
+			"signed_xml",
+			"provider_code",
+			"rejection_code",
+			"rejection_msg",
+			"provider_warning_message",
+			"submitted_at",
+			"outcome_at",
+		},
+		"zatca_consumer_claim": {
+			"pos_id",
+			"bill_request_id",
+			"event_id",
+			"egs_sequence_id",
+			"fingerprint",
+			"state",
+			"lease_expires_at",
+			"completed_at",
+		},
+	}
+
+	rows, err := db.Query(`
+		SELECT table_name, column_name
+		FROM information_schema.columns
+		WHERE table_schema = DATABASE()
+		  AND table_name IN ('branch_zatca_config', 'zatca_submission', 'zatca_consumer_claim')
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+
+	found := make(map[string]map[string]bool, len(required))
+	for table := range required {
+		found[table] = make(map[string]bool)
+	}
+	for rows.Next() {
+		var table, column string
+		if err := rows.Scan(&table, &column); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := found[table]; ok {
+			found[table][column] = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	var missing []string
+	for table, columns := range required {
+		for _, column := range columns {
+			if !found[table][column] {
+				missing = append(missing, table+"."+column)
+			}
+		}
+	}
+	sort.Strings(missing)
+	if len(missing) > 0 {
+		t.Fatalf("tenant schema is missing the daemon chain contract columns: %s", strings.Join(missing, ", "))
+	}
 }
 
 // chainFixture is one company, branch, and set of bills. Its rows are removed when the test ends.
@@ -182,6 +270,90 @@ func TestBookingHoldsTheChainUntilItIsReleased(t *testing.T) {
 	}
 }
 
+func TestConcurrentBookingsHaveOneOwnerAndSafeReleaseTakeover(t *testing.T) {
+	db := testDB(t)
+	fx := newChainFixture(t, db, 2)
+	ctx := context.Background()
+	chain := NewSQLChain(db)
+	messages := []Message{
+		fixtureMessage(fx, fx.bills[0], "concurrent-1"),
+		fixtureMessage(fx, fx.bills[1], "concurrent-2"),
+	}
+
+	type result struct {
+		msg     Message
+		booking Booking
+		err     error
+	}
+	start := make(chan struct{})
+	results := make(chan result, len(messages))
+	for _, msg := range messages {
+		go func(msg Message) {
+			<-start
+			booking, err := chain.Book(ctx, msg)
+			results <- result{msg: msg, booking: booking, err: err}
+		}(msg)
+	}
+	close(start)
+
+	first, second := <-results, <-results
+	var winner, loser result
+	if first.err == nil {
+		winner, loser = first, second
+	} else {
+		winner, loser = second, first
+	}
+	if winner.err != nil {
+		t.Fatalf("concurrent bookings = %v and %v; want exactly one success", first.err, second.err)
+	}
+	if !errors.Is(loser.err, ErrChainBusy) {
+		t.Fatalf("losing booking error = %v; want ErrChainBusy", loser.err)
+	}
+	if winner.booking.ICV != 1 || winner.booking.PIH != GenesisPIH {
+		t.Fatalf("winner booking = ICV %d, PIH %q; want ICV 1 from genesis", winner.booking.ICV, winner.booking.PIH)
+	}
+
+	var reservedKey string
+	scanOne(t, db, &reservedKey, `SELECT icv_reservation_key FROM branch_zatca_config WHERE branch_id = ?`, fx.branchID)
+	if reservedKey != winner.msg.RequestKey() {
+		t.Fatalf("reservation owner = %q; want %q", reservedKey, winner.msg.RequestKey())
+	}
+
+	if err := chain.Release(ctx, winner.booking); err != nil {
+		t.Fatalf("Release winner: %v", err)
+	}
+	taken, err := chain.Book(ctx, loser.msg)
+	if err != nil {
+		t.Fatalf("Book loser after release: %v", err)
+	}
+	if taken.ICV != 1 || taken.PIH != GenesisPIH {
+		t.Fatalf("takeover booking = ICV %d, PIH %q; want ICV 1 from genesis", taken.ICV, taken.PIH)
+	}
+
+	// A late release from the previous owner must not clear the new owner's reservation.
+	if err := chain.Release(ctx, winner.booking); err != nil {
+		t.Fatalf("late Release winner: %v", err)
+	}
+	scanOne(t, db, &reservedKey, `SELECT icv_reservation_key FROM branch_zatca_config WHERE branch_id = ?`, fx.branchID)
+	if reservedKey != loser.msg.RequestKey() {
+		t.Fatalf("reservation owner after late release = %q; want %q", reservedKey, loser.msg.RequestKey())
+	}
+
+	if err := chain.Commit(ctx, taken, signedFor(taken, loser.msg.ID, "hash-concurrent")); err != nil {
+		t.Fatalf("Commit takeover: %v", err)
+	}
+	var lastICV uint64
+	scanOne(t, db, &lastICV, `SELECT last_icv FROM branch_zatca_config WHERE branch_id = ?`, fx.branchID)
+	if lastICV != 1 {
+		t.Fatalf("last ICV after takeover commit = %d; want 1", lastICV)
+	}
+	var reservation sql.NullString
+	scanOne(t, db, &reservation, `SELECT icv_reservation_key FROM branch_zatca_config WHERE branch_id = ?`, fx.branchID)
+	if reservation.Valid {
+		t.Fatalf("reservation after takeover commit = %q; want NULL", reservation.String)
+	}
+}
+
 func TestBookingOfACrashedRequestIsTakenOverAfterItsLease(t *testing.T) {
 	db := testDB(t)
 	fx := newChainFixture(t, db, 2)
@@ -204,6 +376,69 @@ func TestBookingOfACrashedRequestIsTakenOverAfterItsLease(t *testing.T) {
 	}
 	if booking.ICV != 1 {
 		t.Fatalf("ICV after a crash = %d; want 1, the crashed booking committed nothing", booking.ICV)
+	}
+}
+
+func TestSQLRedeliveryReusesCommittedInvoiceAndStopsAfterCompletion(t *testing.T) {
+	db := testDB(t)
+	fx := newChainFixture(t, db, 1)
+	ctx := context.Background()
+	claims := NewSQLClaimStore(db)
+	chain := NewSQLChain(db)
+	var pipelineCalls calls
+	pipeline := &fakePipeline{
+		calls:     &pipelineCalls,
+		sourceID:  fx.bills[0],
+		outcome:   Outcome{State: OutcomeAccepted},
+		submitErr: errors.New("provider timeout"),
+	}
+	stream := NewOrderedStream(claims, chain, pipeline)
+	msg := fixtureMessage(fx, fx.bills[0], "sql-redelivery")
+	acks := 0
+	ack := func() error {
+		acks++
+		return nil
+	}
+
+	if err := stream.HandleMessage(ctx, msg, ack); err == nil {
+		t.Fatal("first delivery succeeded; want a provider failure")
+	}
+	if len(pipeline.built) != 1 || len(pipeline.submitted) != 1 {
+		t.Fatalf("first delivery built %d and submitted %d; want one of each", len(pipeline.built), len(pipeline.submitted))
+	}
+	first := pipeline.submitted[0]
+	if acks != 0 {
+		t.Fatalf("acks after technical failure = %d; want 0", acks)
+	}
+
+	pipeline.submitErr = nil
+	pipelineCalls = nil
+	if err := stream.HandleMessage(ctx, msg, ack); err != nil {
+		t.Fatalf("redelivery: %v", err)
+	}
+	if !reflect.DeepEqual(pipelineCalls, calls{"submit"}) {
+		t.Fatalf("redelivery pipeline calls = %v; want submit only", pipelineCalls)
+	}
+	if len(pipeline.built) != 1 || len(pipeline.submitted) != 2 {
+		t.Fatalf("redelivery built %d and submitted %d; want one build and two submissions", len(pipeline.built), len(pipeline.submitted))
+	}
+	second := pipeline.submitted[1]
+	if second.SignedXML != first.SignedXML || second.UUID != first.UUID || second.ICV != first.ICV {
+		t.Fatalf("redelivery invoice = %+v; want exact stored invoice %+v", second, first)
+	}
+	if acks != 1 {
+		t.Fatalf("acks after accepted redelivery = %d; want 1", acks)
+	}
+
+	pipelineCalls = nil
+	if err := stream.HandleMessage(ctx, msg, ack); err != nil {
+		t.Fatalf("completed redelivery: %v", err)
+	}
+	if len(pipeline.submitted) != 2 {
+		t.Fatalf("completed redelivery submitted %d times; want 2", len(pipeline.submitted))
+	}
+	if len(pipelineCalls) != 0 || acks != 2 {
+		t.Fatalf("completed redelivery calls = %v, acks = %d; want no pipeline call and ACK 2", pipelineCalls, acks)
 	}
 }
 

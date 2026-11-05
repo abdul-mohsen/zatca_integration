@@ -83,8 +83,11 @@ type Chain interface {
 	Record(ctx context.Context, invoice SignedInvoice, outcome Outcome) error
 }
 
-// SQLChain is the chain in the tenant database. A booking uses the reservation columns of branch_zatca_config (goose 00005).
-// The committed chain is last_icv and previous_invoice_hash on the same row. The invoice itself is a zatca_submission row.
+// SQLChain is the daemon's runtime chain owner in the tenant database. The
+// backend owns the Goose schema, including the reservation columns added by
+// 00005, but the daemon alone books, releases, commits, and advances the chain.
+// The committed chain is last_icv and previous_invoice_hash on the same row.
+// The invoice itself is a zatca_submission row.
 type SQLChain struct {
 	DB            *sql.DB
 	LeaseDuration time.Duration

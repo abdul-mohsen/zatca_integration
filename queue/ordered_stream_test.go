@@ -101,6 +101,7 @@ func (c *fakeChain) Record(_ context.Context, _ SignedInvoice, outcome Outcome) 
 // fakePipeline verifies, builds, and submits with fixed results.
 type fakePipeline struct {
 	calls      *calls
+	sourceID   int64
 	prepareErr error
 	buildErr   error
 	submitErr  error
@@ -137,8 +138,12 @@ func (f *fakePrepared) Build(_ context.Context, booking Booking) (SignedInvoice,
 	if f.pipeline.buildErr != nil {
 		return SignedInvoice{}, f.pipeline.buildErr
 	}
+	sourceID := f.pipeline.sourceID
+	if sourceID == 0 {
+		sourceID = 42
+	}
 	return SignedInvoice{
-		SourceID:  42,
+		SourceID:  sourceID,
 		BranchID:  booking.BranchID,
 		UUID:      booking.UUID,
 		ICV:       booking.ICV,

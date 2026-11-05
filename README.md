@@ -510,6 +510,29 @@ The exact duplicate-invoice response and acceptance behavior of a live ZATCA
 sandbox require an external sandbox run; local tests do not claim that
 evidence.
 
+### Chain ownership and tenant schema contract
+
+The ZATCA daemon is the **single runtime owner** of each branch's ICV and
+previous-invoice-hash chain. `queue.SQLChain` is constructed once per tenant
+database by `cmd/daemon/main.go` and is the only runtime path that books,
+releases, commits, and advances the chain.
+
+The backend owns the tenant schema and Goose migrations, but the daemon uses
+the reservation columns created by Goose `00005_egs_chain_reservation.sql`:
+`icv_reservation_key`, `icv_reservation_token`, `reserved_icv`, and
+`reservation_lease_expires_at`. Booking locks the branch row and sets all four;
+release and commit clear only the matching reservation. The committed values
+remain `last_icv` and `previous_invoice_hash` on `branch_zatca_config`.
+
+The daemon also requires the backend-owned submission/claim schema from Goose
+`00001`, `00003`, and `00010`, including `zatca_submission.signed_xml` and
+`zatca_consumer_claim`. Fresh tenant databases must run the complete Goose
+path; existing tenants must have the same columns before a daemon starts.
+Removing `00005` or its columns is a breaking change that requires a
+coordinated daemon protocol and migration. Removing the backend's old
+`pkg/egschain` runtime package does not remove this schema contract; its stale
+migration comment should be updated by the backend owner.
+
 ## 9. Signed XML Storage
 
 The signed XML is stored in the tenant database, in zatca_submission.signed_xml, in the same transaction as its ICV, hash, and UUID. It never changes afterwards: a retry sends the stored XML again and does not build a new one.
