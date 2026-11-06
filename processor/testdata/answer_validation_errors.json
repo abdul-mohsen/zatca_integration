@@ -1,0 +1,10 @@
+{
+  "status": "CLEARED",
+  "validationResults": {
+    "warningMessages": [],
+    "errorMessages": [
+      {"code": "TEST-V1", "message": "first validation error"}
+    ],
+    "status": "ERROR"
+  }
+}

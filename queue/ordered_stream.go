@@ -158,6 +158,9 @@ func (s *OrderedStream) invoiceFor(ctx context.Context, msg Message) (SignedInvo
 	if err != nil {
 		return SignedInvoice{}, s.release(ctx, booking, err)
 	}
+	if err := checkBuilt(invoice, msg, booking); err != nil {
+		return SignedInvoice{}, s.release(ctx, booking, err)
+	}
 	if err := s.chain.Commit(ctx, booking, invoice); err != nil {
 		return SignedInvoice{}, s.release(ctx, booking, err)
 	}
@@ -167,11 +170,38 @@ func (s *OrderedStream) invoiceFor(ctx context.Context, msg Message) (SignedInvo
 // checkStored refuses a stored invoice that belongs to another UUID or branch. The invoice was committed earlier, so a mismatch
 // is a technical failure for an operator to look at. It is not an input error.
 func checkStored(invoice SignedInvoice, msg Message) (SignedInvoice, error) {
+	if err := invoice.Validate(); err != nil {
+		return SignedInvoice{}, fmt.Errorf("stored bill %d is invalid: %w", msg.ID, err)
+	}
+	if invoice.SourceID != msg.ID {
+		return SignedInvoice{}, fmt.Errorf("stored invoice source %d does not match bill %d", invoice.SourceID, msg.ID)
+	}
 	if invoice.UUID != msg.InvoiceUUID || invoice.BranchID != msg.BranchID {
 		return SignedInvoice{}, fmt.Errorf("bill %d is stored as invoice %s of branch %d, not %s of branch %d",
 			msg.ID, invoice.UUID, invoice.BranchID, msg.InvoiceUUID, msg.BranchID)
 	}
 	return invoice, nil
+}
+
+// checkBuilt enforces that a pipeline cannot replace the backend's invoice
+// identity or the chain booking before the signed invoice is persisted.
+func checkBuilt(invoice SignedInvoice, msg Message, booking Booking) error {
+	if err := invoice.Validate(); err != nil {
+		return fmt.Errorf("built bill %d is invalid: %w", msg.ID, err)
+	}
+	switch {
+	case invoice.SourceID != msg.ID:
+		return fmt.Errorf("built invoice source %d does not match bill %d", invoice.SourceID, msg.ID)
+	case invoice.BranchID != msg.BranchID:
+		return fmt.Errorf("built invoice branch %d does not match branch %d", invoice.BranchID, msg.BranchID)
+	case invoice.UUID != msg.InvoiceUUID || invoice.UUID != booking.UUID:
+		return fmt.Errorf("built invoice UUID %s does not match the backend UUID %s", invoice.UUID, msg.InvoiceUUID)
+	case invoice.ICV != booking.ICV:
+		return fmt.Errorf("built invoice ICV %d does not match booked ICV %d", invoice.ICV, booking.ICV)
+	case invoice.PIH != booking.PIH:
+		return fmt.Errorf("built invoice PIH does not match the booking")
+	}
+	return nil
 }
 
 // release drops a booking after a failure before the commit. The cause is kept, and a release error is joined to it.

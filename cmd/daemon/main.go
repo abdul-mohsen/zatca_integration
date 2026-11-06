@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/subtle"
 	"database/sql"
 	"flag"
@@ -170,19 +171,24 @@ func main() {
 	if err != nil {
 		log.Fatalf("load tenants: %v", err)
 	}
+	if err := tenant.ValidateAll(tenants); err != nil {
+		log.Fatalf("validate tenants: %v", err)
+	}
 	log.Printf("Loaded %d tenant(s)", len(tenants))
 
 	// ── 4. Build per-tenant context ────────────────────────────────────
 	tenantMap := map[string]*tenantCtx{} // dbName → context
 
 	for _, t := range tenants {
-		if t.TenantKey == "" {
-			log.Printf("ERROR: skip tenant %s: zatca_master has no tenant_key", t.Name)
-			continue
-		}
 		tdb, err := tenant.OpenDB(t, *baseDSN)
 		if err != nil {
 			log.Printf("WARN: skip tenant %s: %v", t.Name, err)
+			continue
+		}
+		chain := queue.NewSQLChain(tdb)
+		if err := chain.Preflight(context.Background()); err != nil {
+			log.Printf("WARN: skip tenant %s: %v", t.Name, err)
+			tdb.Close()
 			continue
 		}
 		cfg := &config.Config{
@@ -194,7 +200,7 @@ func main() {
 			cfg:    cfg,
 			encKey: encKey,
 			claims: queue.NewSQLClaimStore(tdb),
-			chain:  queue.NewSQLChain(tdb),
+			chain:  chain,
 		}
 
 		// Open separate admin connection for onboarding if admin-dsn is set

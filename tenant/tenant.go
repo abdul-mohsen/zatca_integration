@@ -2,8 +2,11 @@ package tenant
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-sql-driver/mysql"
 )
@@ -16,6 +19,44 @@ type Tenant struct {
 	DBName     string
 	ZATCAEnv   string // sandbox, simulation, or production
 	AlertEmail string
+}
+
+// Validate checks the stable identity used to route a tenant's messages. The
+// daemon must fail closed instead of silently overwriting one tenant in its
+// db_name map.
+func (t Tenant) Validate() error {
+	switch {
+	case strings.TrimSpace(t.TenantKey) == "":
+		return errors.New("tenant_key is required")
+	case utf8.RuneCountInString(t.TenantKey) > 64:
+		return errors.New("tenant_key must be at most 64 characters")
+	case strings.TrimSpace(t.DBName) == "":
+		return errors.New("db_name is required")
+	case utf8.RuneCountInString(t.DBName) > 64:
+		return errors.New("db_name must be at most 64 characters")
+	}
+	return nil
+}
+
+// ValidateAll checks the registry before any tenant database is opened.
+// tenant_key is the stable identity; db_name remains the database routing key.
+func ValidateAll(tenants []Tenant) error {
+	tenantKeys := make(map[string]struct{}, len(tenants))
+	dbNames := make(map[string]struct{}, len(tenants))
+	for _, t := range tenants {
+		if err := t.Validate(); err != nil {
+			return fmt.Errorf("tenant %d (%s): %w", t.ID, t.Name, err)
+		}
+		if _, exists := tenantKeys[t.TenantKey]; exists {
+			return fmt.Errorf("tenant_key %q is used by more than one tenant", t.TenantKey)
+		}
+		if _, exists := dbNames[t.DBName]; exists {
+			return fmt.Errorf("db_name %q is used by more than one tenant", t.DBName)
+		}
+		tenantKeys[t.TenantKey] = struct{}{}
+		dbNames[t.DBName] = struct{}{}
+	}
+	return nil
 }
 
 // LoadAll returns all enabled tenants from the master database.
@@ -34,7 +75,13 @@ func LoadAll(masterDB *sql.DB) ([]Tenant, error) {
 		}
 		tenants = append(tenants, t)
 	}
-	return tenants, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := ValidateAll(tenants); err != nil {
+		return nil, fmt.Errorf("validate tenants: %w", err)
+	}
+	return tenants, nil
 }
 
 // OpenDB opens a connection to this tenant's database using the base DSN template.

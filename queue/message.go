@@ -119,6 +119,6 @@ func invalidf(format string, args ...any) error {
 }
 
 func isUUID(value string) bool {
-	_, err := uuid.Parse(value)
-	return err == nil
+	parsed, err := uuid.Parse(value)
+	return err == nil && parsed != uuid.Nil
 }

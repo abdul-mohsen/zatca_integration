@@ -1,0 +1,10 @@
+{
+  "status": "CLEARED",
+  "validationResults": {
+    "warningMessages": [
+      {"code": "TEST-W1", "message": "first warning"}
+    ],
+    "errorMessages": [],
+    "status": "PASS"
+  }
+}
