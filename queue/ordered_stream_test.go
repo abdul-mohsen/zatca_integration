@@ -281,7 +281,8 @@ func TestRedeliveryAfterASubmitFailureSubmitsTheStoredXMLAgain(t *testing.T) {
 		t.Fatalf("built %d times; want once, the stored XML is never rebuilt", len(h.pipeline.built))
 	}
 	first, second := h.pipeline.submitted[0], h.pipeline.submitted[1]
-	if first.SignedXML != second.SignedXML || first.Hash != second.Hash || first.ICV != second.ICV {
+	if first.SignedXML != second.SignedXML || first.Hash != second.Hash || first.QR != second.QR ||
+		first.UUID != second.UUID || first.ICV != second.ICV || first.PIH != second.PIH {
 		t.Fatalf("the redelivery submitted %+v; want the stored invoice %+v", second, first)
 	}
 	if h.acks != 1 {
