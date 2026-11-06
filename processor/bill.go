@@ -287,6 +287,8 @@ func verifyBill(cfg *config.Config, msg queue.Message, bill BillRow, products []
 		return fmt.Errorf("the bill belongs to branch %d, not %d", bill.BranchID, msg.BranchID)
 	case bill.State < 1:
 		return fmt.Errorf("the bill is not a final sale (state %d)", bill.State)
+	case finalizedInvoiceID(bill) == "":
+		return errors.New("the bill has no finalized invoice sequence")
 	case bill.InvoiceUUID.Valid && bill.InvoiceUUID.String != msg.InvoiceUUID:
 		return errors.New("the bill carries another invoice UUID")
 	case cfg.Seller.VAT == "":
@@ -326,7 +328,7 @@ func apiRequest(svc *zatca.Service, signedXML string) (models.InvoiceRequest, er
 func buildBillInvoice(cfg *config.Config, b BillRow, products []ProductRow, issueTime time.Time, booking queue.Booking) *invoice.Invoice {
 	isStandard := b.BuyerVAT.Valid && b.BuyerVAT.String != ""
 	inv := &invoice.Invoice{
-		ID:               fmt.Sprintf("INV-%d", b.ID),
+		ID:               finalizedInvoiceID(b),
 		UUID:             booking.UUID,
 		IssueDate:        issueTime,
 		IssueTime:        issueTime,
@@ -358,6 +360,21 @@ func buildBillInvoice(cfg *config.Config, b BillRow, products []ProductRow, issu
 		inv.SubType = invoice.SubTypeSimplified
 	}
 	return inv
+}
+
+// finalizedInvoiceID is the printed identity shared by the backend PDF and
+// the ZATCA XML. The backend stores the sequence as a numeric value, so
+// normalizing it here keeps both representations byte-for-byte equivalent.
+func finalizedInvoiceID(b BillRow) string {
+	if !b.SeqNumber.Valid {
+		return ""
+	}
+	sequence := strings.TrimSpace(b.SeqNumber.String)
+	value, err := strconv.ParseUint(sequence, 10, 64)
+	if err != nil || value == 0 {
+		return ""
+	}
+	return fmt.Sprintf("INV-%d", value)
 }
 
 func paymentMeans(b BillRow) string {
