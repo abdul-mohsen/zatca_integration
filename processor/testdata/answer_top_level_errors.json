@@ -1,0 +1,7 @@
+{
+  "status": "CLEARED",
+  "errors": [
+    {"code": "TEST-E1", "message": "first top-level error"},
+    {"code": "TEST-E2", "message": "second top-level error"}
+  ]
+}

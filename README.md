@@ -25,7 +25,7 @@ A production-ready Go daemon for Saudi Arabia's ZATCA (Zakat, Tax and Customs Au
 - **Embedded NATS** with JetStream — no external message broker needed (~15 MB RAM)
 - **Per-branch ordering** — each `(tenant × branch × doc_type)` gets its own consumer
 - **Combined Docker image** — Go daemon + JRE + ZATCA SDK (`fatoora`) in one container
-- **Startup replay** — on boot, scans all tenant DBs for pending documents and re-publishes them
+- **Redelivery** - JetStream redelivers an unacknowledged document. The claim and the invoice chain make a redelivery safe
 - **Email alerts** — sends failure notifications after exhausting retries
 
 ## Prerequisites
@@ -110,7 +110,6 @@ docker build -t zatca-daemon .
 docker run -d \
   --name zatca \
   -p 4222:4222 \
-  -v zatca-xml:/data/zatca-xml \
   -v zatca-nats:/nats-data \
   zatca-daemon daemon \
     --db-user  "myuser" \
@@ -120,20 +119,17 @@ docker run -d \
     --master-db zatca_master \
     --nats-port  4222 \
     --nats-data  /nats-data \
-    --xml-dir    /data/zatca-xml
 
 # Run (Option 2: full DSN — only if password has no special characters)
 docker run -d \
   --name zatca \
   -p 4222:4222 \
-  -v zatca-xml:/data/zatca-xml \
   -v zatca-nats:/nats-data \
   zatca-daemon daemon \
     --master-dsn "user:pass@tcp(db-host:3306)/zatca_master" \
     --base-dsn   "user:pass@tcp(db-host:3306)/" \
     --nats-port  4222 \
     --nats-data  /nats-data \
-    --xml-dir    /data/zatca-xml
 ```
 
 ### Option B: Local (development)
@@ -148,14 +144,12 @@ go build -o bin/daemon ./cmd/daemon
   --db-host  "localhost" \
   --db-port  3306 \
   --nats-port  4222 \
-  --xml-dir    ./xml-output
 
 # Option 2: full DSN
 ./bin/daemon \
   --master-dsn "root:pass@tcp(localhost:3306)/zatca_master" \
   --base-dsn   "root:pass@tcp(localhost:3306)/" \
   --nats-port  4222 \
-  --xml-dir    ./xml-output
 ```
 
 ### Daemon Flags
@@ -171,7 +165,6 @@ go build -o bin/daemon ./cmd/daemon
 | `--base-dsn` | | Full base DSN without DB name (alternative to individual flags) |
 | `--nats-port` | `4222` | Port for the embedded NATS server |
 | `--nats-data` | `./nats-data` | JetStream persistent storage directory |
-| `--xml-dir` | `/data/zatca-xml` | Base directory for storing signed XML files |
 
 > **Password with special characters?** Use `--db-user`/`--db-pass` flags instead of `--master-dsn`/`--base-dsn`. The individual flags use the MySQL driver's `FormatDSN()` which properly escapes all special characters.
 
@@ -182,7 +175,6 @@ go build -o bin/daemon ./cmd/daemon
 3. Opens a DB connection to each tenant's database
 4. Discovers active branches per tenant
 5. Launches **3 workers per branch** (bill, credit, debit) + **1 onboard worker per tenant**
-6. **Replays** any pending documents found in the DB (catches items missed while the daemon was down)
 7. Waits for SIGINT/SIGTERM for graceful shutdown
 
 ---
@@ -273,7 +265,7 @@ zatca.{doc_type}.{db_name}.{branch_id}
 | `zatca.bill.alfaris_db.1` | Bill for branch 1 | Sign + report/clear invoice |
 | `zatca.credit.alfaris_db.1` | Credit note for branch 1 | Sign + report/clear credit |
 | `zatca.debit.alfaris_db.1` | Debit note for branch 1 | Sign + report/clear debit |
-| `zatca.onboard.alfaris_db.1` | Onboard branch 1 | CSR → compliance → production |
+| `control.zatca.onboard.alfaris_db.1` | Onboard branch 1 | CSR → compliance → production |
 
 ### Message Format
 
@@ -362,7 +354,7 @@ The daemon will:
 3. Build UBL 2.1 XML
 4. Sign via SDK (`fatoora`)
 5. Submit to ZATCA (ClearInvoice for B2B, ReportInvoice for B2C)
-6. Update the bill row: `state=3`, `invoice_hash`, `invoice_qr`, `invoice_uuid`, `invoice_xml_path`
+6. Commit the signed invoice and its chain update in one transaction (`zatca_submission`, `branch_zatca_config`, and the bill's hash, QR code, and UUID)
 
 ### Step 6: Issue a credit note
 
@@ -430,7 +422,6 @@ go build -o bin/store_status    ./cmd/store_status
 ./bin/store_status --db-user root --db-pass "p@ss!" --db-host localhost --db-name demo_db --json --ping
 ```
 
-All CLI tools accept `--db-user`, `--db-pass`, `--db-host`, `--db-port`, `--db-name` as safe alternatives to `--dsn`. They also accept `--zatca-env` (default `production`) and `--xml-dir` (default `/data/zatca-xml`).
 
 ---
 
@@ -444,8 +435,7 @@ bill (state=1) ──► Query bill + products from DB
                    ──► Build UBL 2.1 XML
                    ──► SDK: sign invoice (fatoora)
                    ──► ZATCA API: ClearInvoice (B2B) or ReportInvoice (B2C)
-                   ──► Update bill: state=3, hash, QR, UUID, XML path
-                   ──► Save signed XML to filesystem
+                   ──► Update bill: hash, QR, UUID, and state=3 once ZATCA accepts the invoice
 ```
 
 ### B2B vs B2C Detection
@@ -481,7 +471,6 @@ bill (state=1) ──► Query bill + products from DB
   - Sends an **alert email** to the tenant's `alert_email`
   - ACKs the message (to avoid blocking the queue)
   - Leaves the document in its current state for manual handling
-- On startup, the daemon **replays** any documents still pending in the DB
 
 ### SMTP Configuration (for alerts)
 
@@ -499,21 +488,7 @@ SMTP_FROM=alerts@yourcompany.com
 
 ## 8. Signed XML Storage
 
-Signed XML files are saved to the filesystem at:
-
-```
-{xml-dir}/{company_id}/{branch_id}/{bill_type}/{row_id}.xml
-```
-
-Example: `/data/zatca-xml/1/3/invoice/42.xml`
-
-In Docker, mount a volume to persist XMLs:
-
-```bash
-docker run -v zatca-xml:/data/zatca-xml ...
-```
-
-The path is also stored in the bill row as `invoice_xml_path`.
+The signed XML is stored in the tenant database, in zatca_submission.signed_xml, in the same transaction as its ICV, hash, and UUID. It never changes afterwards: a retry sends the stored XML again and does not build a new one.
 
 ---
 
@@ -572,7 +547,7 @@ The `INSERT ... ON DUPLICATE KEY UPDATE` in the onboarding flow handles both ini
 
 ```
 ├── cmd/
-│   ├── daemon/          Daemon entry point (main, worker, email, replay)
+│   ├── daemon/          Daemon entry point (main, worker, email)
 │   ├── register_branch/ CLI: branch ZATCA registration
 │   ├── process_bills/   CLI: batch invoice processing
 │   ├── credit_notes/    CLI: batch credit note processing

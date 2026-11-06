@@ -1,0 +1,6 @@
+{
+  "db_name": "tenant_acme",
+  "tenant_key": "acme-0001",
+  "branch_id": 7,
+  "otp": "123456"
+}

@@ -18,7 +18,6 @@ services:
       - "${NATS_PORT:-4222}:4222"   # NATS — your backend publishes here
       - "${NATS_MONITOR_PORT:-8222}:8222"   # NATS monitoring — http://localhost:8222
     volumes:
-      - zatca-xml:/data/zatca-xml       # signed XML storage
       - nats-data:/data/nats            # JetStream persistence
     environment:
       # --- DB connection (required) ---
@@ -45,8 +44,7 @@ services:
       SMTP_USER: ${SMTP_USER:-}
       SMTP_PASS: ${SMTP_PASS:-}
       SMTP_FROM: ${SMTP_FROM:-zatca-daemon@localhost}
-    command: ["--nats-data=/data/nats"]
+    command: ["--nats-mode=embedded", "--nats-monitor=8222", "--nats-data=/data/nats"]
 
 volumes:
-  zatca-xml:
   nats-data:

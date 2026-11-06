@@ -1,0 +1,11 @@
+{
+  "status": "CLEARED",
+  "validationResults": {
+    "infoMessages": [
+      {"type": "INFO", "code": "TEST-INFO", "message": "information only", "status": "PASS"}
+    ],
+    "warningMessages": [],
+    "errorMessages": [],
+    "status": "PASS"
+  }
+}

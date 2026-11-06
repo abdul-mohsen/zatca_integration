@@ -31,6 +31,7 @@ type BranchZATCA struct {
 	ProductionPassword string
 	PrivateKey         string // PEM-encoded EC private key
 	Certificate        string // Base64-encoded certificate from ZATCA
+	EGSID              string // the computer number of the branch's CSR: its EGS id
 }
 
 // LoadBranchZATCA loads ZATCA credentials for a given branch from the database.
@@ -52,7 +53,8 @@ func LoadBranchZATCA(db *sql.DB, branchID int64, encKey *secutil.Key) (*BranchZA
 		COALESCE(s.country, 'SA') as country,
 		COALESCE(bz.zatca_production_username, '') as zatca_username,
 		COALESCE(bz.zatca_production_password, '') as zatca_password,
-		COALESCE(bz.zatca_private_key, '') as zatca_private_key
+		COALESCE(bz.zatca_private_key, '') as zatca_private_key,
+		COALESCE(bz.csr_computer_number, '') as csr_computer_number
 	FROM branches b
 	JOIN company c ON c.id = b.company_id
 	LEFT JOIN store s ON s.id = (
@@ -79,6 +81,7 @@ func LoadBranchZATCA(db *sql.DB, branchID int64, encKey *secutil.Key) (*BranchZA
 		&bz.ProductionUsername,
 		&bz.ProductionPassword,
 		&bz.PrivateKey,
+		&bz.EGSID,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("load ZATCA config for branch %d: %w", branchID, err)
@@ -108,10 +111,9 @@ func (bz *BranchZATCA) ToConfig(base *config.Config) *config.Config {
 	return &config.Config{
 		Env:                base.Env,
 		OTP:                base.OTP,
-		XMLDir:             base.XMLDir,
-		TenantID:           base.TenantID,
 		ProductionUsername: bz.ProductionUsername,
 		ProductionPassword: bz.ProductionPassword,
+		EGSID:              bz.EGSID,
 		CSR: config.CSRConfig{
 			CommonName:       base.CSR.CommonName,
 			SerialNumber:     base.CSR.SerialNumber,

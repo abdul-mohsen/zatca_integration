@@ -6,8 +6,6 @@ import (
 	"time"
 )
 
-const DefaultPIH = "NWZlY2ViNjZmZmM4NmYzOGQ5NTI3ODZjNmQ2OTZjNzljMmRiYzIzOWRkNGU5MWI0NjcyOWQ3M2EyN2ZiNTdlOQ=="
-
 // ProductRow represents product columns from the bill_product table.
 type ProductRow struct {
 	ProductID         sql.NullInt64
@@ -68,13 +66,8 @@ type BillRow struct {
 	BuyerCountry      sql.NullString
 	BuyerSchemeID     sql.NullString
 	BuyerRegistration sql.NullString
-}
-
-// CreditDebitRow extends BillRow with credit/debit note fields.
-type CreditDebitRow struct {
-	BillRow
-	NoteText sql.NullString // credit_note.note or debit_note.note
-	NoteID   sql.NullInt64  // credit_note.id or debit_note.id
+	State             int64
+	InvoiceUUID       sql.NullString
 }
 
 // LoadProducts loads products for a given bill from the bill_product table.

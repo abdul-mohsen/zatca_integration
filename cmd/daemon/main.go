@@ -1,14 +1,12 @@
 package main
 
 import (
+	"context"
 	"crypto/subtle"
 	"database/sql"
 	"flag"
-	"fmt"
 	"log"
 	"net/http"
-	"net/http/httputil"
-	"net/url"
 	"os"
 	"os/signal"
 	"sync"
@@ -16,17 +14,10 @@ import (
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
-	"github.com/nats-io/nats-server/v2/server"
-	"github.com/nats-io/nats.go"
 
 	"github.com/zatca-go/zatca/config"
 	"github.com/zatca-go/zatca/dbutil"
-	"github.com/zatca-go/zatca/processor"
-	"github.com/zatca-go/zatca/queue"
 	"github.com/zatca-go/zatca/secutil"
-	"github.com/zatca-go/zatca/storeconfig"
-	"github.com/zatca-go/zatca/tenant"
-	"github.com/zatca-go/zatca/zatca"
 )
 
 func main() {
@@ -38,10 +29,14 @@ func main() {
 	dbHost := flag.String("db-host", "", "Database host")
 	dbPort := flag.String("db-port", "3306", "Database port")
 	masterDB := flag.String("master-db", "zatca_master", "Master database name")
+	natsMode := flag.String("nats-mode", envOrDefault("NATS_MODE", string(config.NATSExternal)), "NATS ownership mode: external or embedded")
+	natsURL := flag.String("nats-url", envOrDefault("NATS_URL", ""), "External NATS URL (required in external mode)")
 	natsPort := flag.Int("nats-port", 4222, "Port for embedded NATS server")
-	natsMonPort := flag.Int("nats-monitor", 8222, "Port for NATS HTTP monitoring (0 to disable)")
+	natsMonPort := flag.Int("nats-monitor", 0, "Port for embedded NATS HTTP monitoring (0 to disable)")
 	natsDataDir := flag.String("nats-data", "./nats-data", "JetStream data directory")
-	xmlDir := flag.String("xml-dir", "/data/zatca-xml", "Base directory for storing signed XML files")
+	natsAckWait := flag.Duration("nats-ack-wait", 5*time.Minute, "JetStream delivery ACK wait")
+	natsMaxDeliver := flag.Int("nats-max-deliver", 10, "Maximum delivery attempts before local terminal failure")
+	tenantReconcileInterval := flag.Duration("tenant-reconcile-interval", time.Minute, "Tenant and branch discovery interval")
 	flag.Parse()
 
 	// Env var fallbacks (for Docker / docker-compose)
@@ -87,74 +82,36 @@ func main() {
 		log.Fatalf("ENCRYPT_KEY is required: %v (generate with: openssl rand -base64 32)", err)
 	}
 
-	// ── 1. Start embedded NATS with JetStream ──────────────────────────
-	opts := &server.Options{
-		Port:      *natsPort,
-		JetStream: true,
-		StoreDir:  *natsDataDir,
-		NoLog:     true,
-		NoSigs:    true,
-	}
-	if *natsMonPort > 0 {
-		// Bind NATS monitoring to localhost only (not public)
-		internalMonPort := *natsMonPort + 10000 // e.g. 18222
-		opts.HTTPHost = "127.0.0.1"
-		opts.HTTPPort = internalMonPort
-
-		monPass := os.Getenv("MONITOR_PASS")
-		if monPass == "" {
-			log.Fatal("MONITOR_PASS is required when --nats-monitor is enabled (set to disable: --nats-monitor=0)")
-		}
-
-		// Auth-protected reverse proxy → internal NATS monitoring
-		target, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", internalMonPort))
-		proxy := httputil.NewSingleHostReverseProxy(target)
-		monMux := http.NewServeMux()
-		monMux.Handle("/", basicAuth(proxy, monPass))
-		go func() {
-			addr := fmt.Sprintf(":%d", *natsMonPort)
-			log.Printf("NATS monitoring (auth-protected) at http://0.0.0.0:%d", *natsMonPort)
-			if err := http.ListenAndServe(addr, monMux); err != nil {
-				log.Printf("WARN: monitoring server: %v", err)
-			}
-		}()
-	}
-	ns, err := server.NewServer(opts)
+	mode, err := config.ParseNATSMode(*natsMode)
 	if err != nil {
-		log.Fatalf("nats server create: %v", err)
+		log.Fatal(err)
 	}
-	go ns.Start()
-	if !ns.ReadyForConnections(10 * time.Second) {
-		log.Fatal("nats server not ready")
+	natsCfg := config.NATSConfig{
+		Mode:              mode,
+		URL:               *natsURL,
+		Port:              *natsPort,
+		MonitorPort:       *natsMonPort,
+		DataDir:           *natsDataDir,
+		AckWait:           *natsAckWait,
+		MaxDeliver:        *natsMaxDeliver,
+		ReconcileInterval: *tenantReconcileInterval,
 	}
-	log.Printf("Embedded NATS running on port %d (JetStream dir: %s)", *natsPort, *natsDataDir)
-
-	// ── 2. Connect to NATS ─────────────────────────────────────────────
-	nc, err := nats.Connect(fmt.Sprintf("nats://localhost:%d", *natsPort))
+	natsRT, err := openNATS(natsCfg, os.Getenv("MONITOR_PASS"))
 	if err != nil {
-		log.Fatalf("nats connect: %v", err)
+		log.Fatalf("NATS startup: %v", err)
 	}
-	defer nc.Close()
-
-	js, err := nc.JetStream()
+	defer natsRT.close()
+	js, err := natsRT.conn.JetStream()
 	if err != nil {
 		log.Fatalf("jetstream: %v", err)
 	}
 
-	// Ensure the ZATCA stream exists
-	_, err = js.AddStream(&nats.StreamConfig{
-		Name:      queue.StreamName,
-		Subjects:  []string{queue.SubjectAll},
-		Retention: nats.WorkQueuePolicy,
-		Storage:   nats.FileStorage,
-		MaxAge:    7 * 24 * time.Hour, // keep messages for 7 days
-	})
-	if err != nil {
-		log.Fatalf("add stream: %v", err)
+	if err := ensureStream(js, mode); err != nil {
+		log.Fatalf("ZATCA stream: %v", err)
 	}
-	log.Println("JetStream stream ready: ZATCA")
+	log.Printf("NATS ready in %s mode", mode)
 
-	// ── 3. Open master DB & get tenants ────────────────────────────────
+	// ── 2. Open master DB; tenant discovery is reconciled continuously ──
 	masterDBConn, err := sql.Open("mysql", *masterDSN)
 	if err != nil {
 		log.Fatalf("open master db: %v", err)
@@ -167,149 +124,33 @@ func main() {
 	masterDBConn.SetMaxIdleConns(2)
 	defer masterDBConn.Close()
 
-	tenants, err := tenant.LoadAll(masterDBConn)
-	if err != nil {
-		log.Fatalf("load tenants: %v", err)
-	}
-	log.Printf("Loaded %d tenant(s)", len(tenants))
-
-	// ── 4. Build per-tenant context ────────────────────────────────────
-	tenantMap := map[string]*tenantCtx{} // dbName → context
-
-	for _, t := range tenants {
-		tdb, err := tenant.OpenDB(t, *baseDSN)
-		if err != nil {
-			log.Printf("WARN: skip tenant %s: %v", t.Name, err)
-			continue
-		}
-		cfg := &config.Config{
-			Env:      config.Environment(t.ZATCAEnv),
-			XMLDir:   *xmlDir,
-			TenantID: t.DBName,
-		}
-		tc := &tenantCtx{tenant: t, db: tdb, cfg: cfg, encKey: encKey}
-
-		// Open separate admin connection for onboarding if admin-dsn is set
-		if *adminDSN != "" {
-			adb, err := tenant.OpenDB(t, *adminDSN)
-			if err != nil {
-				log.Printf("WARN: admin DB for tenant %s failed, onboarding will use runtime user: %v", t.Name, err)
-			} else {
-				tc.adminDB = adb
-			}
-		}
-
-		tenantMap[t.DBName] = tc
-		log.Printf("  Tenant %s (%s) ready", t.Name, t.DBName)
-	}
-	defer func() {
-		for _, tc := range tenantMap {
-			tc.db.Close()
-			if tc.adminDB != nil {
-				tc.adminDB.Close()
-			}
-		}
-	}()
-
-	// ── 5. Per-branch service caches (tenant × branch → zatca.Service) ─
-	type branchEntry struct {
-		svc *zatca.Service
-		cfg *config.Config
-	}
-	branchCaches := map[string]map[int64]*branchEntry{} // dbName → branchID → entry
-	var cacheMu sync.RWMutex
-
-	getService := func(dbName string, branchID int64) (*zatca.Service, *config.Config, error) {
-		cacheMu.RLock()
-		if cache, ok := branchCaches[dbName]; ok {
-			if entry, ok := cache[branchID]; ok {
-				cacheMu.RUnlock()
-				return entry.svc, entry.cfg, nil
-			}
-		}
-		cacheMu.RUnlock()
-
-		tc, ok := tenantMap[dbName]
-		if !ok {
-			return nil, nil, fmt.Errorf("unknown tenant db: %s", dbName)
-		}
-
-		bz, err := storeconfig.LoadBranchZATCA(tc.db, branchID, encKey)
-		if err != nil {
-			return nil, nil, fmt.Errorf("load branch %d ZATCA config: %w", branchID, err)
-		}
-		if !bz.IsRegistered() {
-			return nil, nil, fmt.Errorf("branch %d not registered with ZATCA", branchID)
-		}
-
-		branchCfg := bz.ToConfig(tc.cfg)
-		svc := bz.NewService(tc.cfg)
-
-		cacheMu.Lock()
-		if branchCaches[dbName] == nil {
-			branchCaches[dbName] = map[int64]*branchEntry{}
-		}
-		branchCaches[dbName][branchID] = &branchEntry{svc: svc, cfg: branchCfg}
-		cacheMu.Unlock()
-
-		return svc, branchCfg, nil
-	}
-
-	// ── 6. Launch workers ──────────────────────────────────────────────
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	var wg sync.WaitGroup
-
-	// Discover active branches per tenant and start workers
-	for dbName, tc := range tenantMap {
-		branches, err := processor.QueryActiveBranches(tc.db)
-		if err != nil {
-			log.Printf("WARN: cannot query branches for %s: %v", dbName, err)
-			continue
-		}
-
-		for _, branchID := range branches {
-			markBranchActive(dbName, branchID) // register so onboard won't duplicate
-			for _, docType := range []queue.DocType{queue.DocBill, queue.DocCredit, queue.DocDebit} {
-				wg.Add(1)
-				go func(dt queue.DocType, db string, bid int64) {
-					defer wg.Done()
-					runWorker(js, tenantMap, getService, dt, db, bid)
-				}(docType, dbName, branchID)
-			}
-		}
-		log.Printf("  Started %d workers for tenant %s (%d branches × 3 doc types)", len(branches)*3, tc.tenant.Name, len(branches))
-		if len(branches) == 0 {
-			log.Printf("  NOTE: No onboarded branches in %s — onboard a branch first, then bill workers will auto-start", tc.tenant.Name)
-		}
+	reconciler := newDaemonReconciler(
+		ctx,
+		masterDBConn,
+		*baseDSN,
+		*adminDSN,
+		encKey,
+		natsRT.conn,
+		js,
+		&wg,
+		*natsAckWait,
+		*natsMaxDeliver,
+	)
+	if err := reconciler.reconcile(ctx); err != nil {
+		log.Fatalf("initial tenant reconciliation: %v", err)
 	}
+	go reconciler.loop(*tenantReconcileInterval)
 
-	// Start a single onboard worker per tenant (handles all branches for that tenant)
-	for dbName := range tenantMap {
-		wg.Add(1)
-		go func(db string) {
-			defer wg.Done()
-			runOnboardWorker(js, tenantMap, getService, &wg, db)
-		}(dbName)
-	}
-
-	// ── 7. Startup replay ──────────────────────────────────────────────
-	for dbName, tc := range tenantMap {
-		branches, err := processor.QueryActiveBranches(tc.db)
-		if err != nil {
-			continue
-		}
-		replayPending(js, tc.db, dbName, branches)
-	}
-
-	// ── 8. Wait for shutdown ───────────────────────────────────────────
+	// ── 3. Wait for shutdown ───────────────────────────────────────────
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 	log.Println("Shutting down...")
-
-	nc.Drain()
-	ns.Shutdown()
-	ns.WaitForShutdown()
-	log.Println("NATS shutdown complete")
+	reconciler.stop()
+	log.Println("ZATCA daemon shutdown complete")
 }
 
 // basicAuth wraps an http.Handler with HTTP Basic Authentication.
