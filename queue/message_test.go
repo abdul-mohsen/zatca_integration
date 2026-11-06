@@ -84,6 +84,29 @@ func TestPosIDLimitCountsCharactersNotBytes(t *testing.T) {
 	}
 }
 
+func TestEnvelopeIdentityFieldsRejectUnsafeOrMalformedValues(t *testing.T) {
+	cases := map[string]func(map[string]any){
+		"database wildcard": func(f map[string]any) { f["db_name"] = "tenant.>" },
+		"control character in request": func(f map[string]any) {
+			f["bill_request_id"] = "request\nid"
+		},
+		"oversized request": func(f map[string]any) {
+			f["bill_request_id"] = strings.Repeat("r", 37)
+		},
+		"short fingerprint": func(f map[string]any) { f["request_fingerprint"] = "abc" },
+		"non-hex fingerprint": func(f map[string]any) {
+			f["request_fingerprint"] = strings.Repeat("g", 64)
+		},
+	}
+	for name, change := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := DecodeEnvelope(envelopeWith(t, change)); !errors.Is(err, ErrInvalidEnvelope) {
+				t.Fatalf("DecodeEnvelope = %v; want ErrInvalidEnvelope", err)
+			}
+		})
+	}
+}
+
 func TestOrderedSubjectsNameTheBranchOnly(t *testing.T) {
 	if got := OrderedSubject("tenant_acme", 7); !strings.HasSuffix(got, ".tenant_acme.7") {
 		t.Fatalf("OrderedSubject = %q", got)

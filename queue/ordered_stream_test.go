@@ -289,6 +289,42 @@ func TestRedeliveryAfterASubmitFailureSubmitsTheStoredXMLAgain(t *testing.T) {
 	}
 }
 
+func TestPermanentFailureRecordsLocalTerminalStateWithoutProviderAnswer(t *testing.T) {
+	h := newHarness(t)
+	h.pipeline.submitErr = errors.New("provider unreachable")
+	if err := h.deliver(); err == nil {
+		t.Fatal("first delivery succeeded; want a technical error")
+	}
+	if h.chain.stored == nil {
+		t.Fatal("the committed invoice is required before terminalization")
+	}
+	if err := h.stream.FinalizePermanentFailure(context.Background(), h.msg, errors.New("delivery budget exhausted"), func() error {
+		h.acks++
+		return nil
+	}); err != nil {
+		t.Fatalf("FinalizePermanentFailure: %v", err)
+	}
+	if len(h.chain.recorded) != 1 || h.chain.recorded[0].State != OutcomeTerminalFailure ||
+		h.chain.recorded[0].Evidence != EvidenceLocal {
+		t.Fatalf("recorded = %+v; want one local terminal failure", h.chain.recorded)
+	}
+	if h.acks != 1 {
+		t.Fatalf("acks = %d; want 1", h.acks)
+	}
+}
+
+func TestExternalEvidenceIsMarkedWithoutChangingTheProviderMessage(t *testing.T) {
+	source, evidenceID, message := parseOutcomeEvidence(outcomeMessage(Outcome{
+		State:      OutcomeAccepted,
+		Evidence:   EvidenceExternal,
+		EvidenceID: "case-42",
+		Message:    "reported",
+	}))
+	if source != EvidenceExternal || evidenceID != "case-42" || message != "reported" {
+		t.Fatalf("parsed evidence = %q, %q, %q", source, evidenceID, message)
+	}
+}
+
 func TestRecordFailureAfterAnAnswerKeepsTheDeliveryAndReleasesTheClaim(t *testing.T) {
 	h := newHarness(t)
 	h.chain.recordErr = errors.New("connection lost")

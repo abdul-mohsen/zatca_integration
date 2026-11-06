@@ -15,16 +15,29 @@ const GenesisPIH = "NWZlY2ViNjZmZmM4NmYzOGQ5NTI3ODZjNmQ2OTZjNzljMmRiYzIzOWRkNGU5
 // Outcome states of one invoice. An accepted, warned, rejected, or ambiguous invoice is final. An ambiguous one needs
 // reconciliation with ZATCA before anyone acts on it.
 const (
-	OutcomeAccepted  = "accepted"
-	OutcomeWarning   = "accepted_with_warning"
-	OutcomeRejected  = "rejected"
-	OutcomeAmbiguous = "ambiguous"
+	OutcomeAccepted        = "accepted"
+	OutcomeWarning         = "accepted_with_warning"
+	OutcomeRejected        = "rejected"
+	OutcomeAmbiguous       = "ambiguous"
+	OutcomeTerminalFailure = "terminal_failure"
 )
 
 // Invoice kinds select the ZATCA endpoint: a standard invoice is cleared, a simplified one is reported.
 const (
 	InvoiceStandard   = "standard"
 	InvoiceSimplified = "simplified"
+)
+
+// EvidenceSource identifies where an outcome came from. An external
+// reconciliation answer is only recorded when the operator supplies evidence;
+// the daemon never invents a provider result.
+type EvidenceSource string
+
+const (
+	EvidenceUnspecified EvidenceSource = ""
+	EvidenceProvider    EvidenceSource = "provider"
+	EvidenceExternal    EvidenceSource = "external"
+	EvidenceLocal       EvidenceSource = "local"
 )
 
 // outcomePending is the outcome_state of an invoice that ZATCA has not answered yet.
@@ -64,7 +77,11 @@ type SignedInvoice struct {
 	SignedXML string
 	QR        string
 	// Outcome is the answer ZATCA recorded for this invoice, empty while none is recorded.
-	Outcome string
+	Outcome         string
+	OutcomeEvidence EvidenceSource
+	EvidenceID      string
+	ProviderCode    string
+	OutcomeMessage  string
 }
 
 // Validate checks the immutable fields that must be present before an invoice
@@ -89,7 +106,7 @@ func (i SignedInvoice) Validate() error {
 	case i.Kind != InvoiceStandard && i.Kind != InvoiceSimplified:
 		return fmt.Errorf("signed invoice kind %q is invalid", i.Kind)
 	case i.Outcome != "" && i.Outcome != OutcomeAccepted && i.Outcome != OutcomeWarning &&
-		i.Outcome != OutcomeRejected && i.Outcome != OutcomeAmbiguous:
+		i.Outcome != OutcomeRejected && i.Outcome != OutcomeAmbiguous && i.Outcome != OutcomeTerminalFailure:
 		return fmt.Errorf("signed invoice outcome %q is invalid", i.Outcome)
 	}
 	return nil
@@ -100,6 +117,8 @@ type Outcome struct {
 	State        string
 	ProviderCode string
 	Message      string
+	Evidence     EvidenceSource
+	EvidenceID   string
 }
 
 // Chain is the invoice chain of each branch. The daemon books the next number, commits the signed invoice and advances the
@@ -349,19 +368,23 @@ func (c *SQLChain) Commit(ctx context.Context, booking Booking, invoice SignedIn
 // Commit wrote it.
 func (c *SQLChain) Stored(ctx context.Context, msg Message) (*SignedInvoice, error) {
 	var (
-		invoice SignedInvoice
-		qr      sql.NullString
-		outcome string
+		invoice                     SignedInvoice
+		qr                          sql.NullString
+		outcome                     string
+		providerCode, rejectionCode sql.NullString
+		rejectionMsg, warningMsg    sql.NullString
 	)
 	err := c.DB.QueryRowContext(ctx, `
 		SELECT s.bill_id, s.branch_id, s.invoice_icv, s.previous_invoice_hash, s.invoice_uuid, s.invoice_hash,
-		       s.invoice_kind, s.signed_xml, b.qr_code, s.outcome_state
+		       s.invoice_kind, s.signed_xml, b.qr_code, s.outcome_state,
+		       s.provider_code, s.rejection_code, s.rejection_msg, s.provider_warning_message
 		FROM zatca_submission s
 		JOIN bill b ON b.id = s.bill_id
 		WHERE s.bill_id = ?
 	`, msg.ID).Scan(
 		&invoice.SourceID, &invoice.BranchID, &invoice.ICV, &invoice.PIH,
 		&invoice.UUID, &invoice.Hash, &invoice.Kind, &invoice.SignedXML, &qr, &outcome,
+		&providerCode, &rejectionCode, &rejectionMsg, &warningMsg,
 	)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
@@ -372,6 +395,14 @@ func (c *SQLChain) Stored(ctx context.Context, msg Message) (*SignedInvoice, err
 	invoice.QR = qr.String
 	if outcome != outcomePending {
 		invoice.Outcome = outcome
+		invoice.ProviderCode = providerCode.String
+		if rejectionMsg.Valid {
+			invoice.OutcomeMessage = rejectionMsg.String
+		} else {
+			invoice.OutcomeMessage = warningMsg.String
+		}
+		invoice.OutcomeEvidence, invoice.EvidenceID, invoice.OutcomeMessage =
+			parseOutcomeEvidence(invoice.OutcomeMessage)
 	}
 	return &invoice, nil
 }
@@ -383,6 +414,15 @@ func (c *SQLChain) Record(ctx context.Context, invoice SignedInvoice, outcome Ou
 	status, err := submissionStatus(outcome.State)
 	if err != nil {
 		return err
+	}
+	switch outcome.Evidence {
+	case EvidenceUnspecified, EvidenceProvider, EvidenceExternal, EvidenceLocal:
+	default:
+		return fmt.Errorf("unknown outcome evidence %q", outcome.Evidence)
+	}
+	if outcome.Evidence == EvidenceExternal &&
+		(strings.TrimSpace(outcome.EvidenceID) == "" || !validEvidenceText(outcome.EvidenceID, 256)) {
+		return errors.New("external outcome evidence id is required")
 	}
 	tx, err := c.DB.BeginTx(ctx, nil)
 	if err != nil {
@@ -398,12 +438,13 @@ func (c *SQLChain) Record(ctx context.Context, invoice SignedInvoice, outcome Ou
 	}
 
 	providerCode := nullString(outcome.ProviderCode, 64)
+	message := outcomeMessage(outcome)
 	var rejectionCode, rejectionMsg, warningMsg sql.NullString
-	if outcome.State == OutcomeRejected {
+	if outcome.State == OutcomeRejected || outcome.State == OutcomeTerminalFailure {
 		rejectionCode = providerCode
-		rejectionMsg = nullString(outcome.Message, 512)
+		rejectionMsg = nullString(message, 512)
 	} else {
-		warningMsg = nullString(outcome.Message, 1024)
+		warningMsg = nullString(message, 1024)
 	}
 	result, err := tx.ExecContext(ctx, `
 		UPDATE zatca_submission
@@ -429,7 +470,7 @@ func (c *SQLChain) Record(ctx context.Context, invoice SignedInvoice, outcome Ou
 		INSERT INTO zatca_submission_outcome
 			(submission_id, outcome_state, provider_code, provider_warning_message, observed_at)
 		VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-	`, submissionID, outcome.State, providerCode, warningMsg); err != nil {
+	`, submissionID, outcome.State, providerCode, outcomeLogMessage(outcome, warningMsg)); err != nil {
 		return fmt.Errorf("append outcome of bill %d: %w", invoice.SourceID, err)
 	}
 	if outcome.State == OutcomeAccepted || outcome.State == OutcomeWarning {
@@ -455,6 +496,36 @@ func submissionStatus(state string) (int, error) {
 		return 4, nil
 	case OutcomeAmbiguous:
 		return 1, nil
+	case OutcomeTerminalFailure:
+		return 5, nil
 	}
 	return 0, fmt.Errorf("unknown outcome state %q", state)
+}
+
+const externalEvidencePrefix = "external-evidence:"
+
+func outcomeMessage(outcome Outcome) string {
+	if outcome.Evidence != EvidenceExternal {
+		return outcome.Message
+	}
+	return externalEvidencePrefix + outcome.EvidenceID + "|" + outcome.Message
+}
+
+func outcomeLogMessage(outcome Outcome, warningMsg sql.NullString) sql.NullString {
+	if outcome.Evidence == EvidenceExternal {
+		return nullString(outcomeMessage(outcome), 1024)
+	}
+	return warningMsg
+}
+
+func parseOutcomeEvidence(message string) (EvidenceSource, string, string) {
+	if !strings.HasPrefix(message, externalEvidencePrefix) {
+		return EvidenceUnspecified, "", message
+	}
+	payload := strings.TrimPrefix(message, externalEvidencePrefix)
+	parts := strings.SplitN(payload, "|", 2)
+	if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" {
+		return EvidenceExternal, "", message
+	}
+	return EvidenceExternal, parts[0], parts[1]
 }

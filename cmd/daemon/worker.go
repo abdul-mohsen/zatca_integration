@@ -22,23 +22,30 @@ import (
 
 // tenantCtx is one tenant the daemon serves.
 type tenantCtx struct {
-	tenant  tenant.Tenant
-	db      *sql.DB // source reads and chain writes
-	adminDB *sql.DB // admin: onboarding writes to branch_zatca_config
-	cfg     *config.Config
-	encKey  *secutil.Key
-	claims  queue.ClaimStore
-	chain   queue.Chain
+	tenant             tenant.Tenant
+	db                 *sql.DB // source reads and chain writes
+	adminDB            *sql.DB // admin: onboarding writes to branch_zatca_config
+	cfg                *config.Config
+	encKey             *secutil.Key
+	claims             queue.ClaimStore
+	chain              queue.Chain
+	ackWait            time.Duration
+	maxDeliver         int
+	startBranch        func(*tenantCtx, string, int64)
+	onboardingWG       sync.WaitGroup
+	onboardingStateMu  sync.Mutex
+	onboardingStopping bool
 }
 
 type getServiceFunc func(dbName string, branchID int64) (*zatca.Service, *config.Config, error)
 
 // activeBranches tracks which branches already have a worker, and onboarding tracks which have an onboarding running.
 var (
-	activeMu       sync.Mutex
-	activeBranches = map[string]bool{}
-	onboardingMu   sync.Mutex
-	onboarding     = map[string]bool{}
+	activeMu          sync.Mutex
+	activeBranches    = map[string]bool{}
+	onboardingMu      sync.Mutex
+	onboarding        = map[string]bool{}
+	errTenantStopping = errors.New("tenant is being removed")
 )
 
 func branchKey(dbName string, branchID int64) string {
@@ -54,6 +61,12 @@ func markBranchActive(dbName string, branchID int64) bool {
 	}
 	activeBranches[k] = true
 	return true
+}
+
+func unmarkBranchActive(dbName string, branchID int64) {
+	activeMu.Lock()
+	defer activeMu.Unlock()
+	delete(activeBranches, branchKey(dbName, branchID))
 }
 
 func beginOnboarding(dbName string, branchID int64) bool {
@@ -75,8 +88,20 @@ func endOnboarding(dbName string, branchID int64) {
 
 // runWorker consumes one branch's documents in order. The ordered stream partitions them by tenant and EGS.
 func runWorker(js nats.JetStreamContext, tc *tenantCtx, getService getServiceFunc, dbName string, branchID int64) {
+	runWorkerContext(context.Background(), js, tc, getService, dbName, branchID)
+}
+
+func runWorkerContext(ctx context.Context, js nats.JetStreamContext, tc *tenantCtx, getService getServiceFunc, dbName string, branchID int64) {
 	subject := queue.OrderedSubject(dbName, branchID)
-	sub, err := js.PullSubscribe(subject, queue.OrderedConsumerName(dbName, branchID), nats.AckWait(5*time.Minute))
+	ackWait := tc.ackWait
+	if ackWait <= 0 {
+		ackWait = 5 * time.Minute
+	}
+	maxDeliver := tc.maxDeliver
+	if maxDeliver <= 0 {
+		maxDeliver = 10
+	}
+	sub, err := js.PullSubscribe(subject, queue.OrderedConsumerName(dbName, branchID), nats.AckWait(ackWait), nats.MaxDeliver(maxDeliver))
 	if err != nil {
 		log.Printf("ERROR: subscribe %s: %v", subject, err)
 		return
@@ -90,8 +115,19 @@ func runWorker(js nats.JetStreamContext, tc *tenantCtx, getService getServiceFun
 	log.Printf("Ordered worker started: %s", subject)
 
 	for {
+		select {
+		case <-ctx.Done():
+			_ = sub.Unsubscribe()
+			log.Printf("Ordered worker stopped: %s", subject)
+			return
+		default:
+		}
 		msgs, err := sub.Fetch(1, nats.MaxWait(30*time.Second))
 		if err != nil {
+			if ctx.Err() != nil {
+				_ = sub.Unsubscribe()
+				return
+			}
 			if !errors.Is(err, nats.ErrTimeout) {
 				log.Printf("ERROR: fetch %s: %v", subject, err)
 				time.Sleep(5 * time.Second)
@@ -134,9 +170,27 @@ func handleDelivery(stream *queue.OrderedStream, tc *tenantCtx, dbName string, b
 		log.Printf("ERROR: bill %d not invoiced: %v", msg.ID, err)
 		alert(tc, fmt.Sprintf("bill %d of branch %d", msg.ID, msg.BranchID), err)
 	default:
+		if deliveryBudgetExhausted(raw, tc.maxDeliver) && !errors.Is(err, queue.ErrClaimInFlight) && !errors.Is(err, queue.ErrChainBusy) {
+			if terminalErr := stream.FinalizePermanentFailure(context.Background(), msg, err, func() error { return raw.Ack() }); terminalErr == nil {
+				log.Printf("ERROR: bill %d reached the delivery limit; recorded local terminal failure: %v", msg.ID, err)
+				alert(tc, fmt.Sprintf("bill %d of branch %d reached the retry limit", msg.ID, msg.BranchID), err)
+				return
+			}
+			_ = raw.Term()
+			alert(tc, fmt.Sprintf("bill %d of branch %d could not be finalized after the retry limit", msg.ID, msg.BranchID), err)
+			return
+		}
 		log.Printf("ERROR: bill %d FAILED without ACK, it is retried: %v", msg.ID, err)
 		alert(tc, fmt.Sprintf("bill %d of branch %d", msg.ID, msg.BranchID), err)
 	}
+}
+
+func deliveryBudgetExhausted(raw *nats.Msg, maxDeliver int) bool {
+	if raw == nil || maxDeliver < 1 {
+		return false
+	}
+	meta, err := raw.Metadata()
+	return err == nil && meta != nil && int(meta.NumDelivered) >= maxDeliver
 }
 
 // sendAlertEmail sends each alert. A test replaces it to capture the alerts.
@@ -152,8 +206,13 @@ func alert(tc *tenantCtx, what string, err error) {
 // goroutine onboards the branch with the OTP, which is held in memory only, and writes the result to branch_zatca_config.
 // The request is a core NATS message on a subject outside the stream, so no copy of the OTP is stored.
 func runOnboardResponder(nc *nats.Conn, js nats.JetStreamContext, tc *tenantCtx, getService getServiceFunc, wg *sync.WaitGroup) error {
+	_, err := subscribeOnboardResponder(nc, js, tc, getService, wg)
+	return err
+}
+
+func subscribeOnboardResponder(nc *nats.Conn, js nats.JetStreamContext, tc *tenantCtx, getService getServiceFunc, wg *sync.WaitGroup) (*nats.Subscription, error) {
 	dbName := tc.tenant.DBName
-	_, err := nc.Subscribe(queue.OnboardWildcard(dbName), func(m *nats.Msg) {
+	sub, err := nc.QueueSubscribe(queue.OnboardWildcard(dbName), "zatca-onboarders", func(m *nats.Msg) {
 		req, err := queue.DecodeOnboardRequest(m.Data)
 		if err == nil {
 			err = checkOnboardRequest(m.Subject, tc, req)
@@ -161,18 +220,36 @@ func runOnboardResponder(nc *nats.Conn, js nats.JetStreamContext, tc *tenantCtx,
 		if err == nil && !beginOnboarding(dbName, req.BranchID) {
 			err = errors.New("onboarding of this branch is already running")
 		}
+		stopping := false
+		if err == nil {
+			tc.onboardingStateMu.Lock()
+			if tc.onboardingStopping {
+				err = errTenantStopping
+				stopping = true
+			} else {
+				tc.onboardingWG.Add(1)
+			}
+			tc.onboardingStateMu.Unlock()
+		}
 		replyOnboard(m, err)
 		if err != nil {
+			if stopping {
+				endOnboarding(dbName, req.BranchID)
+			}
 			return
 		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			defer tc.onboardingWG.Done()
 			defer endOnboarding(dbName, req.BranchID)
 			onboardBranch(js, tc, getService, wg, req)
 		}()
 	})
-	return err
+	if err != nil {
+		return nil, err
+	}
+	return sub, nil
 }
 
 // checkOnboardRequest refuses a request for another tenant, or one whose subject does not name its branch.
@@ -211,6 +288,10 @@ func onboardBranch(js nats.JetStreamContext, tc *tenantCtx, getService getServic
 	if err := processor.OnboardBranch(db, tc.cfg, req.BranchID, req.OTP, tc.encKey); err != nil {
 		log.Printf("ERROR: onboard branch=%d FAILED: %v", req.BranchID, err)
 		alert(tc, fmt.Sprintf("onboarding of branch %d", req.BranchID), err)
+		return
+	}
+	if tc.startBranch != nil {
+		tc.startBranch(tc, req.DBName, req.BranchID)
 		return
 	}
 	spawnBranchWorkers(js, tc, getService, wg, req.DBName, req.BranchID)

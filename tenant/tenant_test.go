@@ -51,3 +51,36 @@ func TestValidateRejectsOversizedIdentity(t *testing.T) {
 		})
 	}
 }
+
+func TestRegistryReconcilesAddedUpdatedAndRemovedTenants(t *testing.T) {
+	registry := NewRegistry()
+	first := []Tenant{
+		{ID: 1, TenantKey: "acme", DBName: "acme_db"},
+		{ID: 2, TenantKey: "other", DBName: "other_db"},
+	}
+	result, err := registry.Reconcile(first)
+	if err != nil {
+		t.Fatalf("initial reconcile: %v", err)
+	}
+	if len(result.Added) != 2 || len(result.Updated) != 0 || len(result.Removed) != 0 {
+		t.Fatalf("initial result = %+v", result)
+	}
+
+	second := []Tenant{
+		{ID: 1, TenantKey: "acme", DBName: "acme_db", ZATCAEnv: "simulation"},
+		{ID: 3, TenantKey: "new", DBName: "new_db"},
+	}
+	result, err = registry.Reconcile(second)
+	if err != nil {
+		t.Fatalf("second reconcile: %v", err)
+	}
+	if len(result.Updated) != 1 || result.Updated[0].TenantKey != "acme" {
+		t.Fatalf("updated = %+v; want acme", result.Updated)
+	}
+	if len(result.Added) != 1 || result.Added[0].TenantKey != "new" {
+		t.Fatalf("added = %+v; want new", result.Added)
+	}
+	if len(result.Removed) != 1 || result.Removed[0].TenantKey != "other" {
+		t.Fatalf("removed = %+v; want other", result.Removed)
+	}
+}

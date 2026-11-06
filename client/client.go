@@ -221,6 +221,7 @@ func (c *Client) setProductionAuth(req *http.Request) {
 type APIError struct {
 	StatusCode int
 	Body       string
+	Response   *models.InvoiceResponse
 }
 
 func (e *APIError) Error() string {
@@ -252,7 +253,12 @@ func (c *Client) do(req *http.Request, result any) error {
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		log.Printf("DEBUG: do: non-2xx response status=%d body=%s", resp.StatusCode, string(bodyBytes))
-		return &APIError{StatusCode: resp.StatusCode, Body: string(bodyBytes)}
+		apiErr := &APIError{StatusCode: resp.StatusCode, Body: string(bodyBytes)}
+		var providerResponse models.InvoiceResponse
+		if len(bodyBytes) > 0 && json.Unmarshal(bodyBytes, &providerResponse) == nil {
+			apiErr.Response = &providerResponse
+		}
+		return apiErr
 	}
 
 	if result != nil && len(bodyBytes) > 0 {

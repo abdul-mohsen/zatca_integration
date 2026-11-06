@@ -102,6 +102,39 @@ func (s *OrderedStream) HandleMessage(ctx context.Context, msg Message, ack func
 	}
 }
 
+// FinalizePermanentFailure records a bounded local failure and acknowledges
+// the delivery. It is intentionally separate from provider outcomes: no
+// provider result is fabricated when the daemon exhausts its delivery budget.
+func (s *OrderedStream) FinalizePermanentFailure(ctx context.Context, msg Message, cause error, ack func() error) error {
+	if cause == nil {
+		return errors.New("permanent failure cause is required")
+	}
+	if ack == nil {
+		return errors.New("ordered stream ACK function is required")
+	}
+	invoice, err := s.chain.Stored(ctx, msg)
+	if err != nil {
+		return errors.Join(cause, err)
+	}
+	if invoice != nil && invoice.Outcome == "" {
+		if err := s.chain.Record(ctx, *invoice, Outcome{
+			State:        OutcomeTerminalFailure,
+			ProviderCode: "DAEMON_RETRY_EXHAUSTED",
+			Message:      cause.Error(),
+			Evidence:     EvidenceLocal,
+		}); err != nil {
+			return errors.Join(cause, err)
+		}
+	}
+	if err := s.claims.Complete(ctx, msg); err != nil {
+		return errors.Join(cause, err)
+	}
+	if err := ack(); err != nil {
+		return errors.Join(cause, err)
+	}
+	return nil
+}
+
 // process runs a request whose claim this delivery holds.
 func (s *OrderedStream) process(ctx context.Context, msg Message, ack func() error) error {
 	invoice, err := s.invoiceFor(ctx, msg)

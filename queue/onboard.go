@@ -37,10 +37,10 @@ func DecodeOnboardRequest(data []byte) (OnboardRequest, error) {
 		return OnboardRequest{}, err
 	}
 	switch {
-	case strings.TrimSpace(req.DBName) == "":
-		return OnboardRequest{}, invalidf("db_name is required")
-	case strings.TrimSpace(req.TenantKey) == "":
-		return OnboardRequest{}, invalidf("tenant_key is required")
+	case !validIdentityText(req.DBName, 64):
+		return OnboardRequest{}, invalidf("db_name is required and must be at most 64 characters")
+	case !validIdentityText(req.TenantKey, 64):
+		return OnboardRequest{}, invalidf("tenant_key is required and must be at most 64 characters")
 	case req.BranchID <= 0:
 		return OnboardRequest{}, invalidf("branch_id is required")
 	case strings.TrimSpace(req.OTP) == "" || len(req.OTP) > 64:

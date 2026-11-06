@@ -2,7 +2,9 @@ package queue
 
 import (
 	"context"
+	"errors"
 	"testing"
+	"time"
 )
 
 // A recorded answer is final. Recording again never changes the answer, the stored hash, or the bill.
@@ -109,5 +111,36 @@ func TestReleasedClaimIsTakenAgainAtOnce(t *testing.T) {
 	}
 	if decision, err := claims.Claim(ctx, replay); err != nil || decision != ClaimProcess {
 		t.Fatalf("Claim after Release = %v, %v; want ClaimProcess at once", decision, err)
+	}
+}
+
+func TestStaleLeaseCannotReleaseOrCompleteAReclaimedRequest(t *testing.T) {
+	db := testDB(t)
+	fx := newChainFixture(t, db, 1)
+	ctx := context.Background()
+	start := time.Date(2026, 11, 6, 10, 0, 0, 0, time.UTC)
+	claims := &SQLClaimStore{
+		DB:            db,
+		LeaseDuration: time.Minute,
+		Now:           func() time.Time { return start },
+	}
+	old := fixtureMessage(fx, fx.bills[0], "fenced")
+	newOwner := old
+	newOwner.EventID = "new-owner-event"
+	if decision, err := claims.Claim(ctx, old); err != nil || decision != ClaimProcess {
+		t.Fatalf("old Claim = %v, %v; want ClaimProcess", decision, err)
+	}
+	claims.Now = func() time.Time { return start.Add(2 * time.Minute) }
+	if decision, err := claims.Claim(ctx, newOwner); err != nil || decision != ClaimProcess {
+		t.Fatalf("new Claim = %v, %v; want ClaimProcess after lease expiry", decision, err)
+	}
+	if err := claims.Release(ctx, old); !errors.Is(err, ErrClaimStale) {
+		t.Fatalf("stale Release = %v; want ErrClaimStale", err)
+	}
+	if err := claims.Complete(ctx, old); !errors.Is(err, ErrClaimStale) {
+		t.Fatalf("stale Complete = %v; want ErrClaimStale", err)
+	}
+	if err := claims.Complete(ctx, newOwner); err != nil {
+		t.Fatalf("new owner Complete = %v", err)
 	}
 }
