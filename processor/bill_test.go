@@ -2,9 +2,11 @@ package processor
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -124,23 +126,55 @@ func TestSuccessfulAnswerIsClassifiedByItsMessages(t *testing.T) {
 			want: queue.Outcome{State: queue.OutcomeRejected, ProviderCode: "BR-KSA-61", Message: "seller VAT is missing"},
 		},
 		"warning messages accept with a warning": {
-			resp: &models.InvoiceResponse{ValidationResults: &models.ValidationResults{
+			resp: &models.InvoiceResponse{Status: "CLEARED", ValidationResults: &models.ValidationResults{
 				WarningMessages: []models.ValidationMessage{{Code: "BR-KSA-W1", Message: "note is long"}},
 			}},
 			want: queue.Outcome{State: queue.OutcomeWarning, ProviderCode: "BR-KSA-W1", Message: "note is long"},
 		},
 		"warnings accept with a warning": {
-			resp: &models.InvoiceResponse{Warnings: []models.ErrorDetail{{Code: "W1", Message: "late"}}},
+			resp: &models.InvoiceResponse{Status: "CLEARED", Warnings: []models.ErrorDetail{{Code: "W1", Message: "late"}}},
 			want: queue.Outcome{State: queue.OutcomeWarning, ProviderCode: "W1", Message: "late"},
 		},
 		"neither accepts": {
-			resp: &models.InvoiceResponse{ValidationResults: &models.ValidationResults{Status: "PASS"}},
+			resp: &models.InvoiceResponse{Status: "CLEARED", ValidationResults: &models.ValidationResults{Status: "PASS"}},
 			want: queue.Outcome{State: queue.OutcomeAccepted},
 		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			if got := responseOutcome(tc.resp); got != tc.want {
+			if got := responseOutcome(queue.InvoiceStandard, tc.resp); got != tc.want {
+				t.Fatalf("responseOutcome = %+v; want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+// Each fixture is an answer to an invoice of the given kind. The fixtures are hand-written, not recorded ZATCA answers. An answer
+// with top-level errors, or without the success status of its kind, is rejected even when it lists no validation errors.
+func TestAnswerFixturesAreClassified(t *testing.T) {
+	cases := map[string]struct {
+		kind string
+		want queue.Outcome
+	}{
+		"answer_success_cleared.json":    {queue.InvoiceStandard, queue.Outcome{State: queue.OutcomeAccepted}},
+		"answer_success_reported.json":   {queue.InvoiceSimplified, queue.Outcome{State: queue.OutcomeAccepted}},
+		"answer_warnings_only.json":      {queue.InvoiceStandard, queue.Outcome{State: queue.OutcomeWarning, ProviderCode: "TEST-W1", Message: "first warning"}},
+		"answer_top_level_errors.json":   {queue.InvoiceStandard, queue.Outcome{State: queue.OutcomeRejected, ProviderCode: "TEST-E1", Message: "first top-level error; second top-level error"}},
+		"answer_validation_errors.json":  {queue.InvoiceStandard, queue.Outcome{State: queue.OutcomeRejected, ProviderCode: "TEST-V1", Message: "first validation error"}},
+		"answer_status_not_success.json": {queue.InvoiceStandard, queue.Outcome{State: queue.OutcomeRejected, ProviderCode: "ERROR", Message: `the answer status "ERROR" is not CLEARED`}},
+		"answer_none.json":               {queue.InvoiceStandard, queue.Outcome{State: queue.OutcomeRejected, Message: `the answer status "" is not CLEARED`}},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			raw, err := os.ReadFile("testdata/" + name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var resp models.InvoiceResponse
+			if err := json.Unmarshal(raw, &resp); err != nil {
+				t.Fatalf("parse %s: %v", name, err)
+			}
+			if got := responseOutcome(tc.kind, &resp); got != tc.want {
 				t.Fatalf("responseOutcome = %+v; want %+v", got, tc.want)
 			}
 		})

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -66,6 +67,34 @@ type SignedInvoice struct {
 	Outcome string
 }
 
+// Validate checks the immutable fields that must be present before an invoice
+// can be committed or submitted. It validates local state only; it does not
+// prove that ZATCA accepted the invoice.
+func (i SignedInvoice) Validate() error {
+	switch {
+	case i.SourceID <= 0:
+		return errors.New("signed invoice source id is required")
+	case i.BranchID <= 0:
+		return errors.New("signed invoice branch id is required")
+	case !isUUID(i.UUID):
+		return errors.New("signed invoice UUID is invalid")
+	case i.ICV == 0:
+		return errors.New("signed invoice ICV is required")
+	case strings.TrimSpace(i.PIH) == "":
+		return errors.New("signed invoice PIH is required")
+	case strings.TrimSpace(i.Hash) == "":
+		return errors.New("signed invoice hash is required")
+	case strings.TrimSpace(i.SignedXML) == "":
+		return errors.New("signed invoice XML is required")
+	case i.Kind != InvoiceStandard && i.Kind != InvoiceSimplified:
+		return fmt.Errorf("signed invoice kind %q is invalid", i.Kind)
+	case i.Outcome != "" && i.Outcome != OutcomeAccepted && i.Outcome != OutcomeWarning &&
+		i.Outcome != OutcomeRejected && i.Outcome != OutcomeAmbiguous:
+		return fmt.Errorf("signed invoice outcome %q is invalid", i.Outcome)
+	}
+	return nil
+}
+
 // Outcome is ZATCA's final answer for one invoice.
 type Outcome struct {
 	State        string
@@ -94,6 +123,16 @@ type SQLChain struct {
 // NewSQLChain returns the chain of one tenant database.
 func NewSQLChain(db *sql.DB) *SQLChain {
 	return &SQLChain{DB: db, LeaseDuration: defaultBookingLease}
+}
+
+// Preflight verifies the backend-owned tenant schema before a worker can
+// claim a document. SQLChain remains the owner of reservation values, but the
+// backend migration remains the owner of the table definition.
+func (c *SQLChain) Preflight(ctx context.Context) error {
+	if c == nil {
+		return fmt.Errorf("%w: SQLChain is not configured", ErrTenantSchemaNotReady)
+	}
+	return Preflight(ctx, c.DB)
 }
 
 func (c *SQLChain) now() time.Time {
@@ -181,6 +220,9 @@ func (c *SQLChain) Book(ctx context.Context, msg Message) (Booking, error) {
 		return Booking{}, fmt.Errorf("lock branch %d chain: %w", msg.BranchID, err)
 	}
 
+	if row.lastICV == ^uint64(0) {
+		return Booking{}, fmt.Errorf("%w: branch %d ICV is exhausted", ErrChainConflict, msg.BranchID)
+	}
 	booking := Booking{
 		BranchID:   msg.BranchID,
 		RequestKey: msg.RequestKey(),
@@ -190,8 +232,12 @@ func (c *SQLChain) Book(ctx context.Context, msg Message) (Booking, error) {
 		PIH:        row.effectivePIH(),
 	}
 	now := c.now()
-	if row.ownerKey.Valid && !row.ownedBy(booking.RequestKey) && row.leaseLive(now) {
-		return Booking{}, ErrChainBusy
+	if row.leaseLive(now) {
+		if !row.ownedBy(booking.RequestKey) ||
+			!row.ownerToken.Valid ||
+			row.ownerToken.String != booking.EventID {
+			return Booking{}, ErrChainBusy
+		}
 	}
 	if row.ownedBy(booking.RequestKey) && row.reservedICV.Valid && uint64(row.reservedICV.Int64) != booking.ICV {
 		return Booking{}, ErrChainConflict
@@ -228,6 +274,9 @@ func (c *SQLChain) Commit(ctx context.Context, booking Booking, invoice SignedIn
 	if invoice.BranchID != booking.BranchID || invoice.ICV != booking.ICV || invoice.UUID != booking.UUID || invoice.PIH != booking.PIH {
 		return fmt.Errorf("%w: the invoice does not match its booking", ErrChainConflict)
 	}
+	if err := invoice.Validate(); err != nil {
+		return fmt.Errorf("%w: %v", ErrChainConflict, err)
+	}
 	tx, err := c.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin invoice commit: %w", err)
@@ -241,6 +290,31 @@ func (c *SQLChain) Commit(ctx context.Context, booking Booking, invoice SignedIn
 	if !row.holds(booking) {
 		return fmt.Errorf("%w: branch %d", ErrChainConflict, booking.BranchID)
 	}
+	var (
+		billBranch int64
+		billUUID   sql.NullString
+		billHash   sql.NullString
+	)
+	if err := tx.QueryRowContext(ctx, `
+		SELECT branch_id, invoice_uuid, invoice_hash
+		FROM bill
+		WHERE id = ?
+		FOR UPDATE
+	`, invoice.SourceID).Scan(&billBranch, &billUUID, &billHash); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: bill %d does not exist", ErrChainConflict, invoice.SourceID)
+		}
+		return fmt.Errorf("lock bill %d: %w", invoice.SourceID, err)
+	}
+	if billBranch != booking.BranchID {
+		return fmt.Errorf("%w: bill %d belongs to branch %d, not %d", ErrChainConflict, invoice.SourceID, billBranch, booking.BranchID)
+	}
+	if billUUID.Valid && strings.TrimSpace(billUUID.String) != "" && billUUID.String != invoice.UUID {
+		return fmt.Errorf("%w: bill %d already carries invoice UUID %s", ErrChainConflict, invoice.SourceID, billUUID.String)
+	}
+	if billHash.Valid && strings.TrimSpace(billHash.String) != "" && billHash.String != invoice.Hash {
+		return fmt.Errorf("%w: bill %d already carries another invoice hash", ErrChainConflict, invoice.SourceID)
+	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO zatca_submission
 			(bill_id, branch_id, status, outcome_state, invoice_icv, previous_invoice_hash,
@@ -251,8 +325,10 @@ func (c *SQLChain) Commit(ctx context.Context, booking Booking, invoice SignedIn
 		return fmt.Errorf("store invoice of bill %d: %w", invoice.SourceID, err)
 	}
 	if _, err := tx.ExecContext(ctx, `
-		UPDATE bill SET invoice_uuid = ?, invoice_hash = ?, qr_code = ? WHERE id = ?
-	`, invoice.UUID, invoice.Hash, invoice.QR, invoice.SourceID); err != nil {
+		UPDATE bill
+		SET invoice_uuid = ?, invoice_hash = ?, qr_code = ?
+		WHERE id = ? AND branch_id = ?
+	`, invoice.UUID, invoice.Hash, invoice.QR, invoice.SourceID, booking.BranchID); err != nil {
 		return fmt.Errorf("record invoice fields of bill %d: %w", invoice.SourceID, err)
 	}
 	if _, err := tx.ExecContext(ctx, `

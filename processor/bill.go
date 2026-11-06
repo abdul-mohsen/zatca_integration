@@ -60,6 +60,9 @@ func (p *BillPipeline) Prepare(_ context.Context, msg queue.Message) (queue.Prep
 // ZATCA is an outcome, and so is an answer that needs reconciliation. Any other failure is technical, and the stored XML is
 // sent again later.
 func (p *BillPipeline) Submit(_ context.Context, invoice queue.SignedInvoice) (queue.Outcome, error) {
+	if err := invoice.Validate(); err != nil {
+		return queue.Outcome{}, fmt.Errorf("cannot submit bill %d: %w", invoice.SourceID, err)
+	}
 	svc, _, err := p.Service(invoice.BranchID)
 	if err != nil {
 		return queue.Outcome{}, err
@@ -84,14 +87,38 @@ func (p *BillPipeline) Submit(_ context.Context, invoice queue.SignedInvoice) (q
 	if resp == nil {
 		return queue.Outcome{}, fmt.Errorf("ZATCA returned no response for bill %d", invoice.SourceID)
 	}
-	return responseOutcome(resp), nil
+	return responseOutcome(invoice.Kind, resp), nil
 }
 
-// responseOutcome classifies a 2xx answer. ZATCA can answer 2xx and still list error messages, and those reject the invoice.
-// Warnings, in the answer or in its validation results, accept it with a warning.
-func responseOutcome(resp *models.InvoiceResponse) queue.Outcome {
+// responseOutcome classifies a 2xx answer to an invoice of the given kind. ZATCA can answer 2xx and still refuse the invoice:
+// top-level errors and error messages reject it, and so does a top-level status that is not the success value of the kind.
+// An answer without that status is not accepted. Warnings, in the answer or in its validation results, accept it with a warning.
+func responseOutcome(kind string, resp *models.InvoiceResponse) queue.Outcome {
+	if len(resp.Errors) > 0 {
+		code := resp.Errors[0].Code
+		message := errorText(resp.Errors)
+		if message == "" {
+			message = "provider returned top-level errors"
+		}
+		return queue.Outcome{State: queue.OutcomeRejected, ProviderCode: code, Message: message}
+	}
 	if vr := resp.ValidationResults; vr != nil && len(vr.ErrorMessages) > 0 {
-		return queue.Outcome{State: queue.OutcomeRejected, ProviderCode: vr.ErrorMessages[0].Code, Message: validationText(vr.ErrorMessages)}
+		message := validationText(vr.ErrorMessages)
+		if message == "" {
+			message = "provider returned validation errors"
+		}
+		return queue.Outcome{State: queue.OutcomeRejected, ProviderCode: vr.ErrorMessages[0].Code, Message: message}
+	}
+	want := successStatus(kind)
+	if want == "" {
+		return queue.Outcome{
+			State:        queue.OutcomeRejected,
+			ProviderCode: resp.Status,
+			Message:      fmt.Sprintf("unsupported invoice kind %q", kind),
+		}
+	}
+	if resp.Status != want {
+		return queue.Outcome{State: queue.OutcomeRejected, ProviderCode: resp.Status, Message: fmt.Sprintf("the answer status %q is not %s", resp.Status, want)}
 	}
 	if len(resp.Warnings) > 0 {
 		warning := resp.Warnings[0]
@@ -104,11 +131,34 @@ func responseOutcome(resp *models.InvoiceResponse) queue.Outcome {
 	return queue.Outcome{State: queue.OutcomeAccepted}
 }
 
+// successStatus is the top-level status of an answer that accepts an invoice of the kind. A standard invoice is cleared and a
+// simplified one is reported. These are the success values the client tests use for each endpoint (client/client_test.go).
+func successStatus(kind string) string {
+	switch kind {
+	case queue.InvoiceStandard:
+		return "CLEARED"
+	case queue.InvoiceSimplified:
+		return "REPORTED"
+	default:
+		return ""
+	}
+}
+
+// errorText joins the top-level errors of an answer into one text.
+func errorText(errs []models.ErrorDetail) string {
+	return joinTexts(errs, func(e models.ErrorDetail) string { return e.Message })
+}
+
 // validationText joins the messages of a validation result into one text.
 func validationText(messages []models.ValidationMessage) string {
-	texts := make([]string, 0, len(messages))
-	for _, m := range messages {
-		texts = append(texts, m.Message)
+	return joinTexts(messages, func(m models.ValidationMessage) string { return m.Message })
+}
+
+// joinTexts joins the text of each item into one text, separated by semicolons.
+func joinTexts[T any](items []T, text func(T) string) string {
+	texts := make([]string, 0, len(items))
+	for _, item := range items {
+		texts = append(texts, text(item))
 	}
 	return strings.Join(texts, "; ")
 }

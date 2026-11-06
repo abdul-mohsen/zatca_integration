@@ -51,6 +51,13 @@ func testDB(t *testing.T) *sql.DB {
 	return db
 }
 
+func TestTenantSchemaPreflight(t *testing.T) {
+	db := testDB(t)
+	if err := Preflight(context.Background(), db); err != nil {
+		t.Fatalf("tenant schema preflight: %v", err)
+	}
+}
+
 // chainFixture is one company, branch, and set of bills. Its rows are removed when the test ends.
 type chainFixture struct {
 	db       *sql.DB
