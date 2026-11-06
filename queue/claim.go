@@ -26,6 +26,9 @@ var (
 	ErrClaimInFlight = errors.New("queue claim is in flight")
 	// ErrClaimNotFound means a completion was attempted without a claim.
 	ErrClaimNotFound = errors.New("queue claim not found")
+	// ErrClaimStale means a lease owner tried to release or complete after
+	// another delivery took over the request.
+	ErrClaimStale = errors.New("queue claim lease is stale")
 )
 
 // ClaimStore records which requests were processed, so a redelivery never repeats the business effect. A claim whose

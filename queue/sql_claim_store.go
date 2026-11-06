@@ -140,14 +140,22 @@ func (s *SQLClaimStore) Release(ctx context.Context, msg Message) error {
 	if s == nil || s.DB == nil {
 		return errors.New("queue SQL claim store is not configured")
 	}
-	if _, err := s.DB.ExecContext(ctx, `
+	result, err := s.DB.ExecContext(ctx, `
 		UPDATE zatca_consumer_claim
 		SET lease_expires_at = NULL
-		WHERE pos_id = ? AND bill_request_id = ? AND fingerprint = ? AND state = ?
-	`, msg.PosID, msg.BillRequestID, msg.RequestFingerprint, claimProcessing); err != nil {
+		WHERE pos_id = ? AND bill_request_id = ? AND event_id = ? AND fingerprint = ? AND state = ?
+	`, msg.PosID, msg.BillRequestID, msg.EventID, msg.RequestFingerprint, claimProcessing)
+	if err != nil {
 		return fmt.Errorf("release queue claim %s: %w", msg.BillRequestID, err)
 	}
-	return nil
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("inspect queue claim %s release: %w", msg.BillRequestID, err)
+	}
+	if rows > 0 {
+		return nil
+	}
+	return s.claimOwnerError(ctx, msg)
 }
 
 // Complete marks the request done. It is safe to repeat.
@@ -161,8 +169,8 @@ func (s *SQLClaimStore) Complete(ctx context.Context, msg Message) error {
 	result, err := s.DB.ExecContext(ctx, `
 		UPDATE zatca_consumer_claim
 		SET state = 'completed', lease_expires_at = NULL, completed_at = CURRENT_TIMESTAMP
-		WHERE pos_id = ? AND bill_request_id = ? AND fingerprint = ? AND state = 'processing'
-	`, msg.PosID, msg.BillRequestID, msg.RequestFingerprint)
+		WHERE pos_id = ? AND bill_request_id = ? AND event_id = ? AND fingerprint = ? AND state = 'processing'
+	`, msg.PosID, msg.BillRequestID, msg.EventID, msg.RequestFingerprint)
 	if err != nil {
 		return fmt.Errorf("complete queue claim %s: %w", msg.BillRequestID, err)
 	}
@@ -174,17 +182,46 @@ func (s *SQLClaimStore) Complete(ctx context.Context, msg Message) error {
 		return nil
 	}
 
-	var state string
+	var (
+		state   string
+		eventID string
+	)
 	err = s.DB.QueryRowContext(ctx, `
-		SELECT state
+		SELECT state, event_id
 		FROM zatca_consumer_claim
 		WHERE pos_id = ? AND bill_request_id = ? AND fingerprint = ?
-	`, msg.PosID, msg.BillRequestID, msg.RequestFingerprint).Scan(&state)
+	`, msg.PosID, msg.BillRequestID, msg.RequestFingerprint).Scan(&state, &eventID)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return fmt.Errorf("%w: %s", ErrClaimNotFound, msg.BillRequestID)
 	case err != nil:
 		return fmt.Errorf("inspect queue claim %s: %w", msg.BillRequestID, err)
+	case eventID != msg.EventID:
+		return fmt.Errorf("%w: %s", ErrClaimStale, msg.BillRequestID)
+	case state == claimCompleted:
+		return nil
+	default:
+		return fmt.Errorf("%w: %s", ErrClaimInFlight, msg.BillRequestID)
+	}
+}
+
+func (s *SQLClaimStore) claimOwnerError(ctx context.Context, msg Message) error {
+	var (
+		state   string
+		eventID string
+	)
+	err := s.DB.QueryRowContext(ctx, `
+		SELECT state, event_id
+		FROM zatca_consumer_claim
+		WHERE pos_id = ? AND bill_request_id = ? AND fingerprint = ?
+	`, msg.PosID, msg.BillRequestID, msg.RequestFingerprint).Scan(&state, &eventID)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return fmt.Errorf("%w: %s", ErrClaimNotFound, msg.BillRequestID)
+	case err != nil:
+		return fmt.Errorf("inspect queue claim %s owner: %w", msg.BillRequestID, err)
+	case eventID != msg.EventID:
+		return fmt.Errorf("%w: %s", ErrClaimStale, msg.BillRequestID)
 	case state == claimCompleted:
 		return nil
 	default:

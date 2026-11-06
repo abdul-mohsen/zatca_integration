@@ -149,6 +149,24 @@ func TestSuccessfulAnswerIsClassifiedByItsMessages(t *testing.T) {
 	}
 }
 
+func TestEndpointSpecificTopLevelProviderStatusWinsOverLegacyStatus(t *testing.T) {
+	cleared := &models.InvoiceResponse{
+		Status:          "ERROR",
+		ClearanceStatus: "CLEARED",
+	}
+	if got := responseOutcome(queue.InvoiceStandard, cleared); got.State != queue.OutcomeAccepted {
+		t.Fatalf("clearance outcome = %+v; want accepted from clearanceStatus", got)
+	}
+
+	reported := &models.InvoiceResponse{
+		Status:          "ERROR",
+		ReportingStatus: "REPORTED",
+	}
+	if got := responseOutcome(queue.InvoiceSimplified, reported); got.State != queue.OutcomeAccepted {
+		t.Fatalf("reporting outcome = %+v; want accepted from reportingStatus", got)
+	}
+}
+
 // Each fixture is an answer to an invoice of the given kind. The fixtures are hand-written, not recorded ZATCA answers. An answer
 // with top-level errors, or without the success status of its kind, is rejected even when it lists no validation errors.
 func TestAnswerFixturesAreClassified(t *testing.T) {

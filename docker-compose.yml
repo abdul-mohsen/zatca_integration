@@ -44,7 +44,7 @@ services:
       SMTP_USER: ${SMTP_USER:-}
       SMTP_PASS: ${SMTP_PASS:-}
       SMTP_FROM: ${SMTP_FROM:-zatca-daemon@localhost}
-    command: ["--nats-data=/data/nats"]
+    command: ["--nats-mode=embedded", "--nats-monitor=8222", "--nats-data=/data/nats"]
 
 volumes:
   nats-data:

@@ -2,6 +2,7 @@ package queue
 
 import (
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -65,22 +66,22 @@ func (m Message) Validate() error {
 		return invalidf("id is required")
 	case m.BranchID <= 0:
 		return invalidf("branch_id is required")
-	case strings.TrimSpace(m.DBName) == "":
-		return invalidf("db_name is required")
-	case strings.TrimSpace(m.TenantKey) == "":
-		return invalidf("tenant_key is required")
-	case strings.TrimSpace(m.PosID) == "" || utf8.RuneCountInString(m.PosID) > 64:
+	case !validIdentityText(m.DBName, 64):
+		return invalidf("db_name is required and must be at most 64 characters")
+	case !validIdentityText(m.TenantKey, 64):
+		return invalidf("tenant_key is required and must be at most 64 characters")
+	case !validOpaqueText(m.PosID, 64):
 		return invalidf("pos_id is required and must be at most 64 characters")
-	case strings.TrimSpace(m.BillRequestID) == "":
-		return invalidf("bill_request_id is required")
-	case strings.TrimSpace(m.EventID) == "":
-		return invalidf("event_id is required")
+	case !validOpaqueText(m.BillRequestID, 36):
+		return invalidf("bill_request_id is required and must be at most 36 characters")
+	case !validOpaqueText(m.EventID, 128):
+		return invalidf("event_id is required and must be at most 128 characters")
 	case m.EGSSequenceID != strconv.FormatInt(m.BranchID, 10):
 		return invalidf("egs_sequence_id must be the branch id")
 	case !isUUID(m.InvoiceUUID):
 		return invalidf("invoice_uuid must be a UUID")
-	case strings.TrimSpace(m.RequestFingerprint) == "":
-		return invalidf("request_fingerprint is required")
+	case !validFingerprint(m.RequestFingerprint):
+		return invalidf("request_fingerprint must be a 64-character SHA-256 hex value")
 	}
 	return nil
 }
@@ -122,3 +123,40 @@ func isUUID(value string) bool {
 	parsed, err := uuid.Parse(value)
 	return err == nil && parsed != uuid.Nil
 }
+
+func validIdentityText(value string, maxRunes int) bool {
+	if strings.TrimSpace(value) == "" || strings.TrimSpace(value) != value ||
+		utf8.RuneCountInString(value) > maxRunes || !utf8.ValidString(value) {
+		return false
+	}
+	for _, r := range value {
+		if r == 0 || r == '*' || r == '>' || r == '.' || r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+func validOpaqueText(value string, maxRunes int) bool {
+	if strings.TrimSpace(value) == "" || strings.TrimSpace(value) != value ||
+		utf8.RuneCountInString(value) > maxRunes || !utf8.ValidString(value) {
+		return false
+	}
+	for _, r := range value {
+		if r == 0 || r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+func validFingerprint(value string) bool {
+	if len(value) != hex.EncodedLen(sha256Size) {
+		return false
+	}
+	decoded := make([]byte, sha256Size)
+	_, err := hex.Decode(decoded, []byte(value))
+	return err == nil
+}
+
+const sha256Size = 32

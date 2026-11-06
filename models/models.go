@@ -32,6 +32,8 @@ type InvoiceRequest struct {
 type InvoiceResponse struct {
 	InvoiceHash       string             `json:"invoiceHash,omitempty"`
 	Status            string             `json:"status,omitempty"`
+	ClearanceStatus   string             `json:"clearanceStatus,omitempty"`
+	ReportingStatus   string             `json:"reportingStatus,omitempty"`
 	ClearedInvoice    string             `json:"clearedInvoice,omitempty"` // base64 XML returned by clearance
 	ValidationResults *ValidationResults `json:"validationResults,omitempty"`
 	Warnings          []ErrorDetail      `json:"warnings,omitempty"`

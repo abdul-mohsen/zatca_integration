@@ -117,8 +117,9 @@ func responseOutcome(kind string, resp *models.InvoiceResponse) queue.Outcome {
 			Message:      fmt.Sprintf("unsupported invoice kind %q", kind),
 		}
 	}
-	if resp.Status != want {
-		return queue.Outcome{State: queue.OutcomeRejected, ProviderCode: resp.Status, Message: fmt.Sprintf("the answer status %q is not %s", resp.Status, want)}
+	status := providerStatus(kind, resp)
+	if status != want {
+		return queue.Outcome{State: queue.OutcomeRejected, ProviderCode: status, Message: fmt.Sprintf("the answer status %q is not %s", status, want)}
 	}
 	if len(resp.Warnings) > 0 {
 		warning := resp.Warnings[0]
@@ -129,6 +130,26 @@ func responseOutcome(kind string, resp *models.InvoiceResponse) queue.Outcome {
 		return queue.Outcome{State: queue.OutcomeWarning, ProviderCode: warning.Code, Message: warning.Message}
 	}
 	return queue.Outcome{State: queue.OutcomeAccepted}
+}
+
+// providerStatus reads the endpoint-specific top-level status first. The
+// legacy status field remains a compatibility fallback for older sandbox
+// responses, but an endpoint's status is never inferred from validation data.
+func providerStatus(kind string, resp *models.InvoiceResponse) string {
+	if resp == nil {
+		return ""
+	}
+	switch kind {
+	case queue.InvoiceStandard:
+		if resp.ClearanceStatus != "" {
+			return resp.ClearanceStatus
+		}
+	case queue.InvoiceSimplified:
+		if resp.ReportingStatus != "" {
+			return resp.ReportingStatus
+		}
+	}
+	return resp.Status
 }
 
 // successStatus is the top-level status of an answer that accepts an invoice of the kind. A standard invoice is cleared and a
@@ -168,9 +189,22 @@ func joinTexts[T any](items []T, text func(T) string) string {
 // except for authentication, timeouts, and rate limits, which are technical. Any other error is technical.
 func rejectionOutcome(invoice queue.SignedInvoice, err error) (queue.Outcome, error) {
 	var apiErr *client.APIError
+	if errors.As(err, &apiErr) && (apiErr.StatusCode == http.StatusAlreadyReported || apiErr.StatusCode == http.StatusConflict) {
+		if apiErr.Response != nil && (invoice.Kind == queue.InvoiceStandard || invoice.Kind == queue.InvoiceSimplified) {
+			outcome := responseOutcome(invoice.Kind, apiErr.Response)
+			if outcome.State == queue.OutcomeAccepted || outcome.State == queue.OutcomeWarning {
+				return outcome, nil
+			}
+		}
+	}
 	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusConflict {
 		return queue.Outcome{State: queue.OutcomeAmbiguous, ProviderCode: strconv.Itoa(apiErr.StatusCode), Message: apiErr.Body},
 			fmt.Errorf("%w: bill %d (invoice %s): ZATCA already holds this invoice, so the outcome needs reconciliation",
+				queue.ErrOutcomeAmbiguous, invoice.SourceID, invoice.UUID)
+	}
+	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusAlreadyReported {
+		return queue.Outcome{State: queue.OutcomeAmbiguous, ProviderCode: strconv.Itoa(apiErr.StatusCode), Message: apiErr.Body},
+			fmt.Errorf("%w: bill %d (invoice %s): ZATCA already reported this invoice, so the outcome needs reconciliation",
 				queue.ErrOutcomeAmbiguous, invoice.SourceID, invoice.UUID)
 	}
 	if errors.As(err, &apiErr) && isInvoiceRejection(apiErr.StatusCode) {
