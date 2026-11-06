@@ -60,7 +60,4 @@ COPY --from=builder /daemon /usr/local/bin/daemon
 # NATS port
 EXPOSE 4222
 
-# Default XML storage directory
-VOLUME ["/data/zatca-xml"]
-
 ENTRYPOINT ["daemon"]
