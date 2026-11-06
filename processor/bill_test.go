@@ -14,6 +14,7 @@ import (
 
 	"github.com/zatca-go/zatca/client"
 	"github.com/zatca-go/zatca/config"
+	"github.com/zatca-go/zatca/invoice"
 	"github.com/zatca-go/zatca/models"
 	"github.com/zatca-go/zatca/queue"
 )
@@ -40,6 +41,7 @@ func verifiedBill() (queue.Message, BillRow) {
 		ID:          42,
 		BranchID:    7,
 		State:       1,
+		SeqNumber:   sql.NullString{String: "105", Valid: true},
 		InvoiceUUID: sql.NullString{String: testInvoiceUUID, Valid: true},
 	}
 	return msg, bill
@@ -100,8 +102,111 @@ func TestBuildBillInvoiceUsesTheBookingAndNothingElse(t *testing.T) {
 	bill := BillRow{ID: 42, SeqNumber: sql.NullString{String: "999", Valid: true}}
 
 	inv := buildBillInvoice(verifiedConfig(), bill, []ProductRow{lineOf(1, 10)}, issued, booking)
+	if inv.ID != "INV-999" {
+		t.Fatalf("invoice ID = %s; want the finalized backend sequence", inv.ID)
+	}
 	if inv.UUID != booking.UUID || inv.InvoiceCounterValue != 12 || inv.PreviousInvoiceHash != "previous-hash" {
-		t.Fatalf("invoice = UUID %s, ICV %d, PIH %s; want the booking's values", inv.UUID, inv.InvoiceCounterValue, inv.PreviousInvoiceHash)
+		t.Fatalf("invoice = ID %s, UUID %s, ICV %d, PIH %s; want the booked identity and chain values", inv.ID, inv.UUID, inv.InvoiceCounterValue, inv.PreviousInvoiceHash)
+	}
+}
+
+func TestBuildBillInvoiceUsesFinalizedSequenceForSimplifiedAndStandard(t *testing.T) {
+	booking := queue.Booking{
+		BranchID: 7,
+		UUID:     testInvoiceUUID,
+		ICV:      12,
+		PIH:      "previous-hash",
+	}
+	issued := time.Date(2026, 11, 2, 10, 0, 0, 0, time.UTC)
+
+	for _, tc := range []struct {
+		name     string
+		buyerVAT sql.NullString
+		subtype  invoice.SubType
+	}{
+		{
+			name:    "simplified",
+			subtype: invoice.SubTypeSimplified,
+		},
+		{
+			name:     "standard",
+			buyerVAT: sql.NullString{String: "300000000000003", Valid: true},
+			subtype:  invoice.SubTypeStandard,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bill := BillRow{
+				ID:        42,
+				SeqNumber: sql.NullString{String: "105", Valid: true},
+				BuyerVAT:  tc.buyerVAT,
+			}
+
+			inv := buildBillInvoice(verifiedConfig(), bill, []ProductRow{lineOf(1, 10)}, issued, booking)
+			if inv.ID != "INV-105" {
+				t.Fatalf("invoice ID = %s; want INV-105", inv.ID)
+			}
+			if inv.SubType != tc.subtype {
+				t.Fatalf("invoice subtype = %s; want %s", inv.SubType, tc.subtype)
+			}
+
+			xml, err := inv.ToXML()
+			if err != nil {
+				t.Fatalf("ToXML() error: %v", err)
+			}
+			if !strings.Contains(xml, "<cbc:ID>INV-105</cbc:ID>") {
+				t.Fatal("XML does not carry the finalized backend invoice identity")
+			}
+			if strings.Contains(xml, "<cbc:ID>INV-42</cbc:ID>") {
+				t.Fatal("XML used the database row ID instead of the finalized invoice sequence")
+			}
+			for _, want := range []string{
+				"<cbc:UUID>" + booking.UUID + "</cbc:UUID>",
+				"<cbc:ID>ICV</cbc:ID>",
+				"<cbc:UUID>12</cbc:UUID>",
+				"<cbc:ID>PIH</cbc:ID>",
+				booking.PIH,
+			} {
+				if !strings.Contains(xml, want) {
+					t.Errorf("XML missing booked identity value %q", want)
+				}
+			}
+		})
+	}
+}
+
+func TestReplayBuildKeepsInvoiceIdentityAndChainArtifacts(t *testing.T) {
+	booking := queue.Booking{
+		BranchID: 7,
+		UUID:     testInvoiceUUID,
+		ICV:      12,
+		PIH:      "previous-hash",
+	}
+	bill := BillRow{
+		ID:        42,
+		SeqNumber: sql.NullString{String: "105", Valid: true},
+	}
+	issued := time.Date(2026, 11, 2, 10, 0, 0, 0, time.UTC)
+
+	first := buildBillInvoice(verifiedConfig(), bill, []ProductRow{lineOf(1, 10)}, issued, booking)
+	replay := buildBillInvoice(verifiedConfig(), bill, []ProductRow{lineOf(1, 10)}, issued, booking)
+	firstXML, err := first.ToXML()
+	if err != nil {
+		t.Fatalf("first ToXML() error: %v", err)
+	}
+	replayXML, err := replay.ToXML()
+	if err != nil {
+		t.Fatalf("replay ToXML() error: %v", err)
+	}
+
+	if firstXML != replayXML {
+		t.Fatal("replay rebuilt different XML for the same booked invoice")
+	}
+	if first.ID != "INV-105" || replay.ID != first.ID {
+		t.Fatalf("replay invoice IDs = %s and %s; want INV-105", first.ID, replay.ID)
+	}
+	if first.UUID != replay.UUID || first.InvoiceCounterValue != replay.InvoiceCounterValue ||
+		first.PreviousInvoiceHash != replay.PreviousInvoiceHash {
+		t.Fatalf("replay changed booked invoice identity or chain values")
 	}
 }
 
