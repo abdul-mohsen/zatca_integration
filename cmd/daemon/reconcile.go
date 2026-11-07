@@ -35,17 +35,19 @@ type workerHandle struct {
 // daemonReconciler owns the live tenant and branch topology. The master
 // registry is the only discovery source; NATS messages never create tenants.
 type daemonReconciler struct {
-	ctx        context.Context
-	cancel     context.CancelFunc
-	masterDB   *sql.DB
-	baseDSN    string
-	adminDSN   string
-	encKey     *secutil.Key
-	nc         *nats.Conn
-	js         nats.JetStreamContext
-	wg         *sync.WaitGroup
-	ackWait    time.Duration
-	maxDeliver int
+	ctx              context.Context
+	cancel           context.CancelFunc
+	masterDB         *sql.DB
+	baseDSN          string
+	adminDSN         string
+	encKey           *secutil.Key
+	nc               *nats.Conn
+	js               nats.JetStreamContext
+	wg               *sync.WaitGroup
+	ackWait          time.Duration
+	maxDeliver       int
+	providerFactory  processor.ProviderFactory
+	providerEndpoint string
 
 	reconcileMu sync.Mutex
 	mu          sync.RWMutex
@@ -89,6 +91,23 @@ func newDaemonReconciler(
 		caches:     make(map[string]map[int64]*branchEntry),
 		registry:   tenant.NewRegistry(),
 	}
+}
+
+func newDaemonReconcilerWithProviderFactory(
+	ctx context.Context,
+	masterDB *sql.DB,
+	baseDSN, adminDSN string,
+	encKey *secutil.Key,
+	nc *nats.Conn,
+	js nats.JetStreamContext,
+	wg *sync.WaitGroup,
+	ackWait time.Duration,
+	maxDeliver int,
+	providerFactory processor.ProviderFactory,
+) *daemonReconciler {
+	r := newDaemonReconciler(ctx, masterDB, baseDSN, adminDSN, encKey, nc, js, wg, ackWait, maxDeliver)
+	r.providerFactory = providerFactory
+	return r
 }
 
 func (r *daemonReconciler) getService(dbName string, branchID int64) (*zatca.Service, *config.Config, error) {
@@ -216,10 +235,11 @@ func (r *daemonReconciler) addTenant(t tenant.Tenant) error {
 	tc := &tenantCtx{
 		tenant:           t,
 		db:               tdb,
-		cfg:              &config.Config{Env: env},
+		cfg:              &config.Config{Env: env, ProviderEndpoint: r.providerEndpoint},
 		encKey:           r.encKey,
 		claims:           queue.NewSQLClaimStore(tdb),
 		chain:            chain,
+		providerFactory:  r.providerFactory,
 		ackWait:          r.ackWait,
 		maxDeliver:       r.maxDeliver,
 		startBranch:      r.startBranch,
