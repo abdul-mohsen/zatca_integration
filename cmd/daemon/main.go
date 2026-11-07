@@ -17,6 +17,7 @@ import (
 
 	"github.com/zatca-go/zatca/config"
 	"github.com/zatca-go/zatca/dbutil"
+	"github.com/zatca-go/zatca/provider"
 	"github.com/zatca-go/zatca/secutil"
 )
 
@@ -38,6 +39,8 @@ func main() {
 	natsMaxDeliver := flag.Int("nats-max-deliver", 10, "Maximum delivery attempts before local terminal failure")
 	tenantReconcileInterval := flag.Duration("tenant-reconcile-interval", time.Minute, "Tenant and branch discovery interval")
 	providerEndpoint := flag.String("provider-endpoint", envOrDefault("ZATCA_PROVIDER_ENDPOINT", ""), "Optional ZATCA provider endpoint override")
+	providerMode := flag.String("provider-mode", envOrDefault("ZATCA_PROVIDER_MODE", string(providerModeReal)), "ZATCA provider mode: real or local")
+	providerScenario := flag.String("provider-scenario", envOrDefault("ZATCA_PROVIDER_SCENARIO", string(provider.ScenarioAccepted)), "Local provider submit scenario")
 	flag.Parse()
 
 	// Env var fallbacks (for Docker / docker-compose)
@@ -112,6 +115,11 @@ func main() {
 	}
 	log.Printf("NATS ready in %s mode", mode)
 
+	providerFactory, err := newProviderFactory(*providerMode, *providerScenario)
+	if err != nil {
+		log.Fatalf("ZATCA provider configuration: %v", err)
+	}
+
 	// ── 2. Open master DB; tenant discovery is reconciled continuously ──
 	masterDBConn, err := sql.Open("mysql", *masterDSN)
 	if err != nil {
@@ -128,7 +136,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var wg sync.WaitGroup
-	reconciler := newDaemonReconciler(
+	reconciler := newDaemonReconcilerWithProviderFactory(
 		ctx,
 		masterDBConn,
 		*baseDSN,
@@ -139,6 +147,7 @@ func main() {
 		&wg,
 		*natsAckWait,
 		*natsMaxDeliver,
+		providerFactory,
 	)
 	reconciler.providerEndpoint = *providerEndpoint
 	if err := reconciler.reconcile(ctx); err != nil {
