@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/zatca-go/zatca/client"
@@ -28,6 +29,23 @@ const (
 	ScenarioReconcileTimeout     Scenario = "reconcile_timeout"
 	ScenarioReconcileTechnical   Scenario = "reconcile_technical"
 )
+
+// ParseSubmitScenario validates a deterministic submit scenario. Reconcile
+// scenarios are intentionally not accepted here because the daemon provider
+// mode only controls invoice submission.
+func ParseSubmitScenario(raw string) (Scenario, error) {
+	scenario := Scenario(strings.ToLower(strings.TrimSpace(raw)))
+	if scenario == "" {
+		return ScenarioAccepted, nil
+	}
+	switch scenario {
+	case ScenarioAccepted, ScenarioWarning, ScenarioRejected, ScenarioTimeout,
+		ScenarioTechnical, ScenarioConflict, ScenarioCrashAfterAcceptance:
+		return scenario, nil
+	default:
+		return "", fmt.Errorf("invalid local provider submit scenario %q", raw)
+	}
+}
 
 // LocalOptions configures a deterministic provider without credentials or
 // network access.
