@@ -15,11 +15,21 @@ const (
 )
 
 // SQLClaimStore keeps one claim per request in the tenant database. The table zatca_consumer_claim is owned by the backend
-// (goose 00003). A request is unique by (pos_id, bill_request_id), and an event by event_id.
+// (goose 00003). A request is unique by (pos_id, bill_request_id); its event_id column stores the current claim fence.
 type SQLClaimStore struct {
 	DB            *sql.DB
 	LeaseDuration time.Duration
 	Now           func() time.Time
+}
+
+func claimToken(msg Message) string {
+	if msg.ClaimToken != "" {
+		return msg.ClaimToken
+	}
+	// Keep the direct ClaimStore API backwards-compatible for callers that do
+	// not run through OrderedStream. Production deliveries receive a unique
+	// per-attempt ClaimToken before the first claim.
+	return msg.EventID
 }
 
 // NewSQLClaimStore returns a claim store for one tenant database.
@@ -96,7 +106,7 @@ func (s *SQLClaimStore) claimInTx(ctx context.Context, tx *sql.Tx, msg Message) 
 		UPDATE zatca_consumer_claim
 		SET event_id = ?, egs_sequence_id = ?, state = 'processing', lease_expires_at = ?
 		WHERE pos_id = ? AND bill_request_id = ?
-	`, msg.EventID, msg.EGSSequenceID, now.Add(s.leaseDuration()), msg.PosID, msg.BillRequestID)
+	`, claimToken(msg), msg.EGSSequenceID, now.Add(s.leaseDuration()), msg.PosID, msg.BillRequestID)
 	if err != nil {
 		return ClaimConflict, fmt.Errorf("reclaim queue request %s: %w", msg.BillRequestID, err)
 	}
@@ -108,7 +118,7 @@ func (s *SQLClaimStore) insertClaim(ctx context.Context, tx *sql.Tx, msg Message
 		INSERT INTO zatca_consumer_claim
 			(pos_id, bill_request_id, event_id, egs_sequence_id, fingerprint, state, lease_expires_at)
 		VALUES (?, ?, ?, ?, ?, 'processing', ?)
-	`, msg.PosID, msg.BillRequestID, msg.EventID, msg.EGSSequenceID, msg.RequestFingerprint,
+	`, msg.PosID, msg.BillRequestID, claimToken(msg), msg.EGSSequenceID, msg.RequestFingerprint,
 		s.now().Add(s.leaseDuration()))
 	if isMySQLError(err, mysqlDuplicateKey) {
 		// The event ID already belongs to another request.
@@ -144,7 +154,7 @@ func (s *SQLClaimStore) Release(ctx context.Context, msg Message) error {
 		UPDATE zatca_consumer_claim
 		SET lease_expires_at = NULL
 		WHERE pos_id = ? AND bill_request_id = ? AND event_id = ? AND fingerprint = ? AND state = ?
-	`, msg.PosID, msg.BillRequestID, msg.EventID, msg.RequestFingerprint, claimProcessing)
+	`, msg.PosID, msg.BillRequestID, claimToken(msg), msg.RequestFingerprint, claimProcessing)
 	if err != nil {
 		return fmt.Errorf("release queue claim %s: %w", msg.BillRequestID, err)
 	}
@@ -170,7 +180,7 @@ func (s *SQLClaimStore) Complete(ctx context.Context, msg Message) error {
 		UPDATE zatca_consumer_claim
 		SET state = 'completed', lease_expires_at = NULL, completed_at = CURRENT_TIMESTAMP
 		WHERE pos_id = ? AND bill_request_id = ? AND event_id = ? AND fingerprint = ? AND state = 'processing'
-	`, msg.PosID, msg.BillRequestID, msg.EventID, msg.RequestFingerprint)
+	`, msg.PosID, msg.BillRequestID, claimToken(msg), msg.RequestFingerprint)
 	if err != nil {
 		return fmt.Errorf("complete queue claim %s: %w", msg.BillRequestID, err)
 	}
@@ -196,7 +206,7 @@ func (s *SQLClaimStore) Complete(ctx context.Context, msg Message) error {
 		return fmt.Errorf("%w: %s", ErrClaimNotFound, msg.BillRequestID)
 	case err != nil:
 		return fmt.Errorf("inspect queue claim %s: %w", msg.BillRequestID, err)
-	case eventID != msg.EventID:
+	case eventID != claimToken(msg):
 		return fmt.Errorf("%w: %s", ErrClaimStale, msg.BillRequestID)
 	case state == claimCompleted:
 		return nil
@@ -220,7 +230,7 @@ func (s *SQLClaimStore) claimOwnerError(ctx context.Context, msg Message) error 
 		return fmt.Errorf("%w: %s", ErrClaimNotFound, msg.BillRequestID)
 	case err != nil:
 		return fmt.Errorf("inspect queue claim %s owner: %w", msg.BillRequestID, err)
-	case eventID != msg.EventID:
+	case eventID != claimToken(msg):
 		return fmt.Errorf("%w: %s", ErrClaimStale, msg.BillRequestID)
 	case state == claimCompleted:
 		return nil

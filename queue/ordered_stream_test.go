@@ -21,20 +21,26 @@ type fakeClaims struct {
 	calls       *calls
 	decision    ClaimDecision
 	completeErr error
+	claimed     []Message
+	completed   []Message
+	released    []Message
 }
 
-func (f *fakeClaims) Claim(context.Context, Message) (ClaimDecision, error) {
+func (f *fakeClaims) Claim(_ context.Context, msg Message) (ClaimDecision, error) {
 	f.calls.add("claim")
+	f.claimed = append(f.claimed, msg)
 	return f.decision, nil
 }
 
-func (f *fakeClaims) Complete(context.Context, Message) error {
+func (f *fakeClaims) Complete(_ context.Context, msg Message) error {
 	f.calls.add("complete")
+	f.completed = append(f.completed, msg)
 	return f.completeErr
 }
 
-func (f *fakeClaims) Release(context.Context, Message) error {
+func (f *fakeClaims) Release(_ context.Context, msg Message) error {
 	f.calls.add("unclaim")
+	f.released = append(f.released, msg)
 	return nil
 }
 
@@ -209,6 +215,12 @@ func TestBillIsVerifiedBookedBuiltCommittedSubmittedAndCompleted(t *testing.T) {
 	}
 	if got := h.pipeline.built[0].UUID; got != h.msg.InvoiceUUID {
 		t.Fatalf("built with UUID %s; want the envelope's %s", got, h.msg.InvoiceUUID)
+	}
+	if len(h.claims.claimed) != 1 || h.claims.claimed[0].ClaimToken == "" {
+		t.Fatalf("claimed = %+v; want a per-delivery claim fence", h.claims.claimed)
+	}
+	if len(h.claims.completed) != 1 || h.claims.completed[0].ClaimToken != h.claims.claimed[0].ClaimToken {
+		t.Fatalf("completed = %+v; want the same claim fence as the claim", h.claims.completed)
 	}
 }
 

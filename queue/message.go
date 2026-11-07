@@ -42,6 +42,10 @@ type Message struct {
 	EGSSequenceID      string  `json:"egs_sequence_id"`
 	InvoiceUUID        string  `json:"invoice_uuid"`
 	RequestFingerprint string  `json:"request_fingerprint"`
+	// ClaimToken is an internal per-delivery fence. It is never serialized in
+	// the NATS envelope and prevents a stale worker from releasing a lease
+	// acquired by a later redelivery of the same event.
+	ClaimToken string `json:"-"`
 }
 
 // DecodeEnvelope decodes and validates one document envelope. Unknown fields are refused, so an envelope from another
