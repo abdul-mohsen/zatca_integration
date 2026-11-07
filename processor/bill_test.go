@@ -1,6 +1,7 @@
 package processor
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -16,7 +17,9 @@ import (
 	"github.com/zatca-go/zatca/config"
 	"github.com/zatca-go/zatca/invoice"
 	"github.com/zatca-go/zatca/models"
+	"github.com/zatca-go/zatca/provider"
 	"github.com/zatca-go/zatca/queue"
+	"github.com/zatca-go/zatca/zatca"
 )
 
 const testInvoiceUUID = "0c4f7a1e-2b3d-4e5f-8a9b-1c2d3e4f5a6b"
@@ -332,10 +335,67 @@ func TestRejectionOutcomeOnlyForInvoiceRejections(t *testing.T) {
 			t.Fatalf("HTTP %d = %+v, %v; want a rejection", status, outcome, err)
 		}
 	}
+
 	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusInternalServerError} {
 		outcome, err := rejectionOutcome(invoice, &client.APIError{StatusCode: status})
 		if err == nil || outcome != (queue.Outcome{}) || errors.Is(err, queue.ErrOutcomeAmbiguous) {
 			t.Fatalf("HTTP %d = %+v, %v; want a technical error with no outcome", status, outcome, err)
 		}
+	}
+}
+
+type testProviderAdapter struct{}
+
+func (testProviderAdapter) Submit(context.Context, provider.Submission) (*models.InvoiceResponse, error) {
+	return &models.InvoiceResponse{}, nil
+}
+
+func TestProviderFactoryErrorsDoNotFallBackToProduction(t *testing.T) {
+	wantErr := errors.New("provider setup failed")
+	pipeline := &BillPipeline{
+		ProviderFactory: func(int64, *zatca.Service, *config.Config) (provider.Adapter, error) {
+			return nil, wantErr
+		},
+	}
+
+	_, err := pipeline.providerAdapter(7, nil, nil)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("providerAdapter error = %v; want wrapped factory error", err)
+	}
+}
+
+func TestProviderFactoryMustReturnAnAdapter(t *testing.T) {
+	pipeline := &BillPipeline{
+		ProviderFactory: func(int64, *zatca.Service, *config.Config) (provider.Adapter, error) {
+			return nil, nil
+		},
+	}
+
+	_, err := pipeline.providerAdapter(7, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "nil adapter") {
+		t.Fatalf("providerAdapter error = %v; want nil-adapter configuration error", err)
+	}
+}
+
+func TestProviderSelectionPrefersExplicitAdapter(t *testing.T) {
+	explicit := testProviderAdapter{}
+	factoryCalled := false
+	pipeline := &BillPipeline{
+		Provider: explicit,
+		ProviderFactory: func(int64, *zatca.Service, *config.Config) (provider.Adapter, error) {
+			factoryCalled = true
+			return nil, errors.New("factory must not run")
+		},
+	}
+
+	got, err := pipeline.providerAdapter(7, nil, nil)
+	if err != nil {
+		t.Fatalf("providerAdapter error = %v", err)
+	}
+	if got != explicit {
+		t.Fatalf("providerAdapter = %T; want explicit adapter", got)
+	}
+	if factoryCalled {
+		t.Fatal("provider factory ran despite an explicit adapter")
 	}
 }
