@@ -66,6 +66,33 @@ func TestReconcileHandlerRequiresTheStoredHash(t *testing.T) {
 	}
 }
 
+func TestReconcileHandlerRequiresTheStoredBranch(t *testing.T) {
+	chain := &reconcileChain{invoice: queue.SignedInvoice{
+		SourceID:  42,
+		BranchID:  7,
+		UUID:      "0c4f7a1e-2b3d-4e5f-8a9b-1c2d3e4f5a6b",
+		Hash:      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		ICV:       1,
+		PIH:       queue.GenesisPIH,
+		Kind:      queue.InvoiceStandard,
+		SignedXML: "<Invoice/>",
+	}}
+	tc := &tenantCtx{
+		tenant: tenant.Tenant{TenantKey: "acme-0001", DBName: "tenant_acme"},
+		chain:  chain,
+	}
+	reply := (&daemonReconciler{}).handleReconcileRequest(context.Background(), tc, queue.ReconcileRequest{
+		TenantKey: "acme-0001",
+		DBName:    "tenant_acme",
+		BranchID:  8,
+		BillID:    42,
+		Action:    queue.ReconcileActionStatus,
+	})
+	if reply.Accepted || reply.Error != "branch ID does not match the stored invoice" {
+		t.Fatalf("reply = %+v; want a branch mismatch refusal", reply)
+	}
+}
+
 func TestReconcileHandlerMarksSuppliedAnswerAsExternal(t *testing.T) {
 	hash := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	chain := &reconcileChain{invoice: queue.SignedInvoice{

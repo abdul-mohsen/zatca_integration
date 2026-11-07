@@ -126,7 +126,8 @@ func TestStaleLeaseCannotReleaseOrCompleteAReclaimedRequest(t *testing.T) {
 	}
 	old := fixtureMessage(fx, fx.bills[0], "fenced")
 	newOwner := old
-	newOwner.EventID = "new-owner-event"
+	old.ClaimToken = "old-claim-token"
+	newOwner.ClaimToken = "new-claim-token"
 	if decision, err := claims.Claim(ctx, old); err != nil || decision != ClaimProcess {
 		t.Fatalf("old Claim = %v, %v; want ClaimProcess", decision, err)
 	}

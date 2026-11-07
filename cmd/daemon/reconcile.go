@@ -385,6 +385,9 @@ func (r *daemonReconciler) handleReconcileRequest(ctx context.Context, tc *tenan
 	if stored == nil {
 		return queue.ReconcileReply{Error: fmt.Sprintf("bill %d has no committed invoice", req.BillID)}
 	}
+	if req.BranchID != stored.BranchID {
+		return queue.ReconcileReply{Error: "branch ID does not match the stored invoice"}
+	}
 	if req.InvoiceUUID != "" && req.InvoiceUUID != stored.UUID {
 		return queue.ReconcileReply{Error: "invoice UUID does not match the stored invoice"}
 	}

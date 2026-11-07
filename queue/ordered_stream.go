@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+
+	"github.com/google/uuid"
 )
 
 // Prepared is a bill that passed verification. Build turns it into a signed invoice under a booking.
@@ -76,6 +78,10 @@ func (s *OrderedStream) HandleMessage(ctx context.Context, msg Message, ack func
 	if ack == nil {
 		return errors.New("ordered stream ACK function is required")
 	}
+	// A redelivery keeps the same event_id, so the database owner must use a
+	// fresh fence for each claim attempt. Direct ClaimStore callers may omit
+	// it and retain the event_id fallback for compatibility.
+	msg.ClaimToken = uuid.NewString()
 	lock := s.lockFor(msg.PartitionKey())
 	lock.Lock()
 	defer lock.Unlock()
