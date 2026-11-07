@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"database/sql"
+	"errors"
 	"flag"
 	"log"
 	"net/http"
@@ -96,7 +97,14 @@ func main() {
 		MaxDeliver:        *natsMaxDeliver,
 		ReconcileInterval: *tenantReconcileInterval,
 	}
-	natsRT, err := openNATS(natsCfg, os.Getenv("MONITOR_PASS"))
+	var reconciler *daemonReconciler
+	readiness := func(ctx context.Context) error {
+		if reconciler == nil {
+			return errors.New("daemon reconciliation has not started")
+		}
+		return reconciler.checkReadiness(ctx)
+	}
+	natsRT, err := openNATS(natsCfg, os.Getenv("MONITOR_PASS"), readiness)
 	if err != nil {
 		log.Fatalf("NATS startup: %v", err)
 	}
@@ -127,7 +135,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var wg sync.WaitGroup
-	reconciler := newDaemonReconciler(
+	reconciler = newDaemonReconciler(
 		ctx,
 		masterDBConn,
 		*baseDSN,
