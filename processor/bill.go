@@ -27,6 +27,11 @@ type ServiceFunc func(branchID int64) (*zatca.Service, *config.Config, error)
 // keeps the production client path unchanged.
 type ProviderFactory func(branchID int64, svc *zatca.Service, cfg *config.Config) (provider.Adapter, error)
 
+// APIRequestBuilder creates the provider request from the stored signed XML.
+// The default builder is apiRequest; the field exists so integration tests can
+// exercise the daemon/provider boundary without invoking the external SDK.
+type APIRequestBuilder func(svc *zatca.Service, signedXML string) (models.InvoiceRequest, error)
+
 // BillPipeline is the fiscal pipeline of a sale. It verifies the bill, builds and signs its invoice under a booking, and
 // submits the stored XML to ZATCA.
 type BillPipeline struct {
@@ -34,6 +39,7 @@ type BillPipeline struct {
 	Service         ServiceFunc
 	Provider        provider.Adapter
 	ProviderFactory ProviderFactory
+	RequestBuilder  APIRequestBuilder
 }
 
 // Prepare loads and verifies the bill. A bill that cannot be reported is refused here, before any number is booked.
@@ -74,7 +80,11 @@ func (p *BillPipeline) Submit(ctx context.Context, invoice queue.SignedInvoice) 
 	if err != nil {
 		return queue.Outcome{}, err
 	}
-	apiReq, err := apiRequest(svc, invoice.SignedXML)
+	requestBuilder := p.RequestBuilder
+	if requestBuilder == nil {
+		requestBuilder = apiRequest
+	}
+	apiReq, err := requestBuilder(svc, invoice.SignedXML)
 	if err != nil {
 		return queue.Outcome{}, err
 	}
