@@ -60,8 +60,7 @@ type Config struct {
 	CompliancePassword string
 	ProductionUsername string
 	ProductionPassword string
-	XMLDir             string
-	TenantID           string // tenant identifier (e.g. db_name) used to scope XML storage
+	EGSID              string // the EGS id of the branch: the computer number of its CSR
 	CSR                CSRConfig
 	Seller             SellerInfo
 }

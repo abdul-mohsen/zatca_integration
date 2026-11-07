@@ -1,0 +1,13 @@
+{
+  "doc_type": "bill",
+  "id": 42,
+  "branch_id": 7,
+  "db_name": "tenant_acme",
+  "tenant_key": "acme-0001",
+  "pos_id": "pos-1",
+  "bill_request_id": "3f2b9c1e-7a4d-4e8b-9c21-5d0e6f7a8b9c",
+  "event_id": "9b1d2c3e-4f5a-4b6c-8d7e-0f1a2b3c4d5e",
+  "egs_sequence_id": "7",
+  "invoice_uuid": "0c4f7a1e-2b3d-4e5f-8a9b-1c2d3e4f5a6b",
+  "request_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+}
