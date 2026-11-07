@@ -38,6 +38,7 @@ func main() {
 	natsAckWait := flag.Duration("nats-ack-wait", 5*time.Minute, "JetStream delivery ACK wait")
 	natsMaxDeliver := flag.Int("nats-max-deliver", 10, "Maximum delivery attempts before local terminal failure")
 	tenantReconcileInterval := flag.Duration("tenant-reconcile-interval", time.Minute, "Tenant and branch discovery interval")
+	providerEndpoint := flag.String("provider-endpoint", envOrDefault("ZATCA_PROVIDER_ENDPOINT", ""), "Optional ZATCA provider endpoint override")
 	flag.Parse()
 
 	// Env var fallbacks (for Docker / docker-compose)
@@ -147,6 +148,7 @@ func main() {
 		*natsAckWait,
 		*natsMaxDeliver,
 	)
+	reconciler.providerEndpoint = *providerEndpoint
 	if err := reconciler.reconcile(ctx); err != nil {
 		log.Fatalf("initial tenant reconciliation: %v", err)
 	}
