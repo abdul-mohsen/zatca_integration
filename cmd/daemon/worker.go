@@ -29,6 +29,7 @@ type tenantCtx struct {
 	encKey             *secutil.Key
 	claims             queue.ClaimStore
 	chain              queue.Chain
+	providerFactory    processor.ProviderFactory
 	ackWait            time.Duration
 	maxDeliver         int
 	startBranch        func(*tenantCtx, string, int64)
@@ -119,7 +120,8 @@ func runWorkerContext(ctx context.Context, js nats.JetStreamContext, tc *tenantC
 		return
 	}
 	stream := queue.NewOrderedStream(tc.claims, tc.chain, &processor.BillPipeline{
-		DB: tc.db,
+		DB:              tc.db,
+		ProviderFactory: tc.providerFactory,
 		Service: func(branch int64) (*zatca.Service, *config.Config, error) {
 			return getService(dbName, branch)
 		},
