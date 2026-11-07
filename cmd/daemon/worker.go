@@ -122,13 +122,15 @@ func runWorkerContext(ctx context.Context, js nats.JetStreamContext, tc *tenantC
 			return
 		default:
 		}
-		msgs, err := sub.Fetch(1, nats.MaxWait(30*time.Second))
+		fetchCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		msgs, err := sub.Fetch(1, nats.Context(fetchCtx))
+		cancel()
 		if err != nil {
 			if ctx.Err() != nil {
 				_ = sub.Unsubscribe()
 				return
 			}
-			if !errors.Is(err, nats.ErrTimeout) {
+			if !errors.Is(err, nats.ErrTimeout) && !errors.Is(err, context.DeadlineExceeded) {
 				log.Printf("ERROR: fetch %s: %v", subject, err)
 				time.Sleep(5 * time.Second)
 			}

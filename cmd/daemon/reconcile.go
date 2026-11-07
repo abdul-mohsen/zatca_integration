@@ -27,6 +27,11 @@ type branchEntry struct {
 	cfg *config.Config
 }
 
+type workerHandle struct {
+	cancel context.CancelFunc
+	done   <-chan struct{}
+}
+
 // daemonReconciler owns the live tenant and branch topology. The master
 // registry is the only discovery source; NATS messages never create tenants.
 type daemonReconciler struct {
@@ -42,12 +47,13 @@ type daemonReconciler struct {
 	ackWait    time.Duration
 	maxDeliver int
 
-	mu       sync.RWMutex
-	tenants  map[string]*tenantCtx
-	workers  map[string]context.CancelFunc
-	subs     map[string]*nats.Subscription
-	caches   map[string]map[int64]*branchEntry
-	registry *tenant.Registry
+	reconcileMu sync.Mutex
+	mu          sync.RWMutex
+	tenants     map[string]*tenantCtx
+	workers     map[string]workerHandle
+	subs        map[string]*nats.Subscription
+	caches      map[string]map[int64]*branchEntry
+	registry    *tenant.Registry
 }
 
 func newDaemonReconciler(
@@ -75,7 +81,7 @@ func newDaemonReconciler(
 		ackWait:    ackWait,
 		maxDeliver: maxDeliver,
 		tenants:    make(map[string]*tenantCtx),
-		workers:    make(map[string]context.CancelFunc),
+		workers:    make(map[string]workerHandle),
 		subs:       make(map[string]*nats.Subscription),
 		caches:     make(map[string]map[int64]*branchEntry),
 		registry:   tenant.NewRegistry(),
@@ -118,6 +124,9 @@ func (r *daemonReconciler) getService(dbName string, branchID int64) (*zatca.Ser
 }
 
 func (r *daemonReconciler) reconcile(ctx context.Context) error {
+	r.reconcileMu.Lock()
+	defer r.reconcileMu.Unlock()
+
 	discovered, err := tenant.LoadAllContext(ctx, r.masterDB)
 	if err != nil {
 		return err
@@ -244,11 +253,11 @@ func (r *daemonReconciler) removeTenant(dbName string) {
 	}
 	delete(r.tenants, dbName)
 	delete(r.caches, dbName)
-	var cancellations []context.CancelFunc
+	var workers []workerHandle
 	prefix := dbName + ":"
-	for key, cancel := range r.workers {
+	for key, worker := range r.workers {
 		if strings.HasPrefix(key, prefix) {
-			cancellations = append(cancellations, cancel)
+			workers = append(workers, worker)
 			delete(r.workers, key)
 			unmarkBranchActive(dbName, branchIDFromKey(key))
 		}
@@ -263,14 +272,19 @@ func (r *daemonReconciler) removeTenant(dbName string) {
 		}
 	}
 	r.mu.Unlock()
-	for _, cancel := range cancellations {
-		cancel()
+	for _, worker := range workers {
+		worker.cancel()
 	}
 	for _, sub := range subscriptions {
 		_ = sub.Unsubscribe()
 	}
 	if tc != nil {
 		tc.onboardingWG.Wait()
+	}
+	for _, worker := range workers {
+		<-worker.done
+	}
+	if tc != nil {
 		_ = tc.db.Close()
 		if tc.adminDB != nil {
 			_ = tc.adminDB.Close()
@@ -290,20 +304,27 @@ func (r *daemonReconciler) reconcileBranches(ctx context.Context, tc *tenantCtx)
 		active[branchID] = true
 		r.startBranch(tc, tc.tenant.DBName, branchID)
 	}
+	var stopped []workerHandle
 	r.mu.Lock()
 	delete(r.caches, tc.tenant.DBName)
-	for key, cancel := range r.workers {
+	for key, worker := range r.workers {
 		if !strings.HasPrefix(key, tc.tenant.DBName+":") {
 			continue
 		}
 		branchID := branchIDFromKey(key)
 		if !active[branchID] {
-			cancel()
+			stopped = append(stopped, worker)
 			delete(r.workers, key)
 			unmarkBranchActive(tc.tenant.DBName, branchID)
 		}
 	}
 	r.mu.Unlock()
+	for _, worker := range stopped {
+		worker.cancel()
+	}
+	for _, worker := range stopped {
+		<-worker.done
+	}
 	if len(branches) == 0 {
 		log.Printf("NOTE: no active branches in %s", tc.tenant.Name)
 	}
@@ -322,7 +343,8 @@ func (r *daemonReconciler) startBranch(tc *tenantCtx, dbName string, branchID in
 		return
 	}
 	workerCtx, cancel := context.WithCancel(r.ctx)
-	r.workers[key] = cancel
+	done := make(chan struct{})
+	r.workers[key] = workerHandle{cancel: cancel, done: done}
 	r.mu.Unlock()
 	activeMu.Lock()
 	activeBranches[key] = true
@@ -330,6 +352,7 @@ func (r *daemonReconciler) startBranch(tc *tenantCtx, dbName string, branchID in
 	r.wg.Add(1)
 	go func() {
 		defer r.wg.Done()
+		defer close(done)
 		runWorkerContext(workerCtx, r.js, tc, r.getService, dbName, branchID)
 	}()
 }
@@ -362,6 +385,9 @@ func (r *daemonReconciler) loop(interval time.Duration) {
 
 func (r *daemonReconciler) stop() {
 	r.cancel()
+	r.reconcileMu.Lock()
+	defer r.reconcileMu.Unlock()
+
 	r.mu.RLock()
 	dbNames := make([]string, 0, len(r.tenants))
 	for dbName := range r.tenants {
