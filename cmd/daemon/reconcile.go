@@ -54,6 +54,9 @@ type daemonReconciler struct {
 	subs        map[string]*nats.Subscription
 	caches      map[string]map[int64]*branchEntry
 	registry    *tenant.Registry
+
+	lastReconcileAt  time.Time
+	lastReconcileErr error
 }
 
 func newDaemonReconciler(
@@ -123,9 +126,15 @@ func (r *daemonReconciler) getService(dbName string, branchID int64) (*zatca.Ser
 	return svc, branchCfg, nil
 }
 
-func (r *daemonReconciler) reconcile(ctx context.Context) error {
+func (r *daemonReconciler) reconcile(ctx context.Context) (reconcileErr error) {
 	r.reconcileMu.Lock()
 	defer r.reconcileMu.Unlock()
+	defer func() {
+		r.mu.Lock()
+		r.lastReconcileAt = time.Now()
+		r.lastReconcileErr = reconcileErr
+		r.mu.Unlock()
+	}()
 
 	discovered, err := tenant.LoadAllContext(ctx, r.masterDB)
 	if err != nil {
@@ -158,13 +167,14 @@ func (r *daemonReconciler) reconcile(ctx context.Context) error {
 		}
 	}
 
+	var failures []error
 	for _, target := range discovered {
 		r.mu.RLock()
 		_, exists := r.tenants[target.DBName]
 		r.mu.RUnlock()
 		if !exists {
 			if err := r.addTenant(target); err != nil {
-				log.Printf("WARN: skip tenant %s: %v", target.Name, err)
+				failures = append(failures, fmt.Errorf("tenant %s (%s) failed to start: %w", target.Name, target.DBName, err))
 			}
 		}
 	}
@@ -176,9 +186,12 @@ func (r *daemonReconciler) reconcile(ctx context.Context) error {
 	}
 	r.mu.RUnlock()
 	for _, tc := range tenants {
-		r.reconcileBranches(ctx, tc)
+		if err := r.reconcileBranches(ctx, tc); err != nil {
+			failures = append(failures, fmt.Errorf("tenant %s (%s) branch reconciliation failed: %w",
+				tc.tenant.Name, tc.tenant.DBName, err))
+		}
 	}
-	return nil
+	return errors.Join(failures...)
 }
 
 func (r *daemonReconciler) addTenant(t tenant.Tenant) error {
@@ -201,15 +214,16 @@ func (r *daemonReconciler) addTenant(t tenant.Tenant) error {
 		env, _ = config.ParseEnv(t.ZATCAEnv)
 	}
 	tc := &tenantCtx{
-		tenant:      t,
-		db:          tdb,
-		cfg:         &config.Config{Env: env},
-		encKey:      r.encKey,
-		claims:      queue.NewSQLClaimStore(tdb),
-		chain:       chain,
-		ackWait:     r.ackWait,
-		maxDeliver:  r.maxDeliver,
-		startBranch: r.startBranch,
+		tenant:           t,
+		db:               tdb,
+		cfg:              &config.Config{Env: env},
+		encKey:           r.encKey,
+		claims:           queue.NewSQLClaimStore(tdb),
+		chain:            chain,
+		ackWait:          r.ackWait,
+		maxDeliver:       r.maxDeliver,
+		startBranch:      r.startBranch,
+		expectedBranches: make(map[int64]struct{}),
 	}
 	if r.adminDSN != "" {
 		if adminDB, adminErr := tenant.OpenDB(t, r.adminDSN); adminErr != nil {
@@ -293,17 +307,22 @@ func (r *daemonReconciler) removeTenant(dbName string) {
 	}
 }
 
-func (r *daemonReconciler) reconcileBranches(ctx context.Context, tc *tenantCtx) {
+func (r *daemonReconciler) reconcileBranches(ctx context.Context, tc *tenantCtx) error {
 	branches, err := processor.QueryActiveBranches(tc.db)
 	if err != nil {
-		log.Printf("WARN: cannot query branches for %s: %v", tc.tenant.DBName, err)
-		return
+		return fmt.Errorf("query active branches: %w", err)
 	}
 	active := make(map[int64]bool, len(branches))
 	for _, branchID := range branches {
 		active[branchID] = true
 		r.startBranch(tc, tc.tenant.DBName, branchID)
 	}
+	tc.expectedBranchesMu.Lock()
+	tc.expectedBranches = make(map[int64]struct{}, len(branches))
+	for _, branchID := range branches {
+		tc.expectedBranches[branchID] = struct{}{}
+	}
+	tc.expectedBranchesMu.Unlock()
 	var stopped []workerHandle
 	r.mu.Lock()
 	delete(r.caches, tc.tenant.DBName)
@@ -329,6 +348,7 @@ func (r *daemonReconciler) reconcileBranches(ctx context.Context, tc *tenantCtx)
 		log.Printf("NOTE: no active branches in %s", tc.tenant.Name)
 	}
 	_ = ctx
+	return nil
 }
 
 func (r *daemonReconciler) startBranch(tc *tenantCtx, dbName string, branchID int64) {
@@ -380,6 +400,75 @@ func (r *daemonReconciler) loop(interval time.Duration) {
 				log.Printf("WARN: tenant reconciliation failed: %v", err)
 			}
 		}
+	}
+}
+
+func (r *daemonReconciler) checkReadiness(context.Context) error {
+	r.mu.RLock()
+	reconciledAt := r.lastReconcileAt
+	reconcileErr := r.lastReconcileErr
+	tenants := make([]*tenantCtx, 0, len(r.tenants))
+	for _, tc := range r.tenants {
+		tenants = append(tenants, tc)
+	}
+	workers := make(map[string]workerHandle, len(r.workers))
+	for key, worker := range r.workers {
+		workers[key] = worker
+	}
+	subs := make(map[string]*nats.Subscription, len(r.subs))
+	for key, sub := range r.subs {
+		subs[key] = sub
+	}
+	js := r.js
+	r.mu.RUnlock()
+
+	if reconciledAt.IsZero() {
+		return errors.New("tenant reconciliation has not completed")
+	}
+	if reconcileErr != nil {
+		return fmt.Errorf("tenant reconciliation is unhealthy: %w", reconcileErr)
+	}
+
+	var missing []string
+	for _, tc := range tenants {
+		if sub := subs["onboard:"+tc.tenant.DBName]; sub == nil || !sub.IsValid() {
+			missing = append(missing, fmt.Sprintf("onboarding responder for tenant %s", tc.tenant.DBName))
+		}
+		if sub := subs["reconcile:"+tc.tenant.TenantKey]; sub == nil || !sub.IsValid() {
+			missing = append(missing, fmt.Sprintf("reconciliation responder for tenant %s", tc.tenant.TenantKey))
+		}
+		for _, branchID := range tc.expectedBranchSnapshot() {
+			key := branchKey(tc.tenant.DBName, branchID)
+			worker, ok := workers[key]
+			if !ok || workerStopped(worker.done) {
+				missing = append(missing, fmt.Sprintf("worker for %s branch %d", tc.tenant.DBName, branchID))
+				continue
+			}
+			if js == nil {
+				missing = append(missing, fmt.Sprintf("JetStream consumer for %s branch %d", tc.tenant.DBName, branchID))
+				continue
+			}
+			if _, err := js.ConsumerInfo(queue.StreamName, queue.OrderedConsumerName(tc.tenant.DBName, branchID)); err != nil {
+				missing = append(missing, fmt.Sprintf("JetStream consumer for %s branch %d: %v",
+					tc.tenant.DBName, branchID, err))
+			}
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("daemon readiness is unhealthy; missing expected consumers: %s", strings.Join(missing, "; "))
+	}
+	return nil
+}
+
+func workerStopped(done <-chan struct{}) bool {
+	if done == nil {
+		return true
+	}
+	select {
+	case <-done:
+		return true
+	default:
+		return false
 	}
 }
 
