@@ -32,9 +32,21 @@ type tenantCtx struct {
 	ackWait            time.Duration
 	maxDeliver         int
 	startBranch        func(*tenantCtx, string, int64)
+	expectedBranchesMu sync.RWMutex
+	expectedBranches   map[int64]struct{}
 	onboardingWG       sync.WaitGroup
 	onboardingStateMu  sync.Mutex
 	onboardingStopping bool
+}
+
+func (tc *tenantCtx) expectedBranchSnapshot() []int64 {
+	tc.expectedBranchesMu.RLock()
+	defer tc.expectedBranchesMu.RUnlock()
+	branches := make([]int64, 0, len(tc.expectedBranches))
+	for branchID := range tc.expectedBranches {
+		branches = append(branches, branchID)
+	}
+	return branches
 }
 
 type getServiceFunc func(dbName string, branchID int64) (*zatca.Service, *config.Config, error)
