@@ -110,6 +110,7 @@ func (bz *BranchZATCA) IsRegistered() bool {
 func (bz *BranchZATCA) ToConfig(base *config.Config) *config.Config {
 	return &config.Config{
 		Env:                base.Env,
+		ProviderEndpoint:   base.ProviderEndpoint,
 		OTP:                base.OTP,
 		ProductionUsername: bz.ProductionUsername,
 		ProductionPassword: bz.ProductionPassword,

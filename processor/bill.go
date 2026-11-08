@@ -15,6 +15,7 @@ import (
 	"github.com/zatca-go/zatca/config"
 	"github.com/zatca-go/zatca/invoice"
 	"github.com/zatca-go/zatca/models"
+	"github.com/zatca-go/zatca/provider"
 	"github.com/zatca-go/zatca/queue"
 	"github.com/zatca-go/zatca/zatca"
 )
@@ -22,11 +23,23 @@ import (
 // ServiceFunc returns the ZATCA service of a branch and the branch's configuration.
 type ServiceFunc func(branchID int64) (*zatca.Service, *config.Config, error)
 
+// ProviderFactory creates the provider adapter for one branch. A nil factory
+// keeps the production client path unchanged.
+type ProviderFactory func(branchID int64, svc *zatca.Service, cfg *config.Config) (provider.Adapter, error)
+
+// APIRequestBuilder creates the provider request from the stored signed XML.
+// The default builder is apiRequest; the field exists so integration tests can
+// exercise the daemon/provider boundary without invoking the external SDK.
+type APIRequestBuilder func(svc *zatca.Service, signedXML string) (models.InvoiceRequest, error)
+
 // BillPipeline is the fiscal pipeline of a sale. It verifies the bill, builds and signs its invoice under a booking, and
 // submits the stored XML to ZATCA.
 type BillPipeline struct {
-	DB      *sql.DB
-	Service ServiceFunc
+	DB              *sql.DB
+	Service         ServiceFunc
+	Provider        provider.Adapter
+	ProviderFactory ProviderFactory
+	RequestBuilder  APIRequestBuilder
 }
 
 // Prepare loads and verifies the bill. A bill that cannot be reported is refused here, before any number is booked.
@@ -59,15 +72,19 @@ func (p *BillPipeline) Prepare(_ context.Context, msg queue.Message) (queue.Prep
 // Submit sends a committed invoice to ZATCA. A standard invoice is cleared, and a simplified one is reported. A rejection by
 // ZATCA is an outcome, and so is an answer that needs reconciliation. Any other failure is technical, and the stored XML is
 // sent again later.
-func (p *BillPipeline) Submit(_ context.Context, invoice queue.SignedInvoice) (queue.Outcome, error) {
+func (p *BillPipeline) Submit(ctx context.Context, invoice queue.SignedInvoice) (queue.Outcome, error) {
 	if err := invoice.Validate(); err != nil {
 		return queue.Outcome{}, fmt.Errorf("cannot submit bill %d: %w", invoice.SourceID, err)
 	}
-	svc, _, err := p.Service(invoice.BranchID)
+	svc, cfg, err := p.Service(invoice.BranchID)
 	if err != nil {
 		return queue.Outcome{}, err
 	}
-	apiReq, err := apiRequest(svc, invoice.SignedXML)
+	requestBuilder := p.RequestBuilder
+	if requestBuilder == nil {
+		requestBuilder = apiRequest
+	}
+	apiReq, err := requestBuilder(svc, invoice.SignedXML)
 	if err != nil {
 		return queue.Outcome{}, err
 	}
@@ -75,12 +92,20 @@ func (p *BillPipeline) Submit(_ context.Context, invoice queue.SignedInvoice) (q
 		return queue.Outcome{}, fmt.Errorf("stored hash of bill %d does not match its signed XML", invoice.SourceID)
 	}
 
-	var resp *models.InvoiceResponse
-	if invoice.Kind == queue.InvoiceStandard {
-		resp, err = svc.Client.ClearInvoice(apiReq)
-	} else {
-		resp, err = svc.Client.ReportInvoice(apiReq)
+	adapter, err := p.providerAdapter(invoice.BranchID, svc, cfg)
+	if err != nil {
+		return queue.Outcome{}, err
 	}
+	kind := provider.KindSimplified
+	if invoice.Kind == queue.InvoiceStandard {
+		kind = provider.KindStandard
+	}
+	resp, err := adapter.Submit(ctx, provider.Submission{
+		Endpoint:  cfg.BaseURL(),
+		Kind:      kind,
+		Request:   apiReq,
+		SignedXML: invoice.SignedXML,
+	})
 	if err != nil {
 		return rejectionOutcome(invoice, err)
 	}
@@ -88,6 +113,26 @@ func (p *BillPipeline) Submit(_ context.Context, invoice queue.SignedInvoice) (q
 		return queue.Outcome{}, fmt.Errorf("ZATCA returned no response for bill %d", invoice.SourceID)
 	}
 	return responseOutcome(invoice.Kind, resp), nil
+}
+
+func (p *BillPipeline) providerAdapter(branchID int64, svc *zatca.Service, cfg *config.Config) (provider.Adapter, error) {
+	if p.Provider != nil {
+		return p.Provider, nil
+	}
+	if p.ProviderFactory != nil {
+		adapter, err := p.ProviderFactory(branchID, svc, cfg)
+		if err != nil {
+			return nil, fmt.Errorf("create provider for branch %d: %w", branchID, err)
+		}
+		if adapter == nil {
+			return nil, fmt.Errorf("provider factory returned nil adapter for branch %d", branchID)
+		}
+		return adapter, nil
+	}
+	if svc == nil || svc.Client == nil {
+		return nil, fmt.Errorf("production provider client is not configured for branch %d", branchID)
+	}
+	return provider.NewProduction(svc.Client), nil
 }
 
 // responseOutcome classifies a 2xx answer to an invoice of the given kind. ZATCA can answer 2xx and still refuse the invoice:
