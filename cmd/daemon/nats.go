@@ -25,9 +25,9 @@ func openNATS(cfg config.NATSConfig, monitorPassword string) (*natsRuntime, erro
 	}
 	mode, _ := config.ParseNATSMode(string(cfg.Mode))
 	if mode == config.NATSExternal {
-		conn, err := nats.Connect(cfg.URL)
+		conn, err := nats.Connect(cfg.URL, natsAuthOptions(cfg)...)
 		if err != nil {
-			return nil, fmt.Errorf("connect to external NATS %s: %w", cfg.URL, err)
+			return nil, fmt.Errorf("connect to external NATS: %w", err)
 		}
 		return &natsRuntime{conn: conn}, nil
 	}
@@ -38,6 +38,12 @@ func openNATS(cfg config.NATSConfig, monitorPassword string) (*natsRuntime, erro
 		StoreDir:  cfg.DataDir,
 		NoLog:     true,
 		NoSigs:    true,
+	}
+	if cfg.Username != "" {
+		opts.Users = []*server.User{{
+			Username: cfg.Username,
+			Password: cfg.Password,
+		}}
 	}
 	if cfg.MonitorPort > 0 {
 		if monitorPassword == "" {
@@ -66,12 +72,19 @@ func openNATS(cfg config.NATSConfig, monitorPassword string) (*natsRuntime, erro
 		ns.Shutdown()
 		return nil, fmt.Errorf("embedded NATS was not ready")
 	}
-	conn, err := nats.Connect(ns.ClientURL())
+	conn, err := nats.Connect(ns.ClientURL(), natsAuthOptions(cfg)...)
 	if err != nil {
 		ns.Shutdown()
 		return nil, fmt.Errorf("connect to embedded NATS: %w", err)
 	}
 	return &natsRuntime{conn: conn, server: ns}, nil
+}
+
+func natsAuthOptions(cfg config.NATSConfig) []nats.Option {
+	if cfg.Username == "" {
+		return nil
+	}
+	return []nats.Option{nats.UserInfo(cfg.Username, cfg.Password)}
 }
 
 func (r *natsRuntime) close() {

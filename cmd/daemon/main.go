@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -31,6 +32,9 @@ func main() {
 	masterDB := flag.String("master-db", "zatca_master", "Master database name")
 	natsMode := flag.String("nats-mode", envOrDefault("NATS_MODE", string(config.NATSExternal)), "NATS ownership mode: external or embedded")
 	natsURL := flag.String("nats-url", envOrDefault("NATS_URL", ""), "External NATS URL (required in external mode)")
+	natsUser := flag.String("nats-user", envOrDefault("NATS_USER", ""), "NATS username")
+	natsPassword := flag.String("nats-password", envOrDefault("NATS_PASSWORD", ""), "NATS password")
+	natsAllowUnauthenticated := flag.Bool("nats-allow-unauthenticated", envTruthy("NATS_ALLOW_UNAUTHENTICATED"), "Allow unauthenticated embedded NATS for explicit local/test use")
 	natsPort := flag.Int("nats-port", 4222, "Port for embedded NATS server")
 	natsMonPort := flag.Int("nats-monitor", 0, "Port for embedded NATS HTTP monitoring (0 to disable)")
 	natsDataDir := flag.String("nats-data", "./nats-data", "JetStream data directory")
@@ -87,14 +91,17 @@ func main() {
 		log.Fatal(err)
 	}
 	natsCfg := config.NATSConfig{
-		Mode:              mode,
-		URL:               *natsURL,
-		Port:              *natsPort,
-		MonitorPort:       *natsMonPort,
-		DataDir:           *natsDataDir,
-		AckWait:           *natsAckWait,
-		MaxDeliver:        *natsMaxDeliver,
-		ReconcileInterval: *tenantReconcileInterval,
+		Mode:                 mode,
+		URL:                  *natsURL,
+		Username:             *natsUser,
+		Password:             *natsPassword,
+		AllowUnauthenticated: *natsAllowUnauthenticated,
+		Port:                 *natsPort,
+		MonitorPort:          *natsMonPort,
+		DataDir:              *natsDataDir,
+		AckWait:              *natsAckWait,
+		MaxDeliver:           *natsMaxDeliver,
+		ReconcileInterval:    *tenantReconcileInterval,
 	}
 	natsRT, err := openNATS(natsCfg, os.Getenv("MONITOR_PASS"))
 	if err != nil {
@@ -164,4 +171,13 @@ func basicAuth(next http.Handler, password string) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func envTruthy(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "1", "true", "yes":
+		return true
+	default:
+		return false
+	}
 }
