@@ -2,8 +2,8 @@ version: "3.8"
 
 # Variables below are interpolated from a `.env` file in this directory.
 # See `.env.example` for the full list. Required at runtime: DB_PASS,
-# ENCRYPT_KEY, MONITOR_PASS, NATS_USER, NATS_PASSWORD; ZATCA_SDK_PATH is
-# required when building.
+# ENCRYPT_KEY, MONITOR_PASS, NATS_USER, NATS_PASSWORD, and the NATS TLS
+# certificate/key/CA files; ZATCA_SDK_PATH is required when building.
 
 services:
   zatca-daemon:
@@ -20,6 +20,9 @@ services:
       - "${NATS_MONITOR_PORT:-8222}:8222"   # NATS monitoring — http://localhost:8222
     volumes:
       - nats-data:/data/nats            # JetStream persistence
+      - "${NATS_TLS_CERT_FILE:?NATS_TLS_CERT_FILE must point to the NATS server certificate}:/run/nats/tls/server.crt:ro"
+      - "${NATS_TLS_KEY_FILE:?NATS_TLS_KEY_FILE must point to the NATS server key}:/run/nats/tls/server.key:ro"
+      - "${NATS_TLS_CA_FILE:?NATS_TLS_CA_FILE must point to the NATS CA bundle}:/run/nats/tls/ca.crt:ro"
     environment:
       # --- DB connection (required) ---
       DB_USER: ${DB_USER:-zatca_daemon}
@@ -40,6 +43,12 @@ services:
       NATS_USER: ${NATS_USER:?NATS_USER must be set in .env}
       NATS_PASSWORD: ${NATS_PASSWORD:?NATS_PASSWORD must be set in .env}
       NATS_ALLOW_UNAUTHENTICATED: "false"
+      NATS_LOCAL_TEST_MODE: "false"
+      NATS_PRIVATE_NETWORK_ONLY: "false"
+      NATS_TLS_CERT_FILE: /run/nats/tls/server.crt
+      NATS_TLS_KEY_FILE: /run/nats/tls/server.key
+      NATS_TLS_CA_FILE: /run/nats/tls/ca.crt
+      NATS_TLS_SERVER_NAME: ${NATS_TLS_SERVER_NAME:-nats}
 
       # --- NATS monitoring password (required if port 8222 is exposed) ---
       MONITOR_PASS: ${MONITOR_PASS:?MONITOR_PASS must be set in .env}

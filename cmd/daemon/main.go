@@ -37,6 +37,12 @@ func main() {
 	natsUser := flag.String("nats-user", envOrDefault("NATS_USER", ""), "NATS username")
 	natsPassword := flag.String("nats-password", envOrDefault("NATS_PASSWORD", ""), "NATS password")
 	natsAllowUnauthenticated := flag.Bool("nats-allow-unauthenticated", envTruthy("NATS_ALLOW_UNAUTHENTICATED"), "Allow unauthenticated embedded NATS for explicit local/test use")
+	natsLocalTestMode := flag.Bool("nats-local-test-mode", envTruthy("NATS_LOCAL_TEST_MODE"), "Enable local/test-only NATS settings")
+	natsPrivateNetworkOnly := flag.Bool("nats-private-network-only", envTruthy("NATS_PRIVATE_NETWORK_ONLY"), "Declare that plain nats:// transport is private-network-only")
+	natsTLSCert := flag.String("nats-tls-cert", envOrDefault("NATS_TLS_CERT_FILE", ""), "NATS TLS server/client certificate file")
+	natsTLSKey := flag.String("nats-tls-key", envOrDefault("NATS_TLS_KEY_FILE", ""), "NATS TLS server/client private key file")
+	natsTLSCA := flag.String("nats-tls-ca", envOrDefault("NATS_TLS_CA_FILE", ""), "NATS TLS CA certificate bundle")
+	natsTLSServerName := flag.String("nats-tls-server-name", envOrDefault("NATS_TLS_SERVER_NAME", ""), "NATS TLS server name")
 	natsPort := flag.Int("nats-port", 4222, "Port for embedded NATS server")
 	natsMonPort := flag.Int("nats-monitor", 0, "Port for embedded NATS HTTP monitoring (0 to disable)")
 	natsDataDir := flag.String("nats-data", "./nats-data", "JetStream data directory")
@@ -101,6 +107,12 @@ func main() {
 		Username:             *natsUser,
 		Password:             *natsPassword,
 		AllowUnauthenticated: *natsAllowUnauthenticated,
+		LocalTestMode:        *natsLocalTestMode,
+		PrivateNetworkOnly:   *natsPrivateNetworkOnly,
+		TLSCertFile:          *natsTLSCert,
+		TLSKeyFile:           *natsTLSKey,
+		TLSCAFile:            *natsTLSCA,
+		TLSServerName:        *natsTLSServerName,
 		Port:                 *natsPort,
 		MonitorPort:          *natsMonPort,
 		DataDir:              *natsDataDir,
