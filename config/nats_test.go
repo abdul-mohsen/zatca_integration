@@ -8,14 +8,17 @@ import (
 
 func validNATSConfig(mode NATSMode) NATSConfig {
 	return NATSConfig{
-		Mode:              mode,
-		URL:               "nats://nats.example:4222",
-		Port:              4222,
-		MonitorPort:       0,
-		DataDir:           "nats-data",
-		AckWait:           time.Minute,
-		MaxDeliver:        10,
-		ReconcileInterval: time.Minute,
+		Mode:               mode,
+		URL:                "nats://nats-user:nats-password@nats.example:4222",
+		Username:           "nats-user",
+		Password:           "nats-password",
+		PrivateNetworkOnly: true,
+		Port:               4222,
+		MonitorPort:        0,
+		DataDir:            "nats-data",
+		AckWait:            time.Minute,
+		MaxDeliver:         10,
+		ReconcileInterval:  time.Minute,
 	}
 }
 
@@ -46,6 +49,45 @@ func TestEmbeddedNATSDoesNotNeedAnExternalURL(t *testing.T) {
 	}
 }
 
+func TestEmbeddedNATSRequiresCredentialsUnlessExplicitlyUnauthenticated(t *testing.T) {
+	cfg := validNATSConfig(NATSEmbedded)
+	cfg.PrivateNetworkOnly = false
+	cfg.Username = ""
+	cfg.Password = ""
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("embedded NATS without credentials was accepted")
+	}
+
+	cfg.AllowUnauthenticated = true
+	cfg.LocalTestMode = true
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("explicit local unauthenticated embedded NATS was rejected: %v", err)
+	}
+}
+
+func TestExternalNATSAcceptsCredentialsInURL(t *testing.T) {
+	cfg := validNATSConfig(NATSExternal)
+	cfg.Username = ""
+	cfg.Password = ""
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("external NATS URL credentials were rejected: %v", err)
+	}
+}
+
+func TestNATSConfigRejectsPartialCredentialsAndExternalUnauthenticatedOptIn(t *testing.T) {
+	cfg := validNATSConfig(NATSEmbedded)
+	cfg.Password = ""
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "set together") {
+		t.Fatalf("Validate() = %v; want a paired-credential error", err)
+	}
+
+	cfg = validNATSConfig(NATSExternal)
+	cfg.AllowUnauthenticated = true
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "local test mode") {
+		t.Fatalf("Validate() = %v; want local-test-only unauthenticated error", err)
+	}
+}
+
 func TestNATSConfigRejectsInvalidURLsAndLimits(t *testing.T) {
 	cfg := validNATSConfig(NATSExternal)
 	cases := []struct {
@@ -66,5 +108,88 @@ func TestNATSConfigRejectsInvalidURLsAndLimits(t *testing.T) {
 				t.Fatalf("Validate() = %v; want an error containing %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestNATSConfigRequiresPrivateNetworkForPlainExternalTransport(t *testing.T) {
+	cfg := validNATSConfig(NATSExternal)
+	cfg.PrivateNetworkOnly = false
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "private-network-only") {
+		t.Fatalf("Validate() = %v; want private-network-only error", err)
+	}
+
+	cfg.URL = "tls://nats.example:4222"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("TLS external NATS was rejected: %v", err)
+	}
+}
+
+func TestNATSConfigRequiresTLSFilesTogether(t *testing.T) {
+	cfg := validNATSConfig(NATSEmbedded)
+	cfg.PrivateNetworkOnly = false
+	cfg.TLSCertFile = "server.crt"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "certificate and key") {
+		t.Fatalf("Validate() = %v; want certificate/key pairing error", err)
+	}
+
+	cfg.TLSKeyFile = "server.key"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "CA file") {
+		t.Fatalf("Validate() = %v; want CA file error", err)
+	}
+
+	cfg.TLSCAFile = "ca.crt"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("complete embedded TLS configuration was rejected: %v", err)
+	}
+}
+
+func TestNATSConfigRequiresExplicitLocalTestMode(t *testing.T) {
+	cfg := validNATSConfig(NATSEmbedded)
+	cfg.PrivateNetworkOnly = false
+	cfg.Username = ""
+	cfg.Password = ""
+	cfg.AllowUnauthenticated = true
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "local test mode") {
+		t.Fatalf("Validate() = %v; want explicit local-test error", err)
+	}
+}
+
+func TestNATSConfigRequiresTLSForNonLocalMonitor(t *testing.T) {
+	cfg := validNATSConfig(NATSEmbedded)
+	cfg.MonitorPort = 8222
+	cfg.MonitorHost = "0.0.0.0"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "monitor requires TLS") {
+		t.Fatalf("Validate() = %v; want monitor TLS error", err)
+	}
+
+	cfg.MonitorLocalTestMode = true
+	cfg.MonitorPrivateNetworkOnly = true
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "loopback") {
+		t.Fatalf("Validate() = %v; want loopback binding error", err)
+	}
+
+	cfg.MonitorHost = "127.0.0.1"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("explicit private local monitor was rejected: %v", err)
+	}
+}
+
+func TestNATSConfigAcceptsTLSMonitorOutsideLocalTestMode(t *testing.T) {
+	cfg := validNATSConfig(NATSEmbedded)
+	cfg.MonitorPort = 8222
+	cfg.MonitorHost = "0.0.0.0"
+	cfg.MonitorTLSCertFile = "monitor.crt"
+	cfg.MonitorTLSKeyFile = "monitor.key"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("TLS monitor was rejected: %v", err)
+	}
+}
+
+func TestNATSConfigRequiresMonitorTLSFilesTogether(t *testing.T) {
+	cfg := validNATSConfig(NATSEmbedded)
+	cfg.MonitorPort = 8222
+	cfg.MonitorTLSCertFile = "monitor.crt"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "certificate and key") {
+		t.Fatalf("Validate() = %v; want monitor certificate/key error", err)
 	}
 }

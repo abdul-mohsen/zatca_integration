@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"strings"
 	"time"
@@ -32,14 +33,28 @@ func ParseNATSMode(value string) (NATSMode, error) {
 
 // NATSConfig contains the daemon's transport and delivery limits.
 type NATSConfig struct {
-	Mode              NATSMode
-	URL               string
-	Port              int
-	MonitorPort       int
-	DataDir           string
-	AckWait           time.Duration
-	MaxDeliver        int
-	ReconcileInterval time.Duration
+	Mode                      NATSMode
+	URL                       string
+	Username                  string
+	Password                  string
+	AllowUnauthenticated      bool
+	LocalTestMode             bool
+	PrivateNetworkOnly        bool
+	TLSCertFile               string
+	TLSKeyFile                string
+	TLSCAFile                 string
+	TLSServerName             string
+	Port                      int
+	MonitorPort               int
+	MonitorHost               string
+	MonitorTLSCertFile        string
+	MonitorTLSKeyFile         string
+	MonitorPrivateNetworkOnly bool
+	MonitorLocalTestMode      bool
+	DataDir                   string
+	AckWait                   time.Duration
+	MaxDeliver                int
+	ReconcileInterval         time.Duration
 }
 
 // Validate checks ownership-specific configuration before any process starts.
@@ -54,6 +69,22 @@ func (c NATSConfig) Validate() error {
 	if c.MonitorPort < 0 || c.MonitorPort > 65535 {
 		return fmt.Errorf("NATS monitor port must be between 0 and 65535")
 	}
+	hasMonitorTLSCert := strings.TrimSpace(c.MonitorTLSCertFile) != ""
+	hasMonitorTLSKey := strings.TrimSpace(c.MonitorTLSKeyFile) != ""
+	if hasMonitorTLSCert != hasMonitorTLSKey {
+		return fmt.Errorf("NATS monitor TLS certificate and key must be set together")
+	}
+	if c.MonitorPort > 0 && !hasMonitorTLSCert {
+		if !c.MonitorLocalTestMode {
+			return fmt.Errorf("NATS monitor requires TLS unless explicit local test mode is enabled")
+		}
+		if !c.MonitorPrivateNetworkOnly {
+			return fmt.Errorf("plain NATS monitor requires private-network-only mode")
+		}
+		if !monitorHostIsLoopback(c.MonitorHost) {
+			return fmt.Errorf("plain NATS monitor must bind to a loopback host")
+		}
+	}
 	if c.AckWait <= 0 {
 		return fmt.Errorf("NATS ACK wait must be positive")
 	}
@@ -62,6 +93,19 @@ func (c NATSConfig) Validate() error {
 	}
 	if c.ReconcileInterval <= 0 {
 		return fmt.Errorf("tenant reconciliation interval must be positive")
+	}
+	hasUsername := strings.TrimSpace(c.Username) != ""
+	hasPassword := strings.TrimSpace(c.Password) != ""
+	if hasUsername != hasPassword {
+		return fmt.Errorf("NATS username and password must be set together")
+	}
+	hasTLSCert := strings.TrimSpace(c.TLSCertFile) != ""
+	hasTLSKey := strings.TrimSpace(c.TLSKeyFile) != ""
+	if hasTLSCert != hasTLSKey {
+		return fmt.Errorf("NATS TLS certificate and key must be set together")
+	}
+	if c.AllowUnauthenticated && (mode != NATSEmbedded || !c.LocalTestMode) {
+		return fmt.Errorf("unauthenticated NATS is only allowed in explicit local test mode")
 	}
 	if mode == NATSExternal {
 		if strings.TrimSpace(c.URL) == "" {
@@ -74,9 +118,36 @@ func (c NATSConfig) Validate() error {
 		if parsed.Host == "" {
 			return fmt.Errorf("NATS URL must include a host in external mode")
 		}
+		urlHasAuth := parsed.User != nil && parsed.User.Username() != ""
+		if !c.AllowUnauthenticated && !hasUsername && !urlHasAuth {
+			return fmt.Errorf("NATS authentication is required in external mode")
+		}
+		if parsed.Scheme == "nats" && !c.PrivateNetworkOnly {
+			return fmt.Errorf("plain nats:// external transport requires private-network-only mode")
+		}
 	}
-	if mode == NATSEmbedded && strings.TrimSpace(c.DataDir) == "" {
-		return fmt.Errorf("NATS data directory is required in embedded mode")
+	if mode == NATSEmbedded {
+		if strings.TrimSpace(c.DataDir) == "" {
+			return fmt.Errorf("NATS data directory is required in embedded mode")
+		}
+		if !c.AllowUnauthenticated && !hasUsername {
+			return fmt.Errorf("NATS username and password are required in embedded mode")
+		}
+		if !c.AllowUnauthenticated && !hasTLSCert && !c.PrivateNetworkOnly {
+			return fmt.Errorf("embedded production NATS requires TLS or private-network-only mode")
+		}
+		if hasTLSCert && strings.TrimSpace(c.TLSCAFile) == "" {
+			return fmt.Errorf("NATS TLS CA file is required when TLS is enabled")
+		}
 	}
 	return nil
+}
+
+func monitorHostIsLoopback(host string) bool {
+	host = strings.TrimSpace(strings.Trim(host, "[]"))
+	if host == "" || strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }

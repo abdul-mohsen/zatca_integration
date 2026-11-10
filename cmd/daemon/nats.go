@@ -2,11 +2,17 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/nats-io/nats-server/v2/server"
@@ -27,9 +33,13 @@ func openNATS(cfg config.NATSConfig, monitorPassword string, readiness func(cont
 	}
 	mode, _ := config.ParseNATSMode(string(cfg.Mode))
 	if mode == config.NATSExternal {
-		conn, err := nats.Connect(cfg.URL)
+		connectOptions, err := natsConnectOptions(cfg, cfg.URL)
 		if err != nil {
-			return nil, fmt.Errorf("connect to external NATS %s: %w", cfg.URL, err)
+			return nil, err
+		}
+		conn, err := nats.Connect(cfg.URL, connectOptions...)
+		if err != nil {
+			return nil, fmt.Errorf("connect to external NATS: %w", err)
 		}
 		return &natsRuntime{conn: conn}, nil
 	}
@@ -40,6 +50,18 @@ func openNATS(cfg config.NATSConfig, monitorPassword string, readiness func(cont
 		StoreDir:  cfg.DataDir,
 		NoLog:     true,
 		NoSigs:    true,
+	}
+	if cfg.Username != "" {
+		opts.Users = []*server.User{{
+			Username: cfg.Username,
+			Password: cfg.Password,
+		}}
+	}
+	tlsEnabled := strings.TrimSpace(cfg.TLSCertFile) != ""
+	if tlsEnabled {
+		opts.TLS = true
+		opts.TLSCert = cfg.TLSCertFile
+		opts.TLSKey = cfg.TLSKeyFile
 	}
 	if cfg.MonitorPort > 0 {
 		if monitorPassword == "" {
@@ -52,9 +74,18 @@ func openNATS(cfg config.NATSConfig, monitorPassword string, readiness func(cont
 		proxy := httputil.NewSingleHostReverseProxy(target)
 		mux := http.NewServeMux()
 		mux.Handle("/", basicAuth(daemonMonitorHandler(readiness, proxy), monitorPassword))
+		monitorServer := &http.Server{
+			Addr:    net.JoinHostPort(monitorListenHost(cfg), strconv.Itoa(cfg.MonitorPort)),
+			Handler: mux,
+		}
 		go func() {
-			addr := fmt.Sprintf(":%d", cfg.MonitorPort)
-			if err := http.ListenAndServe(addr, mux); err != nil {
+			var err error
+			if strings.TrimSpace(cfg.MonitorTLSCertFile) != "" {
+				err = monitorServer.ListenAndServeTLS(cfg.MonitorTLSCertFile, cfg.MonitorTLSKeyFile)
+			} else {
+				err = monitorServer.ListenAndServe()
+			}
+			if err != nil && err != http.ErrServerClosed {
 				fmt.Printf("WARN: NATS monitoring server: %v\n", err)
 			}
 		}()
@@ -68,7 +99,22 @@ func openNATS(cfg config.NATSConfig, monitorPassword string, readiness func(cont
 		ns.Shutdown()
 		return nil, fmt.Errorf("embedded NATS was not ready")
 	}
-	conn, err := nats.Connect(ns.ClientURL())
+	clientURL := ns.ClientURL()
+	if tlsEnabled {
+		parsed, err := url.Parse(clientURL)
+		if err != nil {
+			ns.Shutdown()
+			return nil, fmt.Errorf("build embedded NATS TLS URL: %w", err)
+		}
+		parsed.Scheme = "tls"
+		clientURL = parsed.String()
+	}
+	connectOptions, err := natsConnectOptions(cfg, clientURL)
+	if err != nil {
+		ns.Shutdown()
+		return nil, err
+	}
+	conn, err := nats.Connect(clientURL, connectOptions...)
 	if err != nil {
 		ns.Shutdown()
 		return nil, fmt.Errorf("connect to embedded NATS: %w", err)
@@ -93,6 +139,75 @@ func daemonMonitorHandler(readiness func(context.Context) error, next http.Handl
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func monitorListenHost(cfg config.NATSConfig) string {
+	host := strings.TrimSpace(cfg.MonitorHost)
+	if host == "" {
+		return "127.0.0.1"
+	}
+	return host
+}
+
+func natsAuthOptions(cfg config.NATSConfig) []nats.Option {
+	if cfg.Username == "" {
+		return nil
+	}
+	return []nats.Option{nats.UserInfo(cfg.Username, cfg.Password)}
+}
+
+func natsConnectOptions(cfg config.NATSConfig, endpoint string) ([]nats.Option, error) {
+	options := natsAuthOptions(cfg)
+	tlsOptions, err := natsTLSOptions(cfg, endpoint)
+	if err != nil {
+		return nil, err
+	}
+	return append(options, tlsOptions...), nil
+}
+
+func natsTLSOptions(cfg config.NATSConfig, endpoint string) ([]nats.Option, error) {
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("parse NATS endpoint for TLS: %w", err)
+	}
+	tlsEnabled := parsed.Scheme == "tls" ||
+		strings.TrimSpace(cfg.TLSCertFile) != "" ||
+		strings.TrimSpace(cfg.TLSCAFile) != "" ||
+		strings.TrimSpace(cfg.TLSServerName) != ""
+	if !tlsEnabled {
+		return nil, nil
+	}
+
+	serverName := strings.TrimSpace(cfg.TLSServerName)
+	if serverName == "" {
+		serverName = parsed.Hostname()
+	}
+	tlsConfig := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		ServerName: serverName,
+	}
+	if cfg.TLSCAFile != "" {
+		caPEM, err := os.ReadFile(cfg.TLSCAFile)
+		if err != nil {
+			return nil, fmt.Errorf("read NATS TLS CA file: %w", err)
+		}
+		roots, err := x509.SystemCertPool()
+		if err != nil || roots == nil {
+			roots = x509.NewCertPool()
+		}
+		if !roots.AppendCertsFromPEM(caPEM) {
+			return nil, fmt.Errorf("NATS TLS CA file does not contain a certificate")
+		}
+		tlsConfig.RootCAs = roots
+	}
+	if cfg.TLSCertFile != "" {
+		certificate, err := tls.LoadX509KeyPair(cfg.TLSCertFile, cfg.TLSKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("load NATS TLS certificate: %w", err)
+		}
+		tlsConfig.Certificates = []tls.Certificate{certificate}
+	}
+	return []nats.Option{nats.Secure(tlsConfig)}, nil
 }
 
 func (r *natsRuntime) close() {
