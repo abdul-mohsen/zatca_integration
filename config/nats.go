@@ -37,6 +37,12 @@ type NATSConfig struct {
 	Username             string
 	Password             string
 	AllowUnauthenticated bool
+	LocalTestMode        bool
+	PrivateNetworkOnly   bool
+	TLSCertFile          string
+	TLSKeyFile           string
+	TLSCAFile            string
+	TLSServerName        string
 	Port                 int
 	MonitorPort          int
 	DataDir              string
@@ -71,8 +77,13 @@ func (c NATSConfig) Validate() error {
 	if hasUsername != hasPassword {
 		return fmt.Errorf("NATS username and password must be set together")
 	}
-	if c.AllowUnauthenticated && mode != NATSEmbedded {
-		return fmt.Errorf("unauthenticated NATS is only allowed in embedded mode")
+	hasTLSCert := strings.TrimSpace(c.TLSCertFile) != ""
+	hasTLSKey := strings.TrimSpace(c.TLSKeyFile) != ""
+	if hasTLSCert != hasTLSKey {
+		return fmt.Errorf("NATS TLS certificate and key must be set together")
+	}
+	if c.AllowUnauthenticated && (mode != NATSEmbedded || !c.LocalTestMode) {
+		return fmt.Errorf("unauthenticated NATS is only allowed in explicit local test mode")
 	}
 	if mode == NATSExternal {
 		if strings.TrimSpace(c.URL) == "" {
@@ -89,6 +100,9 @@ func (c NATSConfig) Validate() error {
 		if !c.AllowUnauthenticated && !hasUsername && !urlHasAuth {
 			return fmt.Errorf("NATS authentication is required in external mode")
 		}
+		if parsed.Scheme == "nats" && !c.PrivateNetworkOnly {
+			return fmt.Errorf("plain nats:// external transport requires private-network-only mode")
+		}
 	}
 	if mode == NATSEmbedded {
 		if strings.TrimSpace(c.DataDir) == "" {
@@ -96,6 +110,12 @@ func (c NATSConfig) Validate() error {
 		}
 		if !c.AllowUnauthenticated && !hasUsername {
 			return fmt.Errorf("NATS username and password are required in embedded mode")
+		}
+		if !c.AllowUnauthenticated && !hasTLSCert && !c.PrivateNetworkOnly {
+			return fmt.Errorf("embedded production NATS requires TLS or private-network-only mode")
+		}
+		if hasTLSCert && strings.TrimSpace(c.TLSCAFile) == "" {
+			return fmt.Errorf("NATS TLS CA file is required when TLS is enabled")
 		}
 	}
 	return nil
