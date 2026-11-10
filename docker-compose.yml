@@ -17,7 +17,7 @@ services:
       - "host.docker.internal:host-gateway"
     ports:
       - "${NATS_PORT:-4222}:4222"   # NATS — your backend publishes here
-      - "${NATS_MONITOR_PORT:-8222}:8222"   # NATS monitoring — http://localhost:8222
+      - "${NATS_MONITOR_PORT:-8222}:8222"   # NATS monitoring — https://localhost:8222
     volumes:
       - nats-data:/data/nats            # JetStream persistence
       - "${NATS_TLS_CERT_FILE:?NATS_TLS_CERT_FILE must point to the NATS server certificate}:/run/nats/tls/server.crt:ro"
@@ -50,7 +50,12 @@ services:
       NATS_TLS_CA_FILE: /run/nats/tls/ca.crt
       NATS_TLS_SERVER_NAME: ${NATS_TLS_SERVER_NAME:-nats}
 
-      # --- NATS monitoring password (required if port 8222 is exposed) ---
+      # --- NATS monitoring (TLS is required outside explicit local tests) ---
+      NATS_MONITOR_HOST: ${NATS_MONITOR_HOST:-0.0.0.0}
+      NATS_MONITOR_PRIVATE_NETWORK_ONLY: "false"
+      NATS_MONITOR_LOCAL_TEST_MODE: "false"
+      NATS_MONITOR_TLS_CERT_FILE: /run/nats/tls/server.crt
+      NATS_MONITOR_TLS_KEY_FILE: /run/nats/tls/server.key
       MONITOR_PASS: ${MONITOR_PASS:?MONITOR_PASS must be set in .env}
 
       # --- SMTP for error alerts (uses host SMTP by default) ---

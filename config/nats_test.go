@@ -153,3 +153,43 @@ func TestNATSConfigRequiresExplicitLocalTestMode(t *testing.T) {
 		t.Fatalf("Validate() = %v; want explicit local-test error", err)
 	}
 }
+
+func TestNATSConfigRequiresTLSForNonLocalMonitor(t *testing.T) {
+	cfg := validNATSConfig(NATSEmbedded)
+	cfg.MonitorPort = 8222
+	cfg.MonitorHost = "0.0.0.0"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "monitor requires TLS") {
+		t.Fatalf("Validate() = %v; want monitor TLS error", err)
+	}
+
+	cfg.MonitorLocalTestMode = true
+	cfg.MonitorPrivateNetworkOnly = true
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "loopback") {
+		t.Fatalf("Validate() = %v; want loopback binding error", err)
+	}
+
+	cfg.MonitorHost = "127.0.0.1"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("explicit private local monitor was rejected: %v", err)
+	}
+}
+
+func TestNATSConfigAcceptsTLSMonitorOutsideLocalTestMode(t *testing.T) {
+	cfg := validNATSConfig(NATSEmbedded)
+	cfg.MonitorPort = 8222
+	cfg.MonitorHost = "0.0.0.0"
+	cfg.MonitorTLSCertFile = "monitor.crt"
+	cfg.MonitorTLSKeyFile = "monitor.key"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("TLS monitor was rejected: %v", err)
+	}
+}
+
+func TestNATSConfigRequiresMonitorTLSFilesTogether(t *testing.T) {
+	cfg := validNATSConfig(NATSEmbedded)
+	cfg.MonitorPort = 8222
+	cfg.MonitorTLSCertFile = "monitor.crt"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "certificate and key") {
+		t.Fatalf("Validate() = %v; want monitor certificate/key error", err)
+	}
+}
