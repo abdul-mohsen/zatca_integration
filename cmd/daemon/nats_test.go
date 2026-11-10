@@ -67,3 +67,17 @@ func TestOpenNATSAllowsUnauthenticatedOnlyForExplicitLocalTestMode(t *testing.T)
 	}
 	conn.Close()
 }
+
+func TestMonitorListenHostDefaultsToLoopback(t *testing.T) {
+	cfg := config.NATSConfig{}
+	if got := monitorListenHost(cfg); got != "127.0.0.1" {
+		t.Fatalf("monitorListenHost() = %q; want loopback default", got)
+	}
+}
+
+func TestMonitorListenHostHonorsConfiguredHost(t *testing.T) {
+	cfg := config.NATSConfig{MonitorHost: "0.0.0.0"}
+	if got := monitorListenHost(cfg); got != "0.0.0.0" {
+		t.Fatalf("monitorListenHost() = %q; want configured host", got)
+	}
+}

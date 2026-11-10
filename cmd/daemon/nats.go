@@ -2,14 +2,16 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -72,9 +74,18 @@ func openNATS(cfg config.NATSConfig, monitorPassword string, readiness func(cont
 		proxy := httputil.NewSingleHostReverseProxy(target)
 		mux := http.NewServeMux()
 		mux.Handle("/", basicAuth(daemonMonitorHandler(readiness, proxy), monitorPassword))
+		monitorServer := &http.Server{
+			Addr:    net.JoinHostPort(monitorListenHost(cfg), strconv.Itoa(cfg.MonitorPort)),
+			Handler: mux,
+		}
 		go func() {
-			addr := fmt.Sprintf(":%d", cfg.MonitorPort)
-			if err := http.ListenAndServe(addr, mux); err != nil {
+			var err error
+			if strings.TrimSpace(cfg.MonitorTLSCertFile) != "" {
+				err = monitorServer.ListenAndServeTLS(cfg.MonitorTLSCertFile, cfg.MonitorTLSKeyFile)
+			} else {
+				err = monitorServer.ListenAndServe()
+			}
+			if err != nil && err != http.ErrServerClosed {
 				fmt.Printf("WARN: NATS monitoring server: %v\n", err)
 			}
 		}()
@@ -128,6 +139,14 @@ func daemonMonitorHandler(readiness func(context.Context) error, next http.Handl
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func monitorListenHost(cfg config.NATSConfig) string {
+	host := strings.TrimSpace(cfg.MonitorHost)
+	if host == "" {
+		return "127.0.0.1"
+	}
+	return host
 }
 
 func natsAuthOptions(cfg config.NATSConfig) []nats.Option {

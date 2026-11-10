@@ -45,6 +45,11 @@ func main() {
 	natsTLSServerName := flag.String("nats-tls-server-name", envOrDefault("NATS_TLS_SERVER_NAME", ""), "NATS TLS server name")
 	natsPort := flag.Int("nats-port", 4222, "Port for embedded NATS server")
 	natsMonPort := flag.Int("nats-monitor", 0, "Port for embedded NATS HTTP monitoring (0 to disable)")
+	natsMonHost := flag.String("nats-monitor-host", envOrDefault("NATS_MONITOR_HOST", ""), "Host for the NATS monitoring proxy")
+	natsMonTLSCert := flag.String("nats-monitor-tls-cert", envOrDefault("NATS_MONITOR_TLS_CERT_FILE", envOrDefault("NATS_TLS_CERT_FILE", "")), "NATS monitoring TLS certificate file")
+	natsMonTLSKey := flag.String("nats-monitor-tls-key", envOrDefault("NATS_MONITOR_TLS_KEY_FILE", envOrDefault("NATS_TLS_KEY_FILE", "")), "NATS monitoring TLS private key file")
+	natsMonPrivateNetworkOnly := flag.Bool("nats-monitor-private-network-only", envTruthy("NATS_MONITOR_PRIVATE_NETWORK_ONLY"), "Allow plain HTTP monitoring only on a private loopback binding")
+	natsMonLocalTestMode := flag.Bool("nats-monitor-local-test-mode", envTruthy("NATS_MONITOR_LOCAL_TEST_MODE"), "Allow plain HTTP monitoring for explicit local tests")
 	natsDataDir := flag.String("nats-data", "./nats-data", "JetStream data directory")
 	natsAckWait := flag.Duration("nats-ack-wait", 5*time.Minute, "JetStream delivery ACK wait")
 	natsMaxDeliver := flag.Int("nats-max-deliver", 10, "Maximum delivery attempts before local terminal failure")
@@ -102,23 +107,28 @@ func main() {
 		log.Fatal(err)
 	}
 	natsCfg := config.NATSConfig{
-		Mode:                 mode,
-		URL:                  *natsURL,
-		Username:             *natsUser,
-		Password:             *natsPassword,
-		AllowUnauthenticated: *natsAllowUnauthenticated,
-		LocalTestMode:        *natsLocalTestMode,
-		PrivateNetworkOnly:   *natsPrivateNetworkOnly,
-		TLSCertFile:          *natsTLSCert,
-		TLSKeyFile:           *natsTLSKey,
-		TLSCAFile:            *natsTLSCA,
-		TLSServerName:        *natsTLSServerName,
-		Port:                 *natsPort,
-		MonitorPort:          *natsMonPort,
-		DataDir:              *natsDataDir,
-		AckWait:              *natsAckWait,
-		MaxDeliver:           *natsMaxDeliver,
-		ReconcileInterval:    *tenantReconcileInterval,
+		Mode:                      mode,
+		URL:                       *natsURL,
+		Username:                  *natsUser,
+		Password:                  *natsPassword,
+		AllowUnauthenticated:      *natsAllowUnauthenticated,
+		LocalTestMode:             *natsLocalTestMode,
+		PrivateNetworkOnly:        *natsPrivateNetworkOnly,
+		TLSCertFile:               *natsTLSCert,
+		TLSKeyFile:                *natsTLSKey,
+		TLSCAFile:                 *natsTLSCA,
+		TLSServerName:             *natsTLSServerName,
+		Port:                      *natsPort,
+		MonitorPort:               *natsMonPort,
+		MonitorHost:               *natsMonHost,
+		MonitorTLSCertFile:        *natsMonTLSCert,
+		MonitorTLSKeyFile:         *natsMonTLSKey,
+		MonitorPrivateNetworkOnly: *natsMonPrivateNetworkOnly,
+		MonitorLocalTestMode:      *natsMonLocalTestMode,
+		DataDir:                   *natsDataDir,
+		AckWait:                   *natsAckWait,
+		MaxDeliver:                *natsMaxDeliver,
+		ReconcileInterval:         *tenantReconcileInterval,
 	}
 	var reconciler *daemonReconciler
 	readiness := func(ctx context.Context) error {
