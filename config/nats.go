@@ -32,14 +32,17 @@ func ParseNATSMode(value string) (NATSMode, error) {
 
 // NATSConfig contains the daemon's transport and delivery limits.
 type NATSConfig struct {
-	Mode              NATSMode
-	URL               string
-	Port              int
-	MonitorPort       int
-	DataDir           string
-	AckWait           time.Duration
-	MaxDeliver        int
-	ReconcileInterval time.Duration
+	Mode                 NATSMode
+	URL                  string
+	Username             string
+	Password             string
+	AllowUnauthenticated bool
+	Port                 int
+	MonitorPort          int
+	DataDir              string
+	AckWait              time.Duration
+	MaxDeliver           int
+	ReconcileInterval    time.Duration
 }
 
 // Validate checks ownership-specific configuration before any process starts.
@@ -63,6 +66,14 @@ func (c NATSConfig) Validate() error {
 	if c.ReconcileInterval <= 0 {
 		return fmt.Errorf("tenant reconciliation interval must be positive")
 	}
+	hasUsername := strings.TrimSpace(c.Username) != ""
+	hasPassword := strings.TrimSpace(c.Password) != ""
+	if hasUsername != hasPassword {
+		return fmt.Errorf("NATS username and password must be set together")
+	}
+	if c.AllowUnauthenticated && mode != NATSEmbedded {
+		return fmt.Errorf("unauthenticated NATS is only allowed in embedded mode")
+	}
 	if mode == NATSExternal {
 		if strings.TrimSpace(c.URL) == "" {
 			return fmt.Errorf("NATS URL is required in external mode")
@@ -74,9 +85,18 @@ func (c NATSConfig) Validate() error {
 		if parsed.Host == "" {
 			return fmt.Errorf("NATS URL must include a host in external mode")
 		}
+		urlHasAuth := parsed.User != nil && parsed.User.Username() != ""
+		if !c.AllowUnauthenticated && !hasUsername && !urlHasAuth {
+			return fmt.Errorf("NATS authentication is required in external mode")
+		}
 	}
-	if mode == NATSEmbedded && strings.TrimSpace(c.DataDir) == "" {
-		return fmt.Errorf("NATS data directory is required in embedded mode")
+	if mode == NATSEmbedded {
+		if strings.TrimSpace(c.DataDir) == "" {
+			return fmt.Errorf("NATS data directory is required in embedded mode")
+		}
+		if !c.AllowUnauthenticated && !hasUsername {
+			return fmt.Errorf("NATS username and password are required in embedded mode")
+		}
 	}
 	return nil
 }

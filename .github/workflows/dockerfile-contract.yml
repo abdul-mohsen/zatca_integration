@@ -51,4 +51,9 @@ jobs:
           DB_PASS: contract-only
           ENCRYPT_KEY: contract-only
           MONITOR_PASS: contract-only
+          NATS_USER: contract-user
+          NATS_PASSWORD: contract-password
         run: docker compose config --quiet
+
+      - name: Validate production NATS security contract
+        run: bash scripts/test-nats-compose.sh

@@ -9,7 +9,9 @@ import (
 func validNATSConfig(mode NATSMode) NATSConfig {
 	return NATSConfig{
 		Mode:              mode,
-		URL:               "nats://nats.example:4222",
+		URL:               "nats://nats-user:nats-password@nats.example:4222",
+		Username:          "nats-user",
+		Password:          "nats-password",
 		Port:              4222,
 		MonitorPort:       0,
 		DataDir:           "nats-data",
@@ -43,6 +45,43 @@ func TestEmbeddedNATSDoesNotNeedAnExternalURL(t *testing.T) {
 	cfg.URL = ""
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("embedded NATS was rejected without an external URL: %v", err)
+	}
+}
+
+func TestEmbeddedNATSRequiresCredentialsUnlessExplicitlyUnauthenticated(t *testing.T) {
+	cfg := validNATSConfig(NATSEmbedded)
+	cfg.Username = ""
+	cfg.Password = ""
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("embedded NATS without credentials was accepted")
+	}
+
+	cfg.AllowUnauthenticated = true
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("explicit local unauthenticated embedded NATS was rejected: %v", err)
+	}
+}
+
+func TestExternalNATSAcceptsCredentialsInURL(t *testing.T) {
+	cfg := validNATSConfig(NATSExternal)
+	cfg.Username = ""
+	cfg.Password = ""
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("external NATS URL credentials were rejected: %v", err)
+	}
+}
+
+func TestNATSConfigRejectsPartialCredentialsAndExternalUnauthenticatedOptIn(t *testing.T) {
+	cfg := validNATSConfig(NATSEmbedded)
+	cfg.Password = ""
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "set together") {
+		t.Fatalf("Validate() = %v; want a paired-credential error", err)
+	}
+
+	cfg = validNATSConfig(NATSExternal)
+	cfg.AllowUnauthenticated = true
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "embedded mode") {
+		t.Fatalf("Validate() = %v; want embedded-only unauthenticated error", err)
 	}
 }
 

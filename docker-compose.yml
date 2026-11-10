@@ -2,7 +2,8 @@ version: "3.8"
 
 # Variables below are interpolated from a `.env` file in this directory.
 # See `.env.example` for the full list. Required at runtime: DB_PASS,
-# ENCRYPT_KEY, MONITOR_PASS; ZATCA_SDK_PATH is required when building.
+# ENCRYPT_KEY, MONITOR_PASS, NATS_USER, NATS_PASSWORD; ZATCA_SDK_PATH is
+# required when building.
 
 services:
   zatca-daemon:
@@ -34,6 +35,11 @@ services:
       # --- Encryption key for sensitive ZATCA credentials (required) ---
       # Generate with: openssl rand -base64 32
       ENCRYPT_KEY: ${ENCRYPT_KEY:?ENCRYPT_KEY must be set in .env}
+
+      # --- NATS client authentication (required; never enable unauthenticated mode here) ---
+      NATS_USER: ${NATS_USER:?NATS_USER must be set in .env}
+      NATS_PASSWORD: ${NATS_PASSWORD:?NATS_PASSWORD must be set in .env}
+      NATS_ALLOW_UNAUTHENTICATED: "false"
 
       # --- NATS monitoring password (required if port 8222 is exposed) ---
       MONITOR_PASS: ${MONITOR_PASS:?MONITOR_PASS must be set in .env}
