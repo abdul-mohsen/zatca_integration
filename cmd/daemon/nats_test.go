@@ -21,7 +21,7 @@ func TestOpenNATSEmbeddedUsesConfiguredCredentials(t *testing.T) {
 		MaxDeliver:         1,
 		ReconcileInterval:  time.Minute,
 	}
-	runtime, err := openNATS(cfg, "")
+	runtime, err := openNATS(cfg, "", nil)
 	if err != nil {
 		t.Fatalf("openNATS() error = %v", err)
 	}
@@ -55,7 +55,7 @@ func TestOpenNATSAllowsUnauthenticatedOnlyForExplicitLocalTestMode(t *testing.T)
 		MaxDeliver:           1,
 		ReconcileInterval:    time.Minute,
 	}
-	runtime, err := openNATS(cfg, "")
+	runtime, err := openNATS(cfg, "", nil)
 	if err != nil {
 		t.Fatalf("openNATS() error = %v", err)
 	}
