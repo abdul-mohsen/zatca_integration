@@ -17,42 +17,36 @@ grep -Fq 'NATS_ALLOW_UNAUTHENTICATED: "false"' "$compose_file" ||
     fail "production Compose must disable unauthenticated NATS explicitly"
 grep -Fq 'NATS_LOCAL_TEST_MODE: "false"' "$compose_file" ||
     fail "production Compose must disable local test mode explicitly"
-grep -Fq 'NATS_PRIVATE_NETWORK_ONLY: "false"' "$compose_file" ||
-    fail "production Compose must not rely on an undeclared private network"
-grep -Fq 'NATS_TLS_CERT_FILE: /run/nats/tls/server.crt' "$compose_file" ||
-    fail "production Compose must configure the NATS TLS certificate"
-grep -Fq 'NATS_TLS_KEY_FILE: /run/nats/tls/server.key' "$compose_file" ||
-    fail "production Compose must configure the NATS TLS key"
-grep -Fq 'NATS_TLS_CA_FILE: /run/nats/tls/ca.crt' "$compose_file" ||
-    fail "production Compose must configure the NATS TLS CA"
+grep -Fq 'NATS_PRIVATE_NETWORK_ONLY: ${NATS_PRIVATE_NETWORK_ONLY:-false}' "$compose_file" ||
+    fail "Compose must pass through the explicit private-network flag with TLS as the default"
+grep -Fq 'NATS_TLS_CERT_FILE: ${NATS_TLS_CERT_FILE:+/run/nats/tls/server.crt}' "$compose_file" ||
+    fail "Compose must leave the NATS TLS certificate unset when no host cert is configured"
+grep -Fq 'NATS_TLS_KEY_FILE: ${NATS_TLS_KEY_FILE:+/run/nats/tls/server.key}' "$compose_file" ||
+    fail "Compose must leave the NATS TLS key unset when no host key is configured"
+grep -Fq 'NATS_TLS_CA_FILE: ${NATS_TLS_CA_FILE:+/run/nats/tls/ca.crt}' "$compose_file" ||
+    fail "Compose must leave the NATS TLS CA unset when no host CA is configured"
 grep -Fq 'NATS_TLS_SERVER_NAME:' "$compose_file" ||
     fail "production Compose must configure the NATS TLS server name"
 grep -Fq 'NATS_MONITOR_HOST: ${NATS_MONITOR_HOST:-0.0.0.0}' "$compose_file" ||
     fail "production Compose must declare the NATS monitor host"
-grep -Fq 'NATS_MONITOR_PRIVATE_NETWORK_ONLY: "false"' "$compose_file" ||
-    fail "production Compose must not rely on private-only monitor mode"
-grep -Fq 'NATS_MONITOR_LOCAL_TEST_MODE: "false"' "$compose_file" ||
+grep -Fq 'NATS_MONITOR_PRIVATE_NETWORK_ONLY: ${NATS_PRIVATE_NETWORK_ONLY:-false}' "$compose_file" ||
+    fail "Compose must align private monitor transport with the explicit private-network mode"
+grep -Fq 'NATS_MONITOR_LOCAL_TEST_MODE: ${NATS_MONITOR_LOCAL_TEST_MODE:-false}' "$compose_file" ||
     fail "production Compose must disable monitor local test mode explicitly"
-grep -Fq 'NATS_MONITOR_TLS_CERT_FILE: /run/nats/tls/server.crt' "$compose_file" ||
-    fail "production Compose must configure the monitor TLS certificate"
-grep -Fq 'NATS_MONITOR_TLS_KEY_FILE: /run/nats/tls/server.key' "$compose_file" ||
-    fail "production Compose must configure the monitor TLS key"
-grep -Fq ':/run/nats/tls/server.crt:ro' "$compose_file" ||
-    fail "production Compose must mount the NATS TLS certificate read-only"
-grep -Fq ':/run/nats/tls/server.key:ro' "$compose_file" ||
-    fail "production Compose must mount the NATS TLS key read-only"
-grep -Fq ':/run/nats/tls/ca.crt:ro' "$compose_file" ||
-    fail "production Compose must mount the NATS TLS CA read-only"
+grep -Fq 'NATS_MONITOR_TLS_CERT_FILE: ${NATS_TLS_CERT_FILE:+/run/nats/tls/server.crt}' "$compose_file" ||
+    fail "Compose must leave monitor TLS unset when no host certificate is configured"
+grep -Fq 'NATS_MONITOR_TLS_KEY_FILE: ${NATS_TLS_KEY_FILE:+/run/nats/tls/server.key}' "$compose_file" ||
+    fail "Compose must leave monitor TLS unset when no host key is configured"
+grep -Fq '${NATS_TLS_CERT_FILE:-/dev/null}:/run/nats/tls/server.crt:ro' "$compose_file" ||
+    fail "Compose must make the NATS TLS certificate mount optional"
+grep -Fq '${NATS_TLS_KEY_FILE:-/dev/null}:/run/nats/tls/server.key:ro' "$compose_file" ||
+    fail "Compose must make the NATS TLS key mount optional"
+grep -Fq '${NATS_TLS_CA_FILE:-/dev/null}:/run/nats/tls/ca.crt:ro' "$compose_file" ||
+    fail "Compose must make the NATS TLS CA mount optional"
 grep -Fq '"${NATS_PORT:-4222}:4222"' "$compose_file" ||
     fail "production Compose must retain the deployment-compatible NATS port"
 grep -Fq '"${NATS_MONITOR_PORT:-8222}:8222"' "$compose_file" ||
-    fail "production Compose must retain the TLS-protected monitor port"
-grep -Fq 'https://localhost:8222' "$compose_file" ||
-    fail "production Compose must document the monitor as HTTPS"
-
-if grep -Fq 'http://localhost:8222' "$compose_file"; then
-    fail "production Compose must not document a plain HTTP monitor endpoint"
-fi
+    fail "Compose must retain the monitor port mapping"
 
 if grep -Fq 'NATS_ALLOW_UNAUTHENTICATED: "true"' "$compose_file"; then
     fail "production Compose must not enable unauthenticated NATS"
@@ -60,11 +54,7 @@ fi
 if grep -Fq 'NATS_LOCAL_TEST_MODE: "true"' "$compose_file"; then
     fail "production Compose must not enable local test mode"
 fi
-if grep -Fq 'NATS_MONITOR_LOCAL_TEST_MODE: "true"' "$compose_file"; then
-    fail "production Compose must not enable monitor local test mode"
-fi
-
-if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
     (
         cd "$repo_dir"
         ZATCA_SDK_PATH="$repo_dir" \
@@ -76,6 +66,22 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
         NATS_TLS_CERT_FILE="$repo_dir/testdata/nats-server.crt" \
         NATS_TLS_KEY_FILE="$repo_dir/testdata/nats-server.key" \
         NATS_TLS_CA_FILE="$repo_dir/testdata/nats-ca.crt" \
+        NATS_PRIVATE_NETWORK_ONLY=false \
+        docker compose config --quiet
+    )
+    (
+        cd "$repo_dir"
+        ZATCA_SDK_PATH="$repo_dir" \
+        DB_PASS=contract-only \
+        ENCRYPT_KEY=contract-only \
+        MONITOR_PASS=contract-only \
+        NATS_USER=contract-user \
+        NATS_PASSWORD=contract-password \
+        NATS_PRIVATE_NETWORK_ONLY=true \
+        NATS_TLS_CERT_FILE= \
+        NATS_TLS_KEY_FILE= \
+        NATS_TLS_CA_FILE= \
+        NATS_MONITOR_PRIVATE_NETWORK_ONLY= \
         docker compose config --quiet
     )
 fi
