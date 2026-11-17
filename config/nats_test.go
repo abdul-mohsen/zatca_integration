@@ -49,6 +49,30 @@ func TestEmbeddedNATSDoesNotNeedAnExternalURL(t *testing.T) {
 	}
 }
 
+func TestEmbeddedNATSRequiresTLSUnlessPrivateNetworkOnly(t *testing.T) {
+	cfg := validNATSConfig(NATSEmbedded)
+	cfg.PrivateNetworkOnly = false
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "requires TLS or private-network-only") {
+		t.Fatalf("Validate() = %v; want TLS requirement in default mode", err)
+	}
+
+	cfg.TLSCertFile = "server.crt"
+	cfg.TLSKeyFile = "server.key"
+	cfg.TLSCAFile = "ca.crt"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("default mode rejected complete TLS configuration: %v", err)
+	}
+}
+
+func TestPrivateEmbeddedNATSStillRequiresCredentials(t *testing.T) {
+	cfg := validNATSConfig(NATSEmbedded)
+	cfg.Username = ""
+	cfg.Password = ""
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "username and password are required") {
+		t.Fatalf("Validate() = %v; want credentials required in private mode", err)
+	}
+}
+
 func TestEmbeddedNATSRequiresCredentialsUnlessExplicitlyUnauthenticated(t *testing.T) {
 	cfg := validNATSConfig(NATSEmbedded)
 	cfg.PrivateNetworkOnly = false
@@ -163,7 +187,7 @@ func TestNATSConfigRequiresTLSForNonLocalMonitor(t *testing.T) {
 	}
 
 	cfg.MonitorLocalTestMode = true
-	cfg.MonitorPrivateNetworkOnly = true
+	cfg.MonitorPrivateNetworkOnly = false
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "loopback") {
 		t.Fatalf("Validate() = %v; want loopback binding error", err)
 	}
@@ -171,6 +195,18 @@ func TestNATSConfigRequiresTLSForNonLocalMonitor(t *testing.T) {
 	cfg.MonitorHost = "127.0.0.1"
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("explicit private local monitor was rejected: %v", err)
+	}
+}
+
+func TestNATSConfigAllowsPlainMonitorOnDeclaredPrivateNetwork(t *testing.T) {
+	cfg := validNATSConfig(NATSEmbedded)
+	cfg.MonitorPort = 8222
+	cfg.MonitorHost = "0.0.0.0"
+	cfg.MonitorPrivateNetworkOnly = true
+	cfg.MonitorLocalTestMode = false
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("private-network monitor was rejected: %v", err)
 	}
 }
 
