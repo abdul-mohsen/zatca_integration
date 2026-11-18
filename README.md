@@ -28,6 +28,33 @@ A production-ready Go daemon for Saudi Arabia's ZATCA (Zakat, Tax and Customs Au
 - **Redelivery** - JetStream redelivers an unacknowledged document. The claim and the invoice chain make a redelivery safe
 - **Email alerts** — sends failure notifications after exhausting retries
 
+Tenant reconciliation is isolated: a tenant with an outdated schema is logged
+and retried without stopping workers for other ready tenants. The authenticated
+`/healthz` response is a JSON readiness report with global and per-tenant
+status. Global tenant-registry discovery failure, a tenant with failed or
+incomplete branch discovery, missing expected workers/responders, or no active
+workers makes readiness unhealthy even if an older tenant is still active.
+An isolated tenant schema startup failure is reported as degraded when another
+tenant remains healthy; it does not stop that healthy worker. A successful
+branch discovery returning no active branches is distinct from a failed
+discovery.
+
+## Embedded NATS deployment gate
+
+Production embedded NATS startup requires `NATS_PRIVATE_NETWORK_FIREWALL_CONFIRMED=true`,
+`NATS_SHARED_CREDENTIALS_ACKNOWLEDGED=true`, a non-empty
+`NATS_SHARED_CREDENTIALS_APPROVAL_ID`, and a future
+`NATS_SHARED_CREDENTIALS_EXPIRES=YYYY-MM-DD`. These values are an operator
+approval gate; the daemon cannot inspect the host firewall and does not
+interpret the confirmation as proof that the published port is restricted.
+The deployment Compose port is published on all host addresses unless the host
+firewall restricts it.
+
+The embedded server currently configures one NATS user without per-tenant
+subject permissions. Backend tenant apps sharing that user share a NATS trust
+boundary; this is not per-tenant subject isolation. Explicit local test mode is
+the only mode that skips the deployment approval gate.
+
 ## Prerequisites
 
 - Docker

@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/subtle"
 	"database/sql"
-	"errors"
 	"flag"
 	"log"
 	"net/http"
@@ -107,35 +106,42 @@ func main() {
 		log.Fatal(err)
 	}
 	natsCfg := config.NATSConfig{
-		Mode:                      mode,
-		URL:                       *natsURL,
-		Username:                  *natsUser,
-		Password:                  *natsPassword,
-		AllowUnauthenticated:      *natsAllowUnauthenticated,
-		LocalTestMode:             *natsLocalTestMode,
-		PrivateNetworkOnly:        *natsPrivateNetworkOnly,
-		TLSCertFile:               *natsTLSCert,
-		TLSKeyFile:                *natsTLSKey,
-		TLSCAFile:                 *natsTLSCA,
-		TLSServerName:             *natsTLSServerName,
-		Port:                      *natsPort,
-		MonitorPort:               *natsMonPort,
-		MonitorHost:               *natsMonHost,
-		MonitorTLSCertFile:        *natsMonTLSCert,
-		MonitorTLSKeyFile:         *natsMonTLSKey,
-		MonitorPrivateNetworkOnly: *natsMonPrivateNetworkOnly,
-		MonitorLocalTestMode:      *natsMonLocalTestMode,
-		DataDir:                   *natsDataDir,
-		AckWait:                   *natsAckWait,
-		MaxDeliver:                *natsMaxDeliver,
-		ReconcileInterval:         *tenantReconcileInterval,
+		Mode:                            mode,
+		URL:                             *natsURL,
+		Username:                        *natsUser,
+		Password:                        *natsPassword,
+		AllowUnauthenticated:            *natsAllowUnauthenticated,
+		LocalTestMode:                   *natsLocalTestMode,
+		PrivateNetworkOnly:              *natsPrivateNetworkOnly,
+		PrivateNetworkFirewallConfirmed: envTruthy("NATS_PRIVATE_NETWORK_FIREWALL_CONFIRMED"),
+		SharedCredentialsAcknowledged:   envTruthy("NATS_SHARED_CREDENTIALS_ACKNOWLEDGED"),
+		SharedCredentialsApprovalID:     envOrDefault("NATS_SHARED_CREDENTIALS_APPROVAL_ID", ""),
+		SharedCredentialsExpires:        envOrDefault("NATS_SHARED_CREDENTIALS_EXPIRES", ""),
+		TLSCertFile:                     *natsTLSCert,
+		TLSKeyFile:                      *natsTLSKey,
+		TLSCAFile:                       *natsTLSCA,
+		TLSServerName:                   *natsTLSServerName,
+		Port:                            *natsPort,
+		MonitorPort:                     *natsMonPort,
+		MonitorHost:                     *natsMonHost,
+		MonitorTLSCertFile:              *natsMonTLSCert,
+		MonitorTLSKeyFile:               *natsMonTLSKey,
+		MonitorPrivateNetworkOnly:       *natsMonPrivateNetworkOnly,
+		MonitorLocalTestMode:            *natsMonLocalTestMode,
+		DataDir:                         *natsDataDir,
+		AckWait:                         *natsAckWait,
+		MaxDeliver:                      *natsMaxDeliver,
+		ReconcileInterval:               *tenantReconcileInterval,
 	}
 	var reconciler *daemonReconciler
-	readiness := func(ctx context.Context) error {
+	readiness := func(ctx context.Context) daemonReadinessReport {
 		if reconciler == nil {
-			return errors.New("daemon reconciliation has not started")
+			return daemonReadinessReport{
+				Status: "unhealthy",
+				Error:  "daemon reconciliation has not started",
+			}
 		}
-		return reconciler.checkReadiness(ctx)
+		return reconciler.readinessReport(ctx)
 	}
 	natsRT, err := openNATS(natsCfg, os.Getenv("MONITOR_PASS"), readiness)
 	if err != nil {
@@ -188,7 +194,7 @@ func main() {
 	)
 	reconciler.providerEndpoint = *providerEndpoint
 	if err := reconciler.reconcile(ctx); err != nil {
-		log.Fatalf("initial tenant reconciliation: %v", err)
+		log.Printf("WARN: initial tenant reconciliation had failures; continuing with tenants that started: %v", err)
 	}
 	go reconciler.loop(*tenantReconcileInterval)
 
