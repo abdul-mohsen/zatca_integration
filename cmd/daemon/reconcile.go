@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -32,6 +33,33 @@ type workerHandle struct {
 	done   <-chan struct{}
 }
 
+type tenantReconcileStatus struct {
+	tenant                  tenant.Tenant
+	startupErr              error
+	branchDiscoveryComplete bool
+	branchDiscoveryErr      error
+}
+
+type tenantReadinessReport struct {
+	Tenant           string  `json:"tenant"`
+	Database         string  `json:"database"`
+	Status           string  `json:"status"`
+	Ready            bool    `json:"ready"`
+	BranchDiscovery  string  `json:"branch_discovery"`
+	ExpectedBranches []int64 `json:"expected_branches"`
+	ActiveWorkers    int     `json:"active_workers"`
+	Error            string  `json:"error,omitempty"`
+}
+
+type daemonReadinessReport struct {
+	Status        string                  `json:"status"`
+	Ready         bool                    `json:"ready"`
+	GlobalError   string                  `json:"global_error,omitempty"`
+	ActiveWorkers int                     `json:"active_workers"`
+	Tenants       []tenantReadinessReport `json:"tenants"`
+	Error         string                  `json:"error,omitempty"`
+}
+
 // daemonReconciler owns the live tenant and branch topology. The master
 // registry is the only discovery source; NATS messages never create tenants.
 type daemonReconciler struct {
@@ -49,16 +77,17 @@ type daemonReconciler struct {
 	providerFactory  processor.ProviderFactory
 	providerEndpoint string
 
-	reconcileMu sync.Mutex
-	mu          sync.RWMutex
-	tenants     map[string]*tenantCtx
-	workers     map[string]workerHandle
-	subs        map[string]*nats.Subscription
-	caches      map[string]map[int64]*branchEntry
-	registry    *tenant.Registry
+	reconcileMu     sync.Mutex
+	mu              sync.RWMutex
+	tenants         map[string]*tenantCtx
+	workers         map[string]workerHandle
+	subs            map[string]*nats.Subscription
+	caches          map[string]map[int64]*branchEntry
+	registry        *tenant.Registry
+	tenantReadiness map[string]tenantReconcileStatus
 
-	lastReconcileAt  time.Time
-	lastReconcileErr error
+	lastReconcileAt        time.Time
+	lastGlobalReconcileErr error
 }
 
 func newDaemonReconciler(
@@ -74,22 +103,23 @@ func newDaemonReconciler(
 ) *daemonReconciler {
 	childCtx, cancel := context.WithCancel(ctx)
 	return &daemonReconciler{
-		ctx:        childCtx,
-		cancel:     cancel,
-		masterDB:   masterDB,
-		baseDSN:    baseDSN,
-		adminDSN:   adminDSN,
-		encKey:     encKey,
-		nc:         nc,
-		js:         js,
-		wg:         wg,
-		ackWait:    ackWait,
-		maxDeliver: maxDeliver,
-		tenants:    make(map[string]*tenantCtx),
-		workers:    make(map[string]workerHandle),
-		subs:       make(map[string]*nats.Subscription),
-		caches:     make(map[string]map[int64]*branchEntry),
-		registry:   tenant.NewRegistry(),
+		ctx:             childCtx,
+		cancel:          cancel,
+		masterDB:        masterDB,
+		baseDSN:         baseDSN,
+		adminDSN:        adminDSN,
+		encKey:          encKey,
+		nc:              nc,
+		js:              js,
+		wg:              wg,
+		ackWait:         ackWait,
+		maxDeliver:      maxDeliver,
+		tenants:         make(map[string]*tenantCtx),
+		workers:         make(map[string]workerHandle),
+		subs:            make(map[string]*nats.Subscription),
+		caches:          make(map[string]map[int64]*branchEntry),
+		registry:        tenant.NewRegistry(),
+		tenantReadiness: make(map[string]tenantReconcileStatus),
 	}
 }
 
@@ -145,21 +175,24 @@ func (r *daemonReconciler) getService(dbName string, branchID int64) (*zatca.Ser
 	return svc, branchCfg, nil
 }
 
-func (r *daemonReconciler) reconcile(ctx context.Context) (reconcileErr error) {
+func (r *daemonReconciler) reconcile(ctx context.Context) error {
 	r.reconcileMu.Lock()
 	defer r.reconcileMu.Unlock()
+	var globalReconcileErr error
 	defer func() {
 		r.mu.Lock()
 		r.lastReconcileAt = time.Now()
-		r.lastReconcileErr = reconcileErr
+		r.lastGlobalReconcileErr = globalReconcileErr
 		r.mu.Unlock()
 	}()
 
 	discovered, err := tenant.LoadAllContext(ctx, r.masterDB)
 	if err != nil {
+		globalReconcileErr = fmt.Errorf("load tenant registry: %w", err)
 		return err
 	}
 	if _, err := r.registry.Reconcile(discovered); err != nil {
+		globalReconcileErr = fmt.Errorf("reconcile tenant registry: %w", err)
 		return err
 	}
 
@@ -186,6 +219,8 @@ func (r *daemonReconciler) reconcile(ctx context.Context) (reconcileErr error) {
 		}
 	}
 
+	r.syncTenantReadiness(discovered)
+
 	var failures []error
 	for _, target := range discovered {
 		r.mu.RLock()
@@ -193,7 +228,10 @@ func (r *daemonReconciler) reconcile(ctx context.Context) (reconcileErr error) {
 		r.mu.RUnlock()
 		if !exists {
 			if err := r.addTenant(target); err != nil {
+				r.recordTenantStartupError(target, err)
 				failures = append(failures, fmt.Errorf("tenant %s (%s) failed to start: %w", target.Name, target.DBName, err))
+			} else {
+				r.recordTenantStartupError(target, nil)
 			}
 		}
 	}
@@ -211,6 +249,55 @@ func (r *daemonReconciler) reconcile(ctx context.Context) (reconcileErr error) {
 		}
 	}
 	return errors.Join(failures...)
+}
+
+func (r *daemonReconciler) syncTenantReadiness(discovered []tenant.Tenant) {
+	desired := make(map[string]tenant.Tenant, len(discovered))
+	for _, current := range discovered {
+		desired[current.DBName] = current
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for dbName, status := range r.tenantReadiness {
+		target, exists := desired[dbName]
+		if !exists || status.tenant.TenantKey != target.TenantKey {
+			delete(r.tenantReadiness, dbName)
+		}
+	}
+	for dbName, target := range desired {
+		status, exists := r.tenantReadiness[dbName]
+		if !exists {
+			status = tenantReconcileStatus{tenant: target}
+		} else {
+			status.tenant = target
+		}
+		r.tenantReadiness[dbName] = status
+	}
+}
+
+func (r *daemonReconciler) recordTenantStartupError(t tenant.Tenant, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	status := r.tenantReadiness[t.DBName]
+	status.tenant = t
+	status.startupErr = err
+	if err != nil {
+		status.branchDiscoveryComplete = false
+		status.branchDiscoveryErr = nil
+	}
+	r.tenantReadiness[t.DBName] = status
+}
+
+func (r *daemonReconciler) recordBranchDiscovery(t tenant.Tenant, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	status := r.tenantReadiness[t.DBName]
+	status.tenant = t
+	status.startupErr = nil
+	status.branchDiscoveryComplete = err == nil
+	status.branchDiscoveryErr = err
+	r.tenantReadiness[t.DBName] = status
 }
 
 func (r *daemonReconciler) addTenant(t tenant.Tenant) error {
@@ -287,6 +374,7 @@ func (r *daemonReconciler) removeTenant(dbName string) {
 	}
 	delete(r.tenants, dbName)
 	delete(r.caches, dbName)
+	delete(r.tenantReadiness, dbName)
 	var workers []workerHandle
 	prefix := dbName + ":"
 	for key, worker := range r.workers {
@@ -330,6 +418,7 @@ func (r *daemonReconciler) removeTenant(dbName string) {
 func (r *daemonReconciler) reconcileBranches(ctx context.Context, tc *tenantCtx) error {
 	branches, err := processor.QueryActiveBranches(tc.db)
 	if err != nil {
+		r.recordBranchDiscovery(tc.tenant, err)
 		return fmt.Errorf("query active branches: %w", err)
 	}
 	active := make(map[int64]bool, len(branches))
@@ -367,6 +456,7 @@ func (r *daemonReconciler) reconcileBranches(ctx context.Context, tc *tenantCtx)
 	if len(branches) == 0 {
 		log.Printf("NOTE: no active branches in %s", tc.tenant.Name)
 	}
+	r.recordBranchDiscovery(tc.tenant, nil)
 	_ = ctx
 	return nil
 }
@@ -423,13 +513,17 @@ func (r *daemonReconciler) loop(interval time.Duration) {
 	}
 }
 
-func (r *daemonReconciler) checkReadiness(context.Context) error {
+func (r *daemonReconciler) readinessReport(context.Context) daemonReadinessReport {
 	r.mu.RLock()
 	reconciledAt := r.lastReconcileAt
-	reconcileErr := r.lastReconcileErr
-	tenants := make([]*tenantCtx, 0, len(r.tenants))
-	for _, tc := range r.tenants {
-		tenants = append(tenants, tc)
+	globalReconcileErr := r.lastGlobalReconcileErr
+	tenants := make(map[string]*tenantCtx, len(r.tenants))
+	for dbName, tc := range r.tenants {
+		tenants[dbName] = tc
+	}
+	tenantStatuses := make(map[string]tenantReconcileStatus, len(r.tenantReadiness))
+	for dbName, status := range r.tenantReadiness {
+		tenantStatuses[dbName] = status
 	}
 	workers := make(map[string]workerHandle, len(r.workers))
 	for key, worker := range r.workers {
@@ -442,42 +536,160 @@ func (r *daemonReconciler) checkReadiness(context.Context) error {
 	js := r.js
 	r.mu.RUnlock()
 
-	if reconciledAt.IsZero() {
-		return errors.New("tenant reconciliation has not completed")
+	report := daemonReadinessReport{
+		Status:  "healthy",
+		Ready:   true,
+		Tenants: make([]tenantReadinessReport, 0, len(tenantStatuses)+len(tenants)),
 	}
-	if reconcileErr != nil && len(tenants) == 0 {
-		return fmt.Errorf("tenant reconciliation is unhealthy: %w", reconcileErr)
+	var readinessErrors []string
+	if reconciledAt.IsZero() {
+		report.Ready = false
+		readinessErrors = append(readinessErrors, "tenant reconciliation has not completed")
+	}
+	if globalReconcileErr != nil {
+		report.Ready = false
+		report.GlobalError = globalReconcileErr.Error()
+		readinessErrors = append(readinessErrors,
+			fmt.Sprintf("global tenant discovery is unhealthy: %v", globalReconcileErr))
 	}
 
-	var missing []string
-	for _, tc := range tenants {
-		if sub := subs["onboard:"+tc.tenant.DBName]; sub == nil || !sub.IsValid() {
-			missing = append(missing, fmt.Sprintf("onboarding responder for tenant %s", tc.tenant.DBName))
+	activeWorkers := 0
+	activeWorkersByTenant := make(map[string]int, len(tenants))
+
+	for key, worker := range workers {
+		if workerStopped(worker.done) {
+			continue
 		}
-		if sub := subs["reconcile:"+tc.tenant.TenantKey]; sub == nil || !sub.IsValid() {
-			missing = append(missing, fmt.Sprintf("reconciliation responder for tenant %s", tc.tenant.TenantKey))
-		}
-		for _, branchID := range tc.expectedBranchSnapshot() {
-			key := branchKey(tc.tenant.DBName, branchID)
-			worker, ok := workers[key]
-			if !ok || workerStopped(worker.done) {
-				missing = append(missing, fmt.Sprintf("worker for %s branch %d", tc.tenant.DBName, branchID))
-				continue
-			}
-			if js == nil {
-				missing = append(missing, fmt.Sprintf("JetStream consumer for %s branch %d", tc.tenant.DBName, branchID))
-				continue
-			}
-			if _, err := js.ConsumerInfo(queue.StreamName, queue.OrderedConsumerName(tc.tenant.DBName, branchID)); err != nil {
-				missing = append(missing, fmt.Sprintf("JetStream consumer for %s branch %d: %v",
-					tc.tenant.DBName, branchID, err))
-			}
+		activeWorkers++
+		if separator := strings.LastIndexByte(key, ':'); separator > 0 {
+			activeWorkersByTenant[key[:separator]]++
 		}
 	}
-	if len(missing) > 0 {
-		return fmt.Errorf("daemon readiness is unhealthy; missing expected consumers: %s", strings.Join(missing, "; "))
+	report.ActiveWorkers = activeWorkers
+	if len(tenants) == 0 {
+		report.Ready = false
+		readinessErrors = append(readinessErrors, "daemon has no active tenants")
 	}
-	return nil
+	if activeWorkers == 0 {
+		report.Ready = false
+		readinessErrors = append(readinessErrors, "daemon has no active tenant workers")
+	}
+
+	tenantNames := make([]string, 0, len(tenantStatuses)+len(tenants))
+	seenTenants := make(map[string]struct{}, len(tenantStatuses)+len(tenants))
+	for dbName := range tenantStatuses {
+		tenantNames = append(tenantNames, dbName)
+		seenTenants[dbName] = struct{}{}
+	}
+	for dbName := range tenants {
+		if _, exists := seenTenants[dbName]; !exists {
+			tenantNames = append(tenantNames, dbName)
+		}
+	}
+	sort.Strings(tenantNames)
+
+	degraded := false
+	for _, dbName := range tenantNames {
+		status, hasStatus := tenantStatuses[dbName]
+		tc := tenants[dbName]
+		if !hasStatus && tc != nil {
+			status.tenant = tc.tenant
+		}
+		tenantReport := tenantReadinessReport{
+			Tenant:           status.tenant.Name,
+			Database:         dbName,
+			Status:           "unhealthy",
+			Ready:            false,
+			BranchDiscovery:  "pending",
+			ExpectedBranches: []int64{},
+			ActiveWorkers:    activeWorkersByTenant[dbName],
+		}
+		if tenantReport.Tenant == "" {
+			tenantReport.Tenant = dbName
+		}
+		switch {
+		case status.startupErr != nil:
+			tenantReport.Status = "degraded"
+			tenantReport.Error = status.startupErr.Error()
+			degraded = true
+		case status.branchDiscoveryErr != nil:
+			tenantReport.BranchDiscovery = "failed"
+			tenantReport.Error = status.branchDiscoveryErr.Error()
+			report.Ready = false
+			readinessErrors = append(readinessErrors,
+				fmt.Sprintf("branch discovery for tenant %s failed: %v", dbName, status.branchDiscoveryErr))
+		case !status.branchDiscoveryComplete:
+			tenantReport.Error = "branch discovery has not completed"
+			report.Ready = false
+			readinessErrors = append(readinessErrors,
+				fmt.Sprintf("branch discovery for tenant %s has not completed", dbName))
+		case tc == nil:
+			tenantReport.BranchDiscovery = "complete"
+			tenantReport.Error = "tenant context is not active"
+			report.Ready = false
+			readinessErrors = append(readinessErrors,
+				fmt.Sprintf("tenant %s context is not active", dbName))
+		default:
+			tenantReport.BranchDiscovery = "complete"
+			branches := tc.expectedBranchSnapshot()
+			sort.Slice(branches, func(i, j int) bool { return branches[i] < branches[j] })
+			tenantReport.ExpectedBranches = branches
+			var tenantErrors []string
+			if sub := subs["onboard:"+dbName]; sub == nil || !sub.IsValid() {
+				tenantErrors = append(tenantErrors, fmt.Sprintf("onboarding responder for tenant %s", dbName))
+			}
+			if sub := subs["reconcile:"+tc.tenant.TenantKey]; sub == nil || !sub.IsValid() {
+				tenantErrors = append(tenantErrors, fmt.Sprintf("reconciliation responder for tenant %s", tc.tenant.TenantKey))
+			}
+			for _, branchID := range branches {
+				key := branchKey(dbName, branchID)
+				worker, exists := workers[key]
+				if !exists || workerStopped(worker.done) {
+					tenantErrors = append(tenantErrors, fmt.Sprintf("worker for %s branch %d", dbName, branchID))
+					continue
+				}
+				if js == nil {
+					tenantErrors = append(tenantErrors, fmt.Sprintf("JetStream consumer for %s branch %d", dbName, branchID))
+					continue
+				}
+				if _, err := js.ConsumerInfo(queue.StreamName, queue.OrderedConsumerName(dbName, branchID)); err != nil {
+					tenantErrors = append(tenantErrors,
+						fmt.Sprintf("JetStream consumer for %s branch %d: %v", dbName, branchID, err))
+				}
+			}
+			if len(tenantErrors) > 0 {
+				tenantReport.Error = strings.Join(tenantErrors, "; ")
+				report.Ready = false
+				readinessErrors = append(readinessErrors, tenantReport.Error)
+			} else {
+				tenantReport.Status = "ready"
+				tenantReport.Ready = true
+			}
+		}
+		report.Tenants = append(report.Tenants, tenantReport)
+	}
+
+	switch {
+	case !report.Ready:
+		report.Status = "unhealthy"
+	case degraded:
+		report.Status = "degraded"
+	}
+	if len(readinessErrors) > 0 {
+		report.Error = strings.Join(readinessErrors, "; ")
+	}
+	return report
+}
+
+func (r *daemonReconciler) checkReadiness(ctx context.Context) error {
+	report := r.readinessReport(ctx)
+	if report.Ready {
+		return nil
+	}
+	if report.Error == "" {
+		return errors.New("daemon readiness is unhealthy")
+	}
+	return errors.New(report.Error)
 }
 
 func workerStopped(done <-chan struct{}) bool {

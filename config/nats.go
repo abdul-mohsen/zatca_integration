@@ -33,28 +33,32 @@ func ParseNATSMode(value string) (NATSMode, error) {
 
 // NATSConfig contains the daemon's transport and delivery limits.
 type NATSConfig struct {
-	Mode                      NATSMode
-	URL                       string
-	Username                  string
-	Password                  string
-	AllowUnauthenticated      bool
-	LocalTestMode             bool
-	PrivateNetworkOnly        bool
-	TLSCertFile               string
-	TLSKeyFile                string
-	TLSCAFile                 string
-	TLSServerName             string
-	Port                      int
-	MonitorPort               int
-	MonitorHost               string
-	MonitorTLSCertFile        string
-	MonitorTLSKeyFile         string
-	MonitorPrivateNetworkOnly bool
-	MonitorLocalTestMode      bool
-	DataDir                   string
-	AckWait                   time.Duration
-	MaxDeliver                int
-	ReconcileInterval         time.Duration
+	Mode                            NATSMode
+	URL                             string
+	Username                        string
+	Password                        string
+	AllowUnauthenticated            bool
+	LocalTestMode                   bool
+	PrivateNetworkOnly              bool
+	PrivateNetworkFirewallConfirmed bool
+	SharedCredentialsAcknowledged   bool
+	SharedCredentialsApprovalID     string
+	SharedCredentialsExpires        string
+	TLSCertFile                     string
+	TLSKeyFile                      string
+	TLSCAFile                       string
+	TLSServerName                   string
+	Port                            int
+	MonitorPort                     int
+	MonitorHost                     string
+	MonitorTLSCertFile              string
+	MonitorTLSKeyFile               string
+	MonitorPrivateNetworkOnly       bool
+	MonitorLocalTestMode            bool
+	DataDir                         string
+	AckWait                         time.Duration
+	MaxDeliver                      int
+	ReconcileInterval               time.Duration
 }
 
 // Validate checks ownership-specific configuration before any process starts.
@@ -138,6 +142,24 @@ func (c NATSConfig) Validate() error {
 		}
 		if hasTLSCert && strings.TrimSpace(c.TLSCAFile) == "" {
 			return fmt.Errorf("NATS TLS CA file is required when TLS is enabled")
+		}
+		if !c.LocalTestMode {
+			if !c.PrivateNetworkFirewallConfirmed {
+				return fmt.Errorf("NATS private-network firewall restriction must be confirmed for embedded mode")
+			}
+			if !c.SharedCredentialsAcknowledged {
+				return fmt.Errorf("shared NATS credential trust boundary must be acknowledged for embedded mode")
+			}
+			if strings.TrimSpace(c.SharedCredentialsApprovalID) == "" {
+				return fmt.Errorf("shared NATS credential approval ID (NATS_SHARED_CREDENTIALS_APPROVAL_ID) is required for embedded mode")
+			}
+			expires, err := time.Parse("2006-01-02", strings.TrimSpace(c.SharedCredentialsExpires))
+			if err != nil {
+				return fmt.Errorf("NATS_SHARED_CREDENTIALS_EXPIRES must use YYYY-MM-DD")
+			}
+			if !expires.After(time.Now().UTC().Truncate(24 * time.Hour)) {
+				return fmt.Errorf("NATS shared-credential approval is expired; set a future expiry date")
+			}
 		}
 	}
 	return nil

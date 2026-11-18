@@ -27,7 +27,7 @@ type natsRuntime struct {
 	server *server.Server
 }
 
-func openNATS(cfg config.NATSConfig, monitorPassword string, readiness func(context.Context) error) (*natsRuntime, error) {
+func openNATS(cfg config.NATSConfig, monitorPassword string, readiness func(context.Context) daemonReadinessReport) (*natsRuntime, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -122,20 +122,20 @@ func openNATS(cfg config.NATSConfig, monitorPassword string, readiness func(cont
 	return &natsRuntime{conn: conn, server: ns}, nil
 }
 
-func daemonMonitorHandler(readiness func(context.Context) error, next http.Handler) http.Handler {
+func daemonMonitorHandler(readiness func(context.Context) daemonReadinessReport, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if readiness != nil && r.URL.Path == "/healthz" {
 			ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 			defer cancel()
-			if err := readiness(ctx); err != nil {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusServiceUnavailable)
-				_ = json.NewEncoder(w).Encode(map[string]string{
-					"status": "unhealthy",
-					"error":  err.Error(),
-				})
-				return
+			report := readiness(ctx)
+			status := http.StatusOK
+			if !report.Ready {
+				status = http.StatusServiceUnavailable
 			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			_ = json.NewEncoder(w).Encode(report)
+			return
 		}
 		next.ServeHTTP(w, r)
 	})

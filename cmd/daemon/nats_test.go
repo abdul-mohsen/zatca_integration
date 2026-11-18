@@ -11,15 +11,19 @@ import (
 
 func TestOpenNATSEmbeddedUsesConfiguredCredentials(t *testing.T) {
 	cfg := config.NATSConfig{
-		Mode:               config.NATSEmbedded,
-		Username:           "daemon-user",
-		Password:           "daemon-password",
-		PrivateNetworkOnly: true,
-		Port:               0,
-		DataDir:            t.TempDir(),
-		AckWait:            time.Minute,
-		MaxDeliver:         1,
-		ReconcileInterval:  time.Minute,
+		Mode:                            config.NATSEmbedded,
+		Username:                        "daemon-user",
+		Password:                        "daemon-password",
+		PrivateNetworkOnly:              true,
+		PrivateNetworkFirewallConfirmed: true,
+		SharedCredentialsAcknowledged:   true,
+		SharedCredentialsApprovalID:     "TEST-123",
+		SharedCredentialsExpires:        time.Now().UTC().AddDate(0, 0, 30).Format("2006-01-02"),
+		Port:                            0,
+		DataDir:                         t.TempDir(),
+		AckWait:                         time.Minute,
+		MaxDeliver:                      1,
+		ReconcileInterval:               time.Minute,
 	}
 	runtime, err := openNATS(cfg, "", nil)
 	if err != nil {
