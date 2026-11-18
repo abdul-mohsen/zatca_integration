@@ -51,6 +51,7 @@ func TestDaemonReadinessRequiresLiveExpectedBranchConsumer(t *testing.T) {
 	done := make(chan struct{})
 	r.mu.Lock()
 	r.lastReconcileAt = time.Now()
+	r.lastReconcileErr = errors.New("tenant tenant_broken failed schema preflight")
 	r.tenants[dbName] = tc
 	r.caches[dbName] = make(map[int64]*branchEntry)
 	r.subs["onboard:"+dbName] = onboardSub

@@ -188,7 +188,7 @@ func main() {
 	)
 	reconciler.providerEndpoint = *providerEndpoint
 	if err := reconciler.reconcile(ctx); err != nil {
-		log.Fatalf("initial tenant reconciliation: %v", err)
+		log.Printf("WARN: initial tenant reconciliation had failures; continuing with tenants that started: %v", err)
 	}
 	go reconciler.loop(*tenantReconcileInterval)
 

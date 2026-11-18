@@ -445,7 +445,7 @@ func (r *daemonReconciler) checkReadiness(context.Context) error {
 	if reconciledAt.IsZero() {
 		return errors.New("tenant reconciliation has not completed")
 	}
-	if reconcileErr != nil {
+	if reconcileErr != nil && len(tenants) == 0 {
 		return fmt.Errorf("tenant reconciliation is unhealthy: %w", reconcileErr)
 	}
 

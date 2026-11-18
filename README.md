@@ -28,6 +28,8 @@ A production-ready Go daemon for Saudi Arabia's ZATCA (Zakat, Tax and Customs Au
 - **Redelivery** - JetStream redelivers an unacknowledged document. The claim and the invoice chain make a redelivery safe
 - **Email alerts** — sends failure notifications after exhausting retries
 
+Tenant reconciliation is isolated: a tenant with an outdated schema is logged and retried without stopping workers for other ready tenants. The daemon health check remains unhealthy when no tenant is active or an active tenant is missing required responders or workers.
+
 ## Prerequisites
 
 - Docker
