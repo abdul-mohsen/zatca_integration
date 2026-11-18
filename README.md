@@ -129,16 +129,25 @@ VALUES (1, 'Main Branch', 'King Fahad Road', '1234', 'Al-Olaya', 'Riyadh', '1234
 
 ### Option A: Docker (recommended)
 
+For production, use Docker Compose with the credentials and transport settings
+in `.env.example`. The direct `docker run` commands below are for an isolated
+private network: provide `NATS_USER` and `NATS_PASSWORD`, and set
+`NATS_PRIVATE_NETWORK_ONLY=true` in the `.env` file. NATS ports are published
+on the host, so firewall them to trusted clients; an HTTP reverse proxy does
+not protect NATS TCP.
+
 ```bash
-# Build the image
-docker build -t zatca-daemon .
+# Build the image; ZATCA_SDK_PATH must point to the private SDK root
+docker build --build-context zatca-sdk="$ZATCA_SDK_PATH" -t zatca-daemon .
 
 # Run (Option 1: individual flags — safe for special characters in passwords)
 docker run -d \
   --name zatca \
+  --env-file .env \
   -p 4222:4222 \
   -v zatca-nats:/nats-data \
   zatca-daemon daemon \
+    --nats-mode embedded \
     --db-user  "myuser" \
     --db-pass  "p@ss!w0rd#complex" \
     --db-host  "db-host" \
@@ -150,33 +159,65 @@ docker run -d \
 # Run (Option 2: full DSN — only if password has no special characters)
 docker run -d \
   --name zatca \
+  --env-file .env \
   -p 4222:4222 \
   -v zatca-nats:/nats-data \
   zatca-daemon daemon \
+    --nats-mode embedded \
     --master-dsn "user:pass@tcp(db-host:3306)/zatca_master" \
     --base-dsn   "user:pass@tcp(db-host:3306)/" \
     --nats-port  4222 \
     --nats-data  /nats-data \
 ```
 
+### NATS TLS and private-network mode
+
+The recommended Compose deployment keeps TLS enabled by default. Copy
+`.env.example` to `.env`, set the NATS username/password, monitor password,
+private SDK build path, and the TLS certificate/key/CA paths, then run
+`docker compose up -d`.
+
+To use plaintext NATS on a trusted private network, set
+`NATS_PRIVATE_NETWORK_ONLY=true` and leave `NATS_TLS_CERT_FILE`,
+`NATS_TLS_KEY_FILE`, and `NATS_TLS_CA_FILE` empty. NATS username/password and
+the monitor password are still required; unauthenticated NATS is not enabled.
+This flag is an operator assertion, not a firewall. Compose publishes ports
+4222 and 8222 on the host, so restrict them to trusted networks. An HTTP
+reverse proxy does not protect the raw NATS TCP connection. `ZATCA_SDK_PATH`
+is still required when building because the daemon image includes the private
+Fatoora SDK.
+
 ### Option B: Local (development)
 
 ```bash
+set -a
+source .env
+set +a
 go build -o bin/daemon ./cmd/daemon
 
 # Option 1: individual flags (recommended)
 ./bin/daemon \
+  --nats-mode embedded \
+  --nats-user "$NATS_USER" \
+  --nats-password "$NATS_PASSWORD" \
+  --nats-private-network-only \
   --db-user  "root" \
   --db-pass  "p@ss!w0rd#complex" \
   --db-host  "localhost" \
   --db-port  3306 \
   --nats-port  4222 \
+  --nats-data  ./nats-data \
 
 # Option 2: full DSN
 ./bin/daemon \
+  --nats-mode embedded \
+  --nats-user "$NATS_USER" \
+  --nats-password "$NATS_PASSWORD" \
+  --nats-private-network-only \
   --master-dsn "root:pass@tcp(localhost:3306)/zatca_master" \
   --base-dsn   "root:pass@tcp(localhost:3306)/" \
   --nats-port  4222 \
+  --nats-data  ./nats-data \
 ```
 
 ### Daemon Flags

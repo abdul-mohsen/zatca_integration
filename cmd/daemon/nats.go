@@ -172,8 +172,7 @@ func natsTLSOptions(cfg config.NATSConfig, endpoint string) ([]nats.Option, erro
 	}
 	tlsEnabled := parsed.Scheme == "tls" ||
 		strings.TrimSpace(cfg.TLSCertFile) != "" ||
-		strings.TrimSpace(cfg.TLSCAFile) != "" ||
-		strings.TrimSpace(cfg.TLSServerName) != ""
+		strings.TrimSpace(cfg.TLSCAFile) != ""
 	if !tlsEnabled {
 		return nil, nil
 	}

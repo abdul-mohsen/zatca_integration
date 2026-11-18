@@ -79,14 +79,13 @@ func (c NATSConfig) Validate() error {
 		return fmt.Errorf("NATS monitor TLS certificate and key must be set together")
 	}
 	if c.MonitorPort > 0 && !hasMonitorTLSCert {
-		if !c.MonitorLocalTestMode {
-			return fmt.Errorf("NATS monitor requires TLS unless explicit local test mode is enabled")
-		}
 		if !c.MonitorPrivateNetworkOnly {
-			return fmt.Errorf("plain NATS monitor requires private-network-only mode")
-		}
-		if !monitorHostIsLoopback(c.MonitorHost) {
-			return fmt.Errorf("plain NATS monitor must bind to a loopback host")
+			if !c.MonitorLocalTestMode {
+				return fmt.Errorf("NATS monitor requires TLS unless explicit private-network mode is enabled")
+			}
+			if !monitorHostIsLoopback(c.MonitorHost) {
+				return fmt.Errorf("plain local-test NATS monitor must bind to a loopback host")
+			}
 		}
 	}
 	if c.AckWait <= 0 {
@@ -105,8 +104,12 @@ func (c NATSConfig) Validate() error {
 	}
 	hasTLSCert := strings.TrimSpace(c.TLSCertFile) != ""
 	hasTLSKey := strings.TrimSpace(c.TLSKeyFile) != ""
+	hasTLSCA := strings.TrimSpace(c.TLSCAFile) != ""
 	if hasTLSCert != hasTLSKey {
 		return fmt.Errorf("NATS TLS certificate and key must be set together")
+	}
+	if mode == NATSEmbedded && hasTLSCA && !hasTLSCert {
+		return fmt.Errorf("embedded NATS TLS CA file requires a certificate and key")
 	}
 	if c.AllowUnauthenticated && (mode != NATSEmbedded || !c.LocalTestMode) {
 		return fmt.Errorf("unauthenticated NATS is only allowed in explicit local test mode")
