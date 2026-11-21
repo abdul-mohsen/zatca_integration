@@ -12,15 +12,19 @@ import (
 
 func TestOpenNATSEmbeddedUsesConfiguredCredentials(t *testing.T) {
 	cfg := config.NATSConfig{
-		Mode:               config.NATSEmbedded,
-		Username:           "daemon-user",
-		Password:           "daemon-password",
-		PrivateNetworkOnly: true,
-		Port:               0,
-		DataDir:            t.TempDir(),
-		AckWait:            time.Minute,
-		MaxDeliver:         1,
-		ReconcileInterval:  time.Minute,
+		Mode:                            config.NATSEmbedded,
+		Username:                        "daemon-user",
+		Password:                        "daemon-password",
+		PrivateNetworkOnly:              true,
+		PrivateNetworkFirewallConfirmed: true,
+		SharedCredentialsAcknowledged:   true,
+		SharedCredentialsApprovalID:     "TEST-123",
+		SharedCredentialsExpires:        time.Now().UTC().AddDate(0, 0, 30).Format("2006-01-02"),
+		Port:                            0,
+		DataDir:                         t.TempDir(),
+		AckWait:                         time.Minute,
+		MaxDeliver:                      1,
+		ReconcileInterval:               time.Minute,
 	}
 	runtime, err := openNATS(cfg, "", nil)
 	if err != nil {
@@ -47,16 +51,20 @@ func TestOpenNATSEmbeddedUsesConfiguredCredentials(t *testing.T) {
 
 func TestOpenNATSPrivateNetworkModeDoesNotInferTLSFromServerName(t *testing.T) {
 	cfg := config.NATSConfig{
-		Mode:               config.NATSEmbedded,
-		Username:           "daemon-user",
-		Password:           "daemon-password",
-		PrivateNetworkOnly: true,
-		TLSServerName:      "nats",
-		Port:               0,
-		DataDir:            t.TempDir(),
-		AckWait:            time.Minute,
-		MaxDeliver:         1,
-		ReconcileInterval:  time.Minute,
+		Mode:                            config.NATSEmbedded,
+		Username:                        "daemon-user",
+		Password:                        "daemon-password",
+		PrivateNetworkOnly:              true,
+		PrivateNetworkFirewallConfirmed: true,
+		SharedCredentialsAcknowledged:   true,
+		SharedCredentialsApprovalID:     "TEST-123",
+		SharedCredentialsExpires:        time.Now().UTC().AddDate(0, 0, 30).Format("2006-01-02"),
+		TLSServerName:                   "nats",
+		Port:                            0,
+		DataDir:                         t.TempDir(),
+		AckWait:                         time.Minute,
+		MaxDeliver:                      1,
+		ReconcileInterval:               time.Minute,
 	}
 	runtime, err := openNATS(cfg, "", nil)
 	if err != nil {
@@ -71,18 +79,22 @@ func TestOpenNATSPrivateNetworkModeDoesNotInferTLSFromServerName(t *testing.T) {
 
 func TestOpenNATSPrivateMonitorStillRequiresPassword(t *testing.T) {
 	cfg := config.NATSConfig{
-		Mode:                      config.NATSEmbedded,
-		Username:                  "daemon-user",
-		Password:                  "daemon-password",
-		PrivateNetworkOnly:        true,
-		MonitorPort:               8222,
-		MonitorHost:               "0.0.0.0",
-		MonitorPrivateNetworkOnly: true,
-		Port:                      0,
-		DataDir:                   t.TempDir(),
-		AckWait:                   time.Minute,
-		MaxDeliver:                1,
-		ReconcileInterval:         time.Minute,
+		Mode:                            config.NATSEmbedded,
+		Username:                        "daemon-user",
+		Password:                        "daemon-password",
+		PrivateNetworkOnly:              true,
+		PrivateNetworkFirewallConfirmed: true,
+		SharedCredentialsAcknowledged:   true,
+		SharedCredentialsApprovalID:     "TEST-123",
+		SharedCredentialsExpires:        time.Now().UTC().AddDate(0, 0, 30).Format("2006-01-02"),
+		MonitorPort:                     8222,
+		MonitorHost:                     "0.0.0.0",
+		MonitorPrivateNetworkOnly:       true,
+		Port:                            0,
+		DataDir:                         t.TempDir(),
+		AckWait:                         time.Minute,
+		MaxDeliver:                      1,
+		ReconcileInterval:               time.Minute,
 	}
 	if _, err := openNATS(cfg, "", nil); err == nil || !strings.Contains(err.Error(), "monitor password is required") {
 		t.Fatalf("openNATS() error = %v; want monitor authentication required", err)

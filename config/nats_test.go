@@ -8,17 +8,81 @@ import (
 
 func validNATSConfig(mode NATSMode) NATSConfig {
 	return NATSConfig{
-		Mode:               mode,
-		URL:                "nats://nats-user:nats-password@nats.example:4222",
-		Username:           "nats-user",
-		Password:           "nats-password",
-		PrivateNetworkOnly: true,
-		Port:               4222,
-		MonitorPort:        0,
-		DataDir:            "nats-data",
-		AckWait:            time.Minute,
-		MaxDeliver:         10,
-		ReconcileInterval:  time.Minute,
+		Mode:                            mode,
+		URL:                             "nats://nats-user:nats-password@nats.example:4222",
+		Username:                        "nats-user",
+		Password:                        "nats-password",
+		PrivateNetworkOnly:              true,
+		PrivateNetworkFirewallConfirmed: true,
+		SharedCredentialsAcknowledged:   true,
+		SharedCredentialsApprovalID:     "TEST-123",
+		SharedCredentialsExpires:        time.Now().UTC().AddDate(0, 0, 30).Format("2006-01-02"),
+		Port:                            4222,
+		MonitorPort:                     0,
+		DataDir:                         "nats-data",
+		AckWait:                         time.Minute,
+		MaxDeliver:                      10,
+		ReconcileInterval:               time.Minute,
+	}
+}
+
+func TestEmbeddedNATSRequiresPrivateNetworkAndSharedCredentialApproval(t *testing.T) {
+	tests := []struct {
+		name string
+		edit func(*NATSConfig)
+		want string
+	}{
+		{
+			name: "firewall confirmation",
+			edit: func(cfg *NATSConfig) { cfg.PrivateNetworkFirewallConfirmed = false },
+			want: "firewall",
+		},
+		{
+			name: "shared credential acknowledgment",
+			edit: func(cfg *NATSConfig) { cfg.SharedCredentialsAcknowledged = false },
+			want: "shared NATS credential",
+		},
+		{
+			name: "approval reference",
+			edit: func(cfg *NATSConfig) { cfg.SharedCredentialsApprovalID = "" },
+			want: "approval ID",
+		},
+		{
+			name: "missing approval expiry",
+			edit: func(cfg *NATSConfig) { cfg.SharedCredentialsExpires = "" },
+			want: "YYYY-MM-DD",
+		},
+		{
+			name: "malformed approval expiry",
+			edit: func(cfg *NATSConfig) { cfg.SharedCredentialsExpires = "not-a-date" },
+			want: "YYYY-MM-DD",
+		},
+		{
+			name: "expired approval",
+			edit: func(cfg *NATSConfig) { cfg.SharedCredentialsExpires = "2000-01-01" },
+			want: "expired",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validNATSConfig(NATSEmbedded)
+			tc.edit(&cfg)
+			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Validate() = %v; want an error containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestEmbeddedNATSExplicitLocalTestModeSkipsDeploymentApprovalGate(t *testing.T) {
+	cfg := validNATSConfig(NATSEmbedded)
+	cfg.PrivateNetworkFirewallConfirmed = false
+	cfg.SharedCredentialsAcknowledged = false
+	cfg.SharedCredentialsApprovalID = ""
+	cfg.SharedCredentialsExpires = ""
+	cfg.LocalTestMode = true
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("explicit local test mode was rejected by the deployment approval gate: %v", err)
 	}
 }
 
