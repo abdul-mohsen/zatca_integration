@@ -1,8 +1,10 @@
 package storeconfig
 
 import (
+	"context"
 	"database/sql"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -11,6 +13,8 @@ import (
 	"github.com/zatca-go/zatca/secutil"
 	"github.com/zatca-go/zatca/zatca"
 )
+
+var ErrBranchConfigDecryption = errors.New("branch ZATCA config decryption failed")
 
 // BranchZATCA holds ZATCA credentials and seller info for a specific branch.
 type BranchZATCA struct {
@@ -37,6 +41,11 @@ type BranchZATCA struct {
 // LoadBranchZATCA loads ZATCA credentials for a given branch from the database.
 // Queries branch → store → company → branch_zatca to build seller info and ZATCA credentials.
 func LoadBranchZATCA(db *sql.DB, branchID int64, encKey *secutil.Key) (*BranchZATCA, error) {
+	return LoadBranchZATCAContext(context.Background(), db, branchID, encKey)
+}
+
+// LoadBranchZATCAContext loads and decrypts one branch configuration with a bounded query context.
+func LoadBranchZATCAContext(ctx context.Context, db *sql.DB, branchID int64, encKey *secutil.Key) (*BranchZATCA, error) {
 	q := `SELECT
 		b.id,
 		COALESCE(s.id, 0) as store_id,
@@ -86,13 +95,25 @@ func LoadBranchZATCA(db *sql.DB, branchID int64, encKey *secutil.Key) (*BranchZA
 	if err != nil {
 		return nil, fmt.Errorf("load ZATCA config for branch %d: %w", branchID, err)
 	}
+	if encKey == nil {
+		return nil, fmt.Errorf("%w: encryption key is not configured", ErrBranchConfigDecryption)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	// Decrypt sensitive fields
 	if bz.PrivateKey, err = encKey.Decrypt(bz.PrivateKey); err != nil {
-		return nil, fmt.Errorf("decrypt private_key for branch %d: %w", branchID, err)
+		return nil, fmt.Errorf("%w: decrypt private_key for branch %d: %w", ErrBranchConfigDecryption, branchID, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	if bz.ProductionPassword, err = encKey.Decrypt(bz.ProductionPassword); err != nil {
-		return nil, fmt.Errorf("decrypt production_password for branch %d: %w", branchID, err)
+		return nil, fmt.Errorf("%w: decrypt production_password for branch %d: %w", ErrBranchConfigDecryption, branchID, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	// The production username IS the base64-encoded certificate (BinarySecurityToken)

@@ -179,6 +179,11 @@ func (r *Registry) Snapshot() []Tenant {
 // OpenDB opens a connection to this tenant's database using the base DSN template.
 // baseDSN should be a DSN without a database name (from dbutil.FormatBaseDSN or "user:pass@tcp(host:port)/").
 func OpenDB(t Tenant, baseDSN string) (*sql.DB, error) {
+	return OpenDBContext(context.Background(), t, baseDSN)
+}
+
+// OpenDBContext opens and pings a tenant database using the caller's deadline.
+func OpenDBContext(ctx context.Context, t Tenant, baseDSN string) (*sql.DB, error) {
 	// Parse the base DSN so we can safely set the database name
 	cfg, err := mysql.ParseDSN(baseDSN)
 	if err != nil {
@@ -199,7 +204,7 @@ func OpenDB(t Tenant, baseDSN string) (*sql.DB, error) {
 	db.SetConnMaxIdleTime(1 * time.Minute)
 	db.SetMaxOpenConns(10)
 	db.SetMaxIdleConns(5)
-	if err := db.Ping(); err != nil {
+	if err := db.PingContext(ctx); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("ping tenant db %s: %w", t.DBName, err)
 	}

@@ -1,6 +1,7 @@
 package processor
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 )
@@ -83,7 +84,12 @@ func QueryBillByID(db *sql.DB, billID int64) (*BillRow, error) {
 
 // QueryActiveBranches returns all active branch IDs for a given tenant database.
 func QueryActiveBranches(db *sql.DB) ([]int64, error) {
-	rows, err := db.Query(`SELECT b.id FROM branches b JOIN company c ON c.id = b.company_id JOIN branch_zatca_config bz ON bz.branch_id = b.id WHERE b.is_active = 1 AND COALESCE(bz.zatca_production_username, '') != '' ORDER BY b.id`)
+	return QueryActiveBranchesContext(context.Background(), db)
+}
+
+// QueryActiveBranchesContext returns active branch IDs with the caller's deadline.
+func QueryActiveBranchesContext(ctx context.Context, db *sql.DB) ([]int64, error) {
+	rows, err := db.QueryContext(ctx, `SELECT b.id FROM branches b JOIN company c ON c.id = b.company_id JOIN branch_zatca_config bz ON bz.branch_id = b.id WHERE b.is_active = 1 AND COALESCE(bz.zatca_production_username, '') != '' ORDER BY b.id`)
 	if err != nil {
 		return nil, err
 	}

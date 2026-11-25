@@ -134,7 +134,7 @@ func Preflight(ctx context.Context, db *sql.DB) error {
 		  AND (`+strings.Join(clauses, " OR ")+`)
 	`, args...)
 	if err != nil {
-		return fmt.Errorf("%w: inspect tenant schema: %v", ErrTenantSchemaNotReady, err)
+		return fmt.Errorf("%w: inspect tenant schema: %w", ErrTenantSchemaNotReady, err)
 	}
 	defer rows.Close()
 

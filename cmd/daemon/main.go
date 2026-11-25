@@ -23,6 +23,8 @@ import (
 )
 
 func main() {
+	verifyDB := flag.Bool("verify-db", false, "Verify database readiness and exit")
+	jsonOutput := flag.Bool("json", false, "Emit database verification results as JSON")
 	masterDSN := flag.String("master-dsn", "", "Full DSN for zatca_master DB (alternative to individual flags)")
 	baseDSN := flag.String("base-dsn", "", "Full base DSN without DB name (alternative to individual flags)")
 	adminDSN := flag.String("admin-dsn", "", "Optional base DSN for admin user (onboarding). Falls back to base-dsn if unset")
@@ -90,6 +92,20 @@ func main() {
 	}
 	if *baseDSN == "" && *dbUser != "" && *dbHost != "" {
 		*baseDSN = dbutil.FormatBaseDSN(*dbUser, *dbPass, *dbHost, *dbPort)
+	}
+	if handled, exitCode, err := dispatchVerificationFlags(*verifyDB, *jsonOutput, func() int {
+		return runDatabaseVerification(os.Stdout, verificationDBConfig{
+			MasterDSN:         *masterDSN,
+			MasterDatabase:    *masterDB,
+			RuntimeBaseDSN:    *baseDSN,
+			OnboardingBaseDSN: *adminDSN,
+			EncryptionKey:     os.Getenv("ENCRYPT_KEY"),
+		})
+	}); handled {
+		if err != nil {
+			log.Print(err)
+		}
+		os.Exit(exitCode)
 	}
 	if *masterDSN == "" || *baseDSN == "" {
 		log.Fatal("Database connection required: use --master-dsn/--base-dsn OR --db-user/--db-pass/--db-host")
