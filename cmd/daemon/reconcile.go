@@ -76,6 +76,7 @@ type daemonReconciler struct {
 	maxDeliver       int
 	providerFactory  processor.ProviderFactory
 	providerEndpoint string
+	tenantDBPrefix   string
 
 	reconcileMu     sync.Mutex
 	mu              sync.RWMutex
@@ -186,7 +187,7 @@ func (r *daemonReconciler) reconcile(ctx context.Context) error {
 		r.mu.Unlock()
 	}()
 
-	discovered, err := tenant.LoadAllContext(ctx, r.masterDB)
+	discovered, err := tenant.LoadAllWithPrefixContext(ctx, r.masterDB, r.tenantDBPrefix)
 	if err != nil {
 		globalReconcileErr = fmt.Errorf("load tenant registry: %w", err)
 		return err
@@ -570,10 +571,6 @@ func (r *daemonReconciler) readinessReport(context.Context) daemonReadinessRepor
 		report.Ready = false
 		readinessErrors = append(readinessErrors, "daemon has no active tenants")
 	}
-	if activeWorkers == 0 {
-		report.Ready = false
-		readinessErrors = append(readinessErrors, "daemon has no active tenant workers")
-	}
 
 	tenantNames := make([]string, 0, len(tenantStatuses)+len(tenants))
 	seenTenants := make(map[string]struct{}, len(tenantStatuses)+len(tenants))
@@ -589,6 +586,7 @@ func (r *daemonReconciler) readinessReport(context.Context) daemonReadinessRepor
 	sort.Strings(tenantNames)
 
 	degraded := false
+	totalExpectedBranches := 0
 	for _, dbName := range tenantNames {
 		status, hasStatus := tenantStatuses[dbName]
 		tc := tenants[dbName]
@@ -634,6 +632,7 @@ func (r *daemonReconciler) readinessReport(context.Context) daemonReadinessRepor
 			branches := tc.expectedBranchSnapshot()
 			sort.Slice(branches, func(i, j int) bool { return branches[i] < branches[j] })
 			tenantReport.ExpectedBranches = branches
+			totalExpectedBranches += len(branches)
 			var tenantErrors []string
 			if sub := subs["onboard:"+dbName]; sub == nil || !sub.IsValid() {
 				tenantErrors = append(tenantErrors, fmt.Sprintf("onboarding responder for tenant %s", dbName))
@@ -667,6 +666,10 @@ func (r *daemonReconciler) readinessReport(context.Context) daemonReadinessRepor
 			}
 		}
 		report.Tenants = append(report.Tenants, tenantReport)
+	}
+	if totalExpectedBranches > 0 && activeWorkers == 0 {
+		report.Ready = false
+		readinessErrors = append(readinessErrors, "daemon has no active tenant workers")
 	}
 
 	switch {

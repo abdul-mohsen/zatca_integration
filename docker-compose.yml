@@ -30,6 +30,8 @@ services:
       DB_HOST: ${DB_HOST:-host.docker.internal}
       DB_PORT: ${DB_PORT:-3306}
       MASTER_DB: ${MASTER_DB:-zatca_master}
+      TENANT_NAME_PREFIX: ${TENANT_NAME_PREFIX:-}
+      TENANT_DB_PREFIX: ${TENANT_DB_PREFIX:-}
 
       # --- Optional: separate admin user for onboarding ---
       ADMIN_DB_USER: ${ADMIN_DB_USER:-}

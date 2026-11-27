@@ -76,6 +76,85 @@ func ValidateAll(tenants []Tenant) error {
 	return nil
 }
 
+// ValidateDBPrefix checks an optional database-name prefix used to scope tenant
+// discovery (for example "tenant_dev_" or "tenant_prod_"). An empty prefix
+// disables scoping.
+func ValidateDBPrefix(prefix string) error {
+	if prefix == "" {
+		return nil
+	}
+	if len(prefix) > 63 {
+		return errors.New("db prefix must be at most 63 characters")
+	}
+	for i := 0; i < len(prefix); i++ {
+		b := prefix[i]
+		if (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_' {
+			continue
+		}
+		return errors.New("db prefix must contain only ASCII letters, digits, and underscores")
+	}
+	return nil
+}
+
+// DBPrefixFromTenantNamePrefix maps a deployment tenant name prefix
+// (e.g. "dev", "dev-", "prod", "prod-", "qa-2-") to the canonical MySQL
+// database prefix ("tenant_dev_", "tenant_prod_", "tenant_qa_2_"). An empty
+// input returns an empty prefix (unscoped).
+func DBPrefixFromTenantNamePrefix(raw string) (string, error) {
+	trimmed := strings.ToLower(strings.TrimSpace(raw))
+	if trimmed == "" {
+		return "", nil
+	}
+	body := strings.TrimSuffix(trimmed, "-")
+	if body == "" {
+		return "", errors.New("tenant name prefix must contain at least one letter or digit")
+	}
+	parts := strings.Split(body, "-")
+	for _, part := range parts {
+		if part == "" {
+			return "", errors.New("tenant name prefix must use single hyphens between alphanumeric segments")
+		}
+		for i := 0; i < len(part); i++ {
+			b := part[i]
+			if (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') {
+				continue
+			}
+			return "", errors.New("tenant name prefix must contain only ASCII letters, digits, and hyphens")
+		}
+	}
+	prefix := "tenant_" + strings.Join(parts, "_") + "_"
+	if err := ValidateDBPrefix(prefix); err != nil {
+		return "", fmt.Errorf("derived %w", err)
+	}
+	return prefix, nil
+}
+
+// ResolveDBPrefix resolves the active database-name prefix from explicit
+// TENANT_DB_PREFIX and/or TENANT_NAME_PREFIX configuration. It fails closed on
+// invalid values or conflicting prefixes.
+func ResolveDBPrefix(explicitDBPrefix, tenantNamePrefix string) (string, error) {
+	explicit := strings.TrimSpace(explicitDBPrefix)
+	if err := ValidateDBPrefix(explicit); err != nil {
+		return "", fmt.Errorf("invalid tenant db prefix: %w", err)
+	}
+	derived, err := DBPrefixFromTenantNamePrefix(tenantNamePrefix)
+	if err != nil {
+		return "", fmt.Errorf("invalid tenant name prefix: %w", err)
+	}
+	if explicit != "" && derived != "" && explicit != derived {
+		return "", fmt.Errorf(
+			"conflicting tenant prefix configuration: tenant db prefix %q does not match tenant name prefix %q (derived %q)",
+			explicit,
+			strings.TrimSpace(tenantNamePrefix),
+			derived,
+		)
+	}
+	if explicit != "" {
+		return explicit, nil
+	}
+	return derived, nil
+}
+
 // LoadAll returns all enabled tenants from the master database.
 func LoadAll(masterDB *sql.DB) ([]Tenant, error) {
 	return LoadAllContext(context.Background(), masterDB)
@@ -85,10 +164,34 @@ func LoadAll(masterDB *sql.DB) ([]Tenant, error) {
 // cancellation and deadline. Reconciliation uses this form so a stalled
 // control-plane database cannot keep the daemon from shutting down.
 func LoadAllContext(ctx context.Context, masterDB *sql.DB) ([]Tenant, error) {
+	return LoadAllWithPrefixContext(ctx, masterDB, "")
+}
+
+// LoadAllWithPrefixContext returns enabled tenants whose db_name starts with
+// dbPrefix (or all enabled tenants when dbPrefix is empty). Out-of-scope rows
+// are excluded before validation so legacy or other-environment rows cannot
+// break discovery for this environment.
+func LoadAllWithPrefixContext(ctx context.Context, masterDB *sql.DB, dbPrefix string) ([]Tenant, error) {
 	if masterDB == nil {
 		return nil, errors.New("master database is not configured")
 	}
-	rows, err := masterDB.QueryContext(ctx, `SELECT id, tenant_key, name, db_name, zatca_env, alert_email FROM tenant WHERE enabled = 1`)
+	if err := ValidateDBPrefix(dbPrefix); err != nil {
+		return nil, fmt.Errorf("invalid tenant db prefix: %w", err)
+	}
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if dbPrefix == "" {
+		rows, err = masterDB.QueryContext(ctx, `SELECT id, tenant_key, name, db_name, zatca_env, alert_email FROM tenant WHERE enabled = 1`)
+	} else {
+		rows, err = masterDB.QueryContext(
+			ctx,
+			`SELECT id, tenant_key, name, db_name, zatca_env, alert_email FROM tenant WHERE enabled = 1 AND LEFT(db_name, CHAR_LENGTH(?)) = ?`,
+			dbPrefix,
+			dbPrefix,
+		)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("query tenants: %w", err)
 	}
@@ -99,6 +202,9 @@ func LoadAllContext(ctx context.Context, masterDB *sql.DB) ([]Tenant, error) {
 		var t Tenant
 		if err := rows.Scan(&t.ID, &t.TenantKey, &t.Name, &t.DBName, &t.ZATCAEnv, &t.AlertEmail); err != nil {
 			return nil, fmt.Errorf("scan tenant: %w", err)
+		}
+		if dbPrefix != "" && !strings.HasPrefix(t.DBName, dbPrefix) {
+			continue
 		}
 		tenants = append(tenants, t)
 	}
