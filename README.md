@@ -32,12 +32,22 @@ Tenant reconciliation is isolated: a tenant with an outdated schema is logged
 and retried without stopping workers for other ready tenants. The authenticated
 `/healthz` response is a JSON readiness report with global and per-tenant
 status. Global tenant-registry discovery failure, a tenant with failed or
-incomplete branch discovery, missing expected workers/responders, or no active
-workers makes readiness unhealthy even if an older tenant is still active.
-An isolated tenant schema startup failure is reported as degraded when another
-tenant remains healthy; it does not stop that healthy worker. A successful
-branch discovery returning no active branches is distinct from a failed
-discovery.
+incomplete branch discovery, missing expected workers/responders, no active
+tenants, or no active workers when one or more branches are expected makes
+readiness unhealthy even if an older tenant is still active. When active
+tenants are healthy with zero onboarded branches and live onboarding and
+reconciliation responders (`onboard:<db>` and `reconcile:<tenant_key>`),
+`/healthz` reports ready so onboarding can proceed. An isolated tenant schema
+startup failure is reported as degraded when another tenant remains healthy; it
+does not stop that healthy worker. A successful branch discovery returning no
+active branches is distinct from a failed discovery.
+
+To isolate shared `zatca_master` registries across environments (for example
+dev vs. production), pass `--tenant-db-prefix` / `TENANT_DB_PREFIX` (such as
+`tenant_dev_` or `tenant_prod_`) or `--tenant-name-prefix` /
+`TENANT_NAME_PREFIX` (such as `dev-` -> `tenant_dev_`, `prod-` ->
+`tenant_prod_`). Invalid or conflicting prefix settings fail closed during both
+daemon startup and `--verify-db --json`.
 
 ## Embedded NATS deployment gate
 
@@ -229,6 +239,8 @@ go build -o bin/daemon ./cmd/daemon
 | `--db-host` | | Database host |
 | `--db-port` | `3306` | Database port |
 | `--master-db` | `zatca_master` | Master database name |
+| `--tenant-db-prefix` | `$TENANT_DB_PREFIX` | Optional MySQL `db_name` prefix to scope tenant discovery (e.g. `tenant_dev_`, `tenant_prod_`) |
+| `--tenant-name-prefix` | `$TENANT_NAME_PREFIX` | Optional deployment tenant name prefix (e.g. `dev-`, `prod-`) mapped to `tenant_<prefix>_` |
 | `--master-dsn` | | Full DSN for master DB (alternative to individual flags) |
 | `--base-dsn` | | Full base DSN without DB name (alternative to individual flags) |
 | `--nats-port` | `4222` | Port for the embedded NATS server |

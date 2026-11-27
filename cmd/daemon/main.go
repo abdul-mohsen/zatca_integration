@@ -20,6 +20,7 @@ import (
 	"github.com/zatca-go/zatca/dbutil"
 	"github.com/zatca-go/zatca/provider"
 	"github.com/zatca-go/zatca/secutil"
+	"github.com/zatca-go/zatca/tenant"
 )
 
 func main() {
@@ -55,6 +56,8 @@ func main() {
 	natsAckWait := flag.Duration("nats-ack-wait", 5*time.Minute, "JetStream delivery ACK wait")
 	natsMaxDeliver := flag.Int("nats-max-deliver", 10, "Maximum delivery attempts before local terminal failure")
 	tenantReconcileInterval := flag.Duration("tenant-reconcile-interval", time.Minute, "Tenant and branch discovery interval")
+	tenantDBPrefix := flag.String("tenant-db-prefix", envOrDefault("TENANT_DB_PREFIX", ""), "Optional MySQL db_name prefix to scope discovered tenants (e.g. tenant_dev_ or tenant_prod_)")
+	tenantNamePrefix := flag.String("tenant-name-prefix", envOrDefault("TENANT_NAME_PREFIX", ""), "Optional deployment tenant name prefix (e.g. dev- or prod-) mapped to tenant_<prefix>_")
 	providerEndpoint := flag.String("provider-endpoint", envOrDefault("ZATCA_PROVIDER_ENDPOINT", ""), "Optional ZATCA provider endpoint override")
 	providerMode := flag.String("provider-mode", envOrDefault("ZATCA_PROVIDER_MODE", string(providerModeReal)), "ZATCA provider mode: real or local")
 	providerScenario := flag.String("provider-scenario", envOrDefault("ZATCA_PROVIDER_SCENARIO", string(provider.ScenarioAccepted)), "Local provider submit scenario")
@@ -100,6 +103,8 @@ func main() {
 			RuntimeBaseDSN:    *baseDSN,
 			OnboardingBaseDSN: *adminDSN,
 			EncryptionKey:     os.Getenv("ENCRYPT_KEY"),
+			TenantDBPrefix:    *tenantDBPrefix,
+			TenantNamePrefix:  *tenantNamePrefix,
 		})
 	}); handled {
 		if err != nil {
@@ -109,6 +114,14 @@ func main() {
 	}
 	if *masterDSN == "" || *baseDSN == "" {
 		log.Fatal("Database connection required: use --master-dsn/--base-dsn OR --db-user/--db-pass/--db-host")
+	}
+
+	resolvedDBPrefix, err := tenant.ResolveDBPrefix(*tenantDBPrefix, *tenantNamePrefix)
+	if err != nil {
+		log.Fatalf("Tenant prefix configuration: %v", err)
+	}
+	if resolvedDBPrefix != "" {
+		log.Printf("Scoping tenant discovery to db_name prefix %q", resolvedDBPrefix)
 	}
 
 	// Parse encryption key for sensitive DB columns (required)
@@ -209,6 +222,7 @@ func main() {
 		providerFactory,
 	)
 	reconciler.providerEndpoint = *providerEndpoint
+	reconciler.tenantDBPrefix = resolvedDBPrefix
 	if err := reconciler.reconcile(ctx); err != nil {
 		log.Printf("WARN: initial tenant reconciliation had failures; continuing with tenants that started: %v", err)
 	}

@@ -9,6 +9,7 @@ import (
 	"github.com/go-sql-driver/mysql"
 
 	"github.com/zatca-go/zatca/secutil"
+	"github.com/zatca-go/zatca/tenant"
 )
 
 type verificationDBConfig struct {
@@ -17,6 +18,8 @@ type verificationDBConfig struct {
 	RuntimeBaseDSN    string
 	OnboardingBaseDSN string
 	EncryptionKey     string
+	TenantDBPrefix    string
+	TenantNamePrefix  string
 }
 
 func dispatchVerificationFlags(
@@ -51,6 +54,17 @@ func runDatabaseVerification(w io.Writer, cfg verificationDBConfig) int {
 		exitCode = 2
 	} else {
 		encKey = parsedKey
+	}
+
+	resolvedDBPrefix, prefixErr := tenant.ResolveDBPrefix(cfg.TenantDBPrefix, cfg.TenantNamePrefix)
+	if prefixErr != nil {
+		checks = append(checks, verificationFailure(
+			"configuration.tenant_db_prefix",
+			verificationTarget{Operation: "validate_tenant_db_prefix"},
+			verificationErrorConfiguration,
+			nil,
+		))
+		exitCode = 2
 	}
 
 	masterValid := validVerificationMasterDSN(cfg.MasterDSN, cfg.MasterDatabase)
@@ -110,6 +124,16 @@ func runDatabaseVerification(w io.Writer, cfg verificationDBConfig) int {
 			verificationErrorConfiguration,
 		))
 		exitCode = 2
+	} else if prefixErr != nil {
+		checks = append(checks, newVerificationNotVerified(
+			"master.registry",
+			verificationTarget{
+				AccountRole: "runtime",
+				Database:    cfg.MasterDatabase,
+				Operation:   "load_enabled_tenants",
+			},
+			verificationErrorConfiguration,
+		))
 	} else {
 		checks = append(checks, verifyDatabase(
 			context.Background(),
@@ -118,7 +142,7 @@ func runDatabaseVerification(w io.Writer, cfg verificationDBConfig) int {
 			cfg.RuntimeBaseDSN,
 			cfg.OnboardingBaseDSN,
 			encKey,
-			defaultVerificationDBOps(),
+			defaultVerificationDBOpsWithPrefix(resolvedDBPrefix),
 		)...)
 	}
 

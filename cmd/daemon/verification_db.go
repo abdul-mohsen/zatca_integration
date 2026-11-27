@@ -43,11 +43,15 @@ type verificationDBOps struct {
 }
 
 func defaultVerificationDBOps() verificationDBOps {
+	return defaultVerificationDBOpsWithPrefix("")
+}
+
+func defaultVerificationDBOpsWithPrefix(dbPrefix string) verificationDBOps {
 	return verificationDBOps{
 		openMaster: openVerificationMasterDB,
 		openTenant: tenant.OpenDBContext,
 		loadTenants: func(ctx context.Context, db *sql.DB) ([]tenant.Tenant, error) {
-			return tenant.LoadAllContext(ctx, db)
+			return tenant.LoadAllWithPrefixContext(ctx, db, dbPrefix)
 		},
 		preflight: queue.Preflight,
 		activeBranches: func(ctx context.Context, db *sql.DB) ([]int64, error) {

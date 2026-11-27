@@ -96,3 +96,64 @@ func TestVerificationModeEmitsSafeJSONForInvalidConfiguration(t *testing.T) {
 		}
 	}
 }
+
+func TestVerificationModeRejectsInvalidOrConflictingTenantPrefix(t *testing.T) {
+	cases := []struct {
+		name             string
+		tenantDBPrefix   string
+		tenantNamePrefix string
+		secretToken      string
+	}{
+		{
+			name:             "conflicting prefixes",
+			tenantDBPrefix:   "tenant_prod_",
+			tenantNamePrefix: "dev-",
+			secretToken:      "tenant_prod_",
+		},
+		{
+			name:           "invalid db prefix",
+			tenantDBPrefix: "tenant-bad;PREFIX_SECRET_FIXTURE",
+			secretToken:    "PREFIX_SECRET_FIXTURE",
+		},
+		{
+			name:             "invalid name prefix",
+			tenantNamePrefix: "---",
+			secretToken:      "---",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var output bytes.Buffer
+			exitCode := runDatabaseVerification(&output, verificationDBConfig{
+				MasterDSN:        "user:pass@tcp(127.0.0.1:3306)/zatca_master",
+				MasterDatabase:   "zatca_master",
+				RuntimeBaseDSN:   "user:pass@tcp(127.0.0.1:3306)/",
+				EncryptionKey:    "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
+				TenantDBPrefix:   tc.tenantDBPrefix,
+				TenantNamePrefix: tc.tenantNamePrefix,
+			})
+			if exitCode != 2 {
+				t.Fatalf("exit code = %d; want configuration exit 2", exitCode)
+			}
+			var report verificationReport
+			if err := json.Unmarshal(output.Bytes(), &report); err != nil {
+				t.Fatalf("json.Unmarshal() error = %v; output=%q", err, output.String())
+			}
+			if report.OverallStatus != verificationFail {
+				t.Fatalf("overall_status = %q; want FAIL", report.OverallStatus)
+			}
+			prefixCheck := requireVerificationCheck(t, report.Checks, "configuration.tenant_db_prefix")
+			if prefixCheck.Status != verificationFail || prefixCheck.ErrorCategory != verificationErrorConfiguration {
+				t.Fatalf("prefix check = %+v; want configuration failure", prefixCheck)
+			}
+			registryCheck := requireVerificationCheck(t, report.Checks, "master.registry")
+			if registryCheck.Status != verificationNotVerified || registryCheck.ErrorCategory != verificationErrorConfiguration {
+				t.Fatalf("registry check = %+v; want NOT_VERIFIED configuration", registryCheck)
+			}
+			if tc.secretToken != "" && strings.Contains(output.String(), tc.secretToken) {
+				t.Fatalf("verification output leaked prefix token %q: %s", tc.secretToken, output.String())
+			}
+		})
+	}
+}

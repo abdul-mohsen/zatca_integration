@@ -338,3 +338,106 @@ func TestDaemonMonitorHandlerReturnsPerTenantReadinessReport(t *testing.T) {
 		t.Fatal("readiness report was forwarded to the NATS monitor")
 	}
 }
+
+func TestDaemonReadinessAllowsPreOnboardingTenantWithZeroBranches(t *testing.T) {
+	nc, js := startTenantRaceJetStream(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	r := newDaemonReconciler(ctx, nil, "", "", nil, nc, js, &wg, time.Second, 1)
+	const (
+		dbName    = "tenant_dev_acme"
+		tenantKey = "dev-acme"
+	)
+	tc := &tenantCtx{
+		tenant:           tenant.Tenant{Name: "Dev Acme", TenantKey: tenantKey, DBName: dbName},
+		expectedBranches: make(map[int64]struct{}),
+	}
+	onboardSub, err := nc.Subscribe(queue.OnboardWildcard(dbName), func(*nats.Msg) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconcileSub, err := nc.Subscribe(queue.ReconcileSubject(tenantKey), func(*nats.Msg) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := nc.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = onboardSub.Unsubscribe()
+		_ = reconcileSub.Unsubscribe()
+	})
+
+	r.mu.Lock()
+	r.lastReconcileAt = time.Now()
+	r.tenants[dbName] = tc
+	r.caches[dbName] = make(map[int64]*branchEntry)
+	r.tenantReadiness[dbName] = tenantReconcileStatus{
+		tenant:                  tc.tenant,
+		branchDiscoveryComplete: true,
+	}
+	r.subs["onboard:"+dbName] = onboardSub
+	r.subs["reconcile:"+tenantKey] = reconcileSub
+	r.mu.Unlock()
+
+	report := r.readinessReport(ctx)
+	if !report.Ready || report.Status != "healthy" || report.ActiveWorkers != 0 {
+		t.Fatalf("pre-onboarding readiness report = %+v; want healthy ready state with 0 active workers", report)
+	}
+	if err := r.checkReadiness(ctx); err != nil {
+		t.Fatalf("checkReadiness() = %v; want nil for pre-onboarding tenant", err)
+	}
+
+	// Alongside an isolated broken tenant, the daemon stays ready in degraded state.
+	r.mu.Lock()
+	r.tenantReadiness["tenant_dev_broken"] = tenantReconcileStatus{
+		tenant:     tenant.Tenant{Name: "Broken", DBName: "tenant_dev_broken"},
+		startupErr: errors.New("tenant schema preflight failed"),
+	}
+	r.mu.Unlock()
+	degradedReport := r.readinessReport(ctx)
+	if !degradedReport.Ready || degradedReport.Status != "degraded" {
+		t.Fatalf("pre-onboarding + degraded report = %+v; want ready degraded state", degradedReport)
+	}
+
+	// Once a branch is expected, missing active workers must fail readiness.
+	tc.expectedBranchesMu.Lock()
+	tc.expectedBranches[7] = struct{}{}
+	tc.expectedBranchesMu.Unlock()
+	if err := r.checkReadiness(ctx); err == nil || !strings.Contains(err.Error(), "daemon has no active tenant workers") {
+		t.Fatalf("readiness with expected branch and 0 workers = %v; want active worker error", err)
+	}
+
+	// Clearing expected branches restores readiness, but losing the onboarding responder fails readiness.
+	tc.expectedBranchesMu.Lock()
+	tc.expectedBranches = make(map[int64]struct{})
+	tc.expectedBranchesMu.Unlock()
+	if err := onboardSub.Unsubscribe(); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.checkReadiness(ctx); err == nil || !strings.Contains(err.Error(), "onboarding responder for tenant "+dbName) {
+		t.Fatalf("readiness without onboarding responder = %v; want missing responder error", err)
+	}
+}
+
+func TestDaemonReadinessFailsWhenAllTenantsFailedStartup(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	r := newDaemonReconciler(ctx, nil, "", "", nil, nil, nil, &wg, time.Second, 1)
+	r.mu.Lock()
+	r.lastReconcileAt = time.Now()
+	r.tenantReadiness["tenant_broken"] = tenantReconcileStatus{
+		tenant:     tenant.Tenant{Name: "Broken", DBName: "tenant_broken"},
+		startupErr: errors.New("tenant schema preflight failed"),
+	}
+	r.mu.Unlock()
+
+	err := r.checkReadiness(ctx)
+	if err == nil || !strings.Contains(err.Error(), "daemon has no active tenants") {
+		t.Fatalf("readiness with only failed tenants = %v; want no active tenants error", err)
+	}
+}
